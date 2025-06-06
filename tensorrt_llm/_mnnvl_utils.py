@@ -320,6 +320,14 @@ class MnnvlMoe:
                                     max_token_count_per_rank: int,
                                     expert_count: int, top_k: int, ep_rank: int,
                                     ep_size: int):
+        # Note:
+        # local_gather_indices is a tensor of shape (local_token_allocation_count) value is the global index of the token in the allgather tensor
+        # send_rank_count_cumsum is a tensor of shape (ep_size) value is the cumulative number of tokens sent to each rank
+        # send_rank_local_indices is a tensor of shape (local_token_allocation_count * top_k) value is the local index of the token in the input tensor
+        # recv_rank_count_cumsum is a tensor of shape (ep_size) value is the cumulative number of tokens received from each rank
+        # recv_rank_local_indices is a tensor of shape (local_token_allocation_count * top_k) value is the local index of the token in the output tensor
+        # backward_recv_rank_local_indices is a tensor of shape (local_token_allocation_count * top_k) value is the local index of the token in the input tensor
+
         local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, \
         recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices = \
             torch.ops.trtllm.moe_comm_prepare_indices(gathered_target_rank_ids, real_rank_token_count_cumsum,
@@ -336,6 +344,7 @@ class MnnvlMoe:
                                    dtype=torch.float32,
                                    device=torch.device('cuda'))
 
+        # Note: calculate local_expert_ids and local_scales here.
         torch.ops.trtllm.moe_local_gather(recv_rank_count_cumsum,
                                           local_gather_indices,
                                           gathered_expert_ids, gathered_scales,
