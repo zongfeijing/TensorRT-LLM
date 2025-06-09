@@ -35,6 +35,150 @@
 namespace torch_ext
 {
 
+#if ENABLE_MULTI_DEVICE
+void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRankCumSum,
+    torch::Tensor const& sendIndices, torch::Tensor& output, torch::Tensor const& recvRankCumSum,
+    torch::Tensor const& recvIndices, int64_t epRank, int64_t epSize)
+{
+    TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+
+    // Copy tensors to host for processing with stream
+    torch::Tensor host_send_rank_cum_sum
+        = torch::empty(sendRankCumSum.sizes(), sendRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
+    host_send_rank_cum_sum.copy_(sendRankCumSum, /*non_blocking=*/true);
+    torch::Tensor host_send_indices
+        = torch::empty(sendIndices.sizes(), sendIndices.options().dtype(torch::kInt32).device(torch::kCPU));
+    host_send_indices.copy_(sendIndices, /*non_blocking=*/true);
+    torch::Tensor host_recv_rank_cum_sum
+        = torch::empty(recvRankCumSum.sizes(), recvRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
+    host_recv_rank_cum_sum.copy_(recvRankCumSum, /*non_blocking=*/true);
+    torch::Tensor host_recv_indices
+        = torch::empty(recvIndices.sizes(), recvIndices.options().dtype(torch::kInt32).device(torch::kCPU));
+    host_recv_indices.copy_(recvIndices, /*non_blocking=*/true);
+
+    // Get CUDA stream
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    // Get NCCL communicator for EP group
+    std::set<int> ep_group;
+    for (int i = 0; i < epSize; i++)
+    {
+        ep_group.insert(i);
+    }
+    auto ncclComm = getComm(ep_group);
+    TLLM_CHECK_WITH_INFO(ncclComm.get() != nullptr, "NCCL communicator should be initialized before use");
+
+    // Get data type mapping
+    auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto ncclDataType = (*getDtypeMap())[type];
+
+    // Synchronize stream to ensure host copies are complete before accessing data
+    cudaStreamSynchronize(stream);
+
+    // Process host data
+    int* host_send_counts = host_send_rank_cum_sum.data_ptr<int>();
+    int* host_recv_counts = host_recv_rank_cum_sum.data_ptr<int>();
+
+    // Convert cumulative sums to counts and displacements
+    std::vector<int> send_counts(epSize);
+    std::vector<int> recv_counts(epSize);
+    std::vector<int> send_displs(epSize);
+    std::vector<int> recv_displs(epSize);
+
+    // Calculate send counts and displacements
+    send_displs[0] = 0;
+    send_counts[0] = host_send_counts[0];
+    for (int i = 1; i < epSize; i++)
+    {
+        send_counts[i] = host_send_counts[i] - host_send_counts[i - 1];
+        send_displs[i] = host_send_counts[i - 1];
+    }
+
+    // Calculate recv counts and displacements
+    recv_displs[0] = 0;
+    recv_counts[0] = host_recv_counts[0];
+    for (int i = 1; i < epSize; i++)
+    {
+        recv_counts[i] = host_recv_counts[i] - host_recv_counts[i - 1];
+        recv_displs[i] = host_recv_counts[i - 1];
+    }
+
+    // Prepare buffers and data layout
+    int64_t feature_size = input.size(1);
+    size_t elt_size = input.dtype().itemsize();
+
+    // Create temporary buffers for gathering data according to indices
+    torch::Tensor send_buffer = torch::empty({sendIndices.size(0), feature_size}, input.options());
+    torch::Tensor recv_buffer = torch::empty({recvIndices.size(0), feature_size}, output.options());
+
+    // Gather send data according to send indices
+    // TODO: This is inefficient - should use a custom CUDA kernel for gathering
+    int* send_indices_ptr = host_send_indices.data_ptr<int>();
+    for (int i = 0; i < host_send_indices.size(0); i++)
+    {
+        if (send_indices_ptr[i] >= 0 && send_indices_ptr[i] < input.size(0))
+        {
+            send_buffer[i].copy_(input[send_indices_ptr[i]], /*non_blocking=*/true);
+        }
+    }
+
+    // Perform NCCL all-to-all communication
+    ncclGroupStart();
+
+    for (int peer = 0; peer < epSize; peer++)
+    {
+        if (peer != epRank)
+        {
+            // Send to peer
+            if (send_counts[peer] > 0)
+            {
+                void* send_ptr
+                    = static_cast<char*>(send_buffer.data_ptr()) + send_displs[peer] * feature_size * elt_size;
+                NCCLCHECK_THROW(
+                    ncclSend(send_ptr, send_counts[peer] * feature_size, ncclDataType, peer, *ncclComm, stream));
+            }
+
+            // Receive from peer
+            if (recv_counts[peer] > 0)
+            {
+                void* recv_ptr
+                    = static_cast<char*>(recv_buffer.data_ptr()) + recv_displs[peer] * feature_size * elt_size;
+                NCCLCHECK_THROW(
+                    ncclRecv(recv_ptr, recv_counts[peer] * feature_size, ncclDataType, peer, *ncclComm, stream));
+            }
+        }
+        else
+        {
+            // Local copy for same rank
+            if (send_counts[peer] > 0)
+            {
+                void* send_ptr
+                    = static_cast<char*>(send_buffer.data_ptr()) + send_displs[peer] * feature_size * elt_size;
+                void* recv_ptr
+                    = static_cast<char*>(recv_buffer.data_ptr()) + recv_displs[peer] * feature_size * elt_size;
+                cudaMemcpyAsync(
+                    recv_ptr, send_ptr, send_counts[peer] * feature_size * elt_size, cudaMemcpyDeviceToDevice, stream);
+            }
+        }
+    }
+
+    ncclGroupEnd();
+
+    // Scatter received data according to recv indices
+    // TODO: This is inefficient - should use a custom CUDA kernel for scattering
+    int* recv_indices_ptr = host_recv_indices.data_ptr<int>();
+    for (int i = 0; i < host_recv_indices.size(0); i++)
+    {
+        if (recv_indices_ptr[i] >= 0 && recv_indices_ptr[i] < output.size(0))
+        {
+            output[recv_indices_ptr[i]].copy_(recv_buffer[i], /*non_blocking=*/true);
+        }
+    }
+
+    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+}
+#endif // ENABLE_MULTI_DEVICE
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch::Tensor> realRankTokenCountCumSum,
     int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize)
@@ -142,12 +286,19 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     torch::Tensor recvRankCumSum, torch::Tensor recvIndices, torch::Tensor allWorkspaces, int64_t epRank,
     int64_t epSize, std::optional<bool> useNccl)
 {
+    bool use_nccl = useNccl.has_value() ? useNccl.value() : false;
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndices, torch::kInt32);
     CHECK_INPUT(recvRankCumSum, torch::kInt32);
     CHECK_INPUT(recvIndices, torch::kInt32);
-    // allWorkspaces is a uint64 tensor, but may not be contiguous
-    TORCH_CHECK(allWorkspaces.dtype() == torch::kUInt64, "allWorkspaces must be a uint64 tensor");
+
+    if (!use_nccl)
+    {
+        // allWorkspaces is a uint64 tensor, but may not be contiguous
+        TORCH_CHECK(allWorkspaces.dtype() == torch::kUInt64, "allWorkspaces must be a uint64 tensor");
+        TORCH_CHECK(allWorkspaces.dim() == 2, "allWorkspaces must be a 2D tensor");
+        TORCH_CHECK(allWorkspaces.size(0) == epSize, "allWorkspaces must have epSize elements");
+    }
 
     TORCH_CHECK(input.dim() == 2, "input must be a 2D tensor");
     TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
@@ -155,152 +306,21 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     TORCH_CHECK(sendIndices.dim() == 1, "sendIndices must be a 1D tensor");
     TORCH_CHECK(recvRankCumSum.dim() == 1, "recvRankCumSum must be a 1D tensor");
     TORCH_CHECK(recvIndices.dim() == 1, "recvIndices must be a 1D tensor");
-    TORCH_CHECK(allWorkspaces.dim() == 2, "allWorkspaces must be a 2D tensor");
 
     TORCH_CHECK(input.size(1) == output.size(1), "input and output must have the same second dimension");
     TORCH_CHECK(sendRankCumSum.size(0) == epSize, "sendRankCumSum must have epSize elements");
     TORCH_CHECK(recvRankCumSum.size(0) == epSize, "recvRankCumSum must have epSize elements");
-    TORCH_CHECK(allWorkspaces.size(0) == epSize, "allWorkspaces must have epSize elements");
 
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
-
-    bool use_nccl = useNccl.has_value() ? useNccl.value() : false;
 
     if (use_nccl)
     {
 #if ENABLE_MULTI_DEVICE
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-
-        torch::Tensor host_send_rank_cum_sum
-            = torch::empty(sendRankCumSum.sizes(), sendRankCumSum.options().dtype(torch::kInt32));
-        host_send_rank_cum_sum.copy_(sendRankCumSum);
-        torch::Tensor host_send_indices = torch::empty(sendIndices.sizes(), sendIndices.options().dtype(torch::kInt32));
-        host_send_indices.copy_(sendIndices);
-        torch::Tensor host_recv_rank_cum_sum
-            = torch::empty(recvRankCumSum.sizes(), recvRankCumSum.options().dtype(torch::kInt32));
-        host_recv_rank_cum_sum.copy_(recvRankCumSum);
-        torch::Tensor host_recv_indices = torch::empty(recvIndices.sizes(), recvIndices.options().dtype(torch::kInt32));
-        host_recv_indices.copy_(recvIndices);
-
-        // Synchronize to ensure host tensors are ready
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-
-        // Get NCCL communicator for EP group
-        std::set<int> ep_group;
-        for (int i = 0; i < epSize; i++)
-        {
-            ep_group.insert(i);
-        }
-        auto ncclComm = getComm(ep_group);
-        TLLM_CHECK_WITH_INFO(ncclComm.get() != nullptr, "NCCL communicator should be initialized before use");
-
-        // Get data type mapping
-        auto type = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
-        auto ncclDataType = (*getDtypeMap())[type];
-
-        // Get host data pointers
-        int* host_send_counts = host_send_rank_cum_sum.data_ptr<int>();
-        int* host_recv_counts = host_recv_rank_cum_sum.data_ptr<int>();
-
-        // Convert cumulative sums to counts
-        std::vector<int> send_counts(epSize);
-        std::vector<int> recv_counts(epSize);
-        std::vector<int> send_displs(epSize);
-        std::vector<int> recv_displs(epSize);
-
-        // Calculate send counts and displacements
-        send_displs[0] = 0;
-        send_counts[0] = host_send_counts[0];
-        for (int i = 1; i < epSize; i++)
-        {
-            send_counts[i] = host_send_counts[i] - host_send_counts[i - 1];
-            send_displs[i] = host_send_counts[i - 1];
-        }
-
-        // Calculate recv counts and displacements
-        recv_displs[0] = 0;
-        recv_counts[0] = host_recv_counts[0];
-        for (int i = 1; i < epSize; i++)
-        {
-            recv_counts[i] = host_recv_counts[i] - host_recv_counts[i - 1];
-            recv_displs[i] = host_recv_counts[i - 1];
-        }
-
-        // Get element size and total elements per vector
-        size_t elt_size = input.dtype().itemsize();
-        int64_t feature_size = input.size(1);
-
-        // Create temporary buffers for gathering data according to indices
-        torch::Tensor send_buffer = torch::empty({sendIndices.size(0), feature_size}, input.options());
-        torch::Tensor recv_buffer = torch::empty({recvIndices.size(0), feature_size}, output.options());
-
-        // Gather send data according to send indices
-        int* send_indices_ptr = sendIndices.data_ptr<int>();
-        for (int i = 0; i < sendIndices.size(0); i++)
-        {
-            if (send_indices_ptr[i] >= 0 && send_indices_ptr[i] < input.size(0))
-            {
-                send_buffer[i].copy_(input[send_indices_ptr[i]]);
-            }
-        }
-
-        // Perform all-to-all using NCCL group operations
-        ncclGroupStart();
-
-        for (int peer = 0; peer < epSize; peer++)
-        {
-            if (peer != epRank)
-            {
-                // Send to peer
-                if (send_counts[peer] > 0)
-                {
-                    void* send_ptr
-                        = static_cast<char*>(send_buffer.data_ptr()) + send_displs[peer] * feature_size * elt_size;
-                    NCCLCHECK_THROW(
-                        ncclSend(send_ptr, send_counts[peer] * feature_size, ncclDataType, peer, *ncclComm, stream));
-                }
-
-                // Receive from peer
-                if (recv_counts[peer] > 0)
-                {
-                    void* recv_ptr
-                        = static_cast<char*>(recv_buffer.data_ptr()) + recv_displs[peer] * feature_size * elt_size;
-                    NCCLCHECK_THROW(
-                        ncclRecv(recv_ptr, recv_counts[peer] * feature_size, ncclDataType, peer, *ncclComm, stream));
-                }
-            }
-            else
-            {
-                // Local copy for same rank
-                if (send_counts[peer] > 0)
-                {
-                    void* send_ptr
-                        = static_cast<char*>(send_buffer.data_ptr()) + send_displs[peer] * feature_size * elt_size;
-                    void* recv_ptr
-                        = static_cast<char*>(recv_buffer.data_ptr()) + recv_displs[peer] * feature_size * elt_size;
-                    cudaMemcpyAsync(recv_ptr, send_ptr, send_counts[peer] * feature_size * elt_size,
-                        cudaMemcpyDeviceToDevice, stream);
-                }
-            }
-        }
-
-        ncclGroupEnd();
-
-        // Scatter received data according to recv indices
-        int* recv_indices_ptr = recvIndices.data_ptr<int>();
-        for (int i = 0; i < recvIndices.size(0); i++)
-        {
-            if (recv_indices_ptr[i] >= 0 && recv_indices_ptr[i] < output.size(0))
-            {
-                output[recv_indices_ptr[i]].copy_(recv_buffer[i]);
-            }
-        }
-
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        moeCommNcclAllToAll(input, sendRankCumSum, sendIndices, output, recvRankCumSum, recvIndices, epRank, epSize);
+        return;
 #else
         TORCH_CHECK(false, "NCCL support is not enabled. Please compile with ENABLE_MULTI_DEVICE=ON");
 #endif // ENABLE_MULTI_DEVICE
-        return;
     }
 
     tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
