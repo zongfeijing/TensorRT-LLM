@@ -353,7 +353,7 @@ class Deepseekv3MoE(nn.Module):
         self.use_dp = model_config.mapping.enable_attention_dp
         self.enable_alltoall = Deepseekv3MoE.should_enable_alltoall(
             model_config, top_k)
-        if self.enable_alltoall:
+        if self.enable_alltoall and MnnvlMemory.supports_mnnvl():
             MnnvlMemory.initialize()
         self.gate = DeepseekV3Gate(
             hidden_size,
@@ -450,13 +450,10 @@ class Deepseekv3MoE(nn.Module):
         if model_config.mapping.tp_size == 1:
             return False
 
-        if not MnnvlMemory.supports_mnnvl():
-            return False
-
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return False
 
-        if model_config.mapping.moe_ep_size <= top_k:
+        if model_config.mapping.moe_ep_size < top_k:
             return False
 
         return True

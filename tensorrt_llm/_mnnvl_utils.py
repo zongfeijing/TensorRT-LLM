@@ -291,7 +291,14 @@ class MnnvlMoe:
     moe_mapping: Mapping = None
 
     @staticmethod
+    def use_nccl() -> bool:
+        return not MnnvlMemory.supports_mnnvl()
+
+    @staticmethod
     def get_moe_workspaces(mapping: Mapping):
+        if MnnvlMoe.use_nccl():
+            return None
+
         if MnnvlMoe.moe_workspace is not None:
             assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
             return MnnvlMoe.moe_workspace_tensor
@@ -374,7 +381,8 @@ class MnnvlMoe:
                                   output_tensor,
                                   alltoall_info.recv_rank_count_cumsum,
                                   alltoall_info.recv_rank_local_indices,
-                                  workspace, ep_rank, ep_size)
+                                  workspace, ep_rank, ep_size,
+                                  MnnvlMoe.use_nccl())
         return output_tensor
 
     @staticmethod
@@ -392,7 +400,7 @@ class MnnvlMoe:
             alltoall_info.recv_rank_local_indices, output_tensor,
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.backward_recv_rank_local_indices, workspace, ep_rank,
-            ep_size)
+            ep_size, MnnvlMoe.use_nccl())
         return torch.sum(output_tensor.reshape(token_count, top_k, x.shape[1]),
                          dim=1,
                          keepdim=False)
