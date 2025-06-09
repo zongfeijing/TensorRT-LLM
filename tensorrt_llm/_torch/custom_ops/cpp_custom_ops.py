@@ -224,6 +224,7 @@ def _register_fake():
         all_workspaces: torch.Tensor,
         ep_rank: int,
         ep_size: int,
+        use_nccl: Optional[bool] = None,
     ):
         pass
 
