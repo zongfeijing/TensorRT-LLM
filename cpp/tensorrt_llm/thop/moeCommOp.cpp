@@ -17,6 +17,7 @@
 
 #include "tensorrt_llm/common/opUtils.h"
 #include "tensorrt_llm/kernels/moeCommKernels.h"
+#include "tensorrt_llm/kernels/moeGatherScatterKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -42,19 +43,13 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
 {
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
 
-    // Copy tensors to host for processing with stream
+    // Copy rank cumulative sums to host for processing counts and displacements
     torch::Tensor hostSendRankCumSum
         = torch::empty(sendRankCumSum.sizes(), sendRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
     hostSendRankCumSum.copy_(sendRankCumSum, /*non_blocking=*/true);
-    torch::Tensor hostSendIndices
-        = torch::empty(sendIndices.sizes(), sendIndices.options().dtype(torch::kInt32).device(torch::kCPU));
-    hostSendIndices.copy_(sendIndices, /*non_blocking=*/true);
     torch::Tensor hostRecvRankCumSum
         = torch::empty(recvRankCumSum.sizes(), recvRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
     hostRecvRankCumSum.copy_(recvRankCumSum, /*non_blocking=*/true);
-    torch::Tensor hostRecvIndices
-        = torch::empty(recvIndices.sizes(), recvIndices.options().dtype(torch::kInt32).device(torch::kCPU));
-    hostRecvIndices.copy_(recvIndices, /*non_blocking=*/true);
 
     // Get CUDA stream
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
@@ -111,15 +106,29 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
     torch::Tensor sendBuffer = torch::empty({sendIndices.size(0), featureSize}, input.options());
     torch::Tensor recvBuffer = torch::empty({recvIndices.size(0), featureSize}, output.options());
 
-    // Gather send data according to send indices
-    // TODO: This is inefficient - should use a custom CUDA kernel for gathering
-    int* sendIndicesPtr = hostSendIndices.data_ptr<int>();
-    for (int i = 0; i < hostSendIndices.size(0); i++)
+    // Gather send data according to send indices using CUDA kernel
+    // Use unsigned integer types based on element size for generic memory operations
+    switch (eltSize)
     {
-        if (sendIndicesPtr[i] >= 0 && sendIndicesPtr[i] < input.size(0))
-        {
-            sendBuffer[i].copy_(input[sendIndicesPtr[i]], /*non_blocking=*/true);
-        }
+    case 1: // uint8_t: covers FP8, NVFP4 (packed), and other 1-byte types
+        tensorrt_llm::kernels::invokeMoeGather<uint8_t>(reinterpret_cast<uint8_t*>(sendBuffer.data_ptr()),
+            reinterpret_cast<uint8_t const*>(input.data_ptr()),
+            sendIndices.data_ptr<int>(), // Use device tensor, not host copy
+            sendIndices.size(0), featureSize, stream);
+        break;
+    case 2: // uint16_t: covers half, bfloat16, and other 2-byte types
+        tensorrt_llm::kernels::invokeMoeGather<uint16_t>(reinterpret_cast<uint16_t*>(sendBuffer.data_ptr()),
+            reinterpret_cast<uint16_t const*>(input.data_ptr()),
+            sendIndices.data_ptr<int>(), // Use device tensor, not host copy
+            sendIndices.size(0), featureSize, stream);
+        break;
+    case 4: // uint32_t: covers float and other 4-byte types
+        tensorrt_llm::kernels::invokeMoeGather<uint32_t>(reinterpret_cast<uint32_t*>(sendBuffer.data_ptr()),
+            reinterpret_cast<uint32_t const*>(input.data_ptr()),
+            sendIndices.data_ptr<int>(), // Use device tensor, not host copy
+            sendIndices.size(0), featureSize, stream);
+        break;
+    default: TORCH_CHECK(false, "Unsupported data type size (%zu bytes) for MOE gather operation", eltSize);
     }
 
     // Perform NCCL all-to-all communication
@@ -160,15 +169,29 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
 
     ncclGroupEnd();
 
-    // Scatter received data according to recv indices
-    // TODO: This is inefficient - should use a custom CUDA kernel for scattering
-    int* recvIndicesPtr = hostRecvIndices.data_ptr<int>();
-    for (int i = 0; i < hostRecvIndices.size(0); i++)
+    // Scatter received data according to recv indices using CUDA kernel
+    // Use unsigned integer types based on element size for generic memory operations
+    switch (eltSize)
     {
-        if (recvIndicesPtr[i] >= 0 && recvIndicesPtr[i] < output.size(0))
-        {
-            output[recvIndicesPtr[i]].copy_(recvBuffer[i], /*non_blocking=*/true);
-        }
+    case 1: // uint8_t: covers FP8, NVFP4 (packed), and other 1-byte types
+        tensorrt_llm::kernels::invokeMoeScatter<uint8_t>(reinterpret_cast<uint8_t*>(output.data_ptr()),
+            reinterpret_cast<uint8_t const*>(recvBuffer.data_ptr()),
+            recvIndices.data_ptr<int>(), // Use device tensor, not host copy
+            recvIndices.size(0), featureSize, stream);
+        break;
+    case 2: // uint16_t: covers half, bfloat16, and other 2-byte types
+        tensorrt_llm::kernels::invokeMoeScatter<uint16_t>(reinterpret_cast<uint16_t*>(output.data_ptr()),
+            reinterpret_cast<uint16_t const*>(recvBuffer.data_ptr()),
+            recvIndices.data_ptr<int>(), // Use device tensor, not host copy
+            recvIndices.size(0), featureSize, stream);
+        break;
+    case 4: // uint32_t: covers float and other 4-byte types
+        tensorrt_llm::kernels::invokeMoeScatter<uint32_t>(reinterpret_cast<uint32_t*>(output.data_ptr()),
+            reinterpret_cast<uint32_t const*>(recvBuffer.data_ptr()),
+            recvIndices.data_ptr<int>(), // Use device tensor, not host copy
+            recvIndices.size(0), featureSize, stream);
+        break;
+    default: TORCH_CHECK(false, "Unsupported data type size (%zu bytes) for MOE scatter operation", eltSize);
     }
 
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
