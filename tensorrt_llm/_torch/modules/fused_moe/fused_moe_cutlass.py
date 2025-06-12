@@ -663,23 +663,28 @@ class CutlassFusedMoE(MoE):
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     x_row: int, x_col: int,
                                     alltoall_info: MoEAlltoallInfo):
+        torch.cuda.nvtx.range_push("mnnvl_moe_alltoallv_x")
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
-
+        torch.cuda.nvtx.range_pop()
         if x_sf is not None:
             if self.has_nvfp4:
+                torch.cuda.nvtx.range_push("unswizzle_sf")
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
                                     self.scaling_vector_size)
+                torch.cuda.nvtx.range_pop()
 
+            torch.cuda.nvtx.range_push("mnnvl_moe_alltoallv_x_sf")
             x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
                                                 self.alltoall_workspace,
                                                 self.ep_rank, self.ep_size)
-
+            torch.cuda.nvtx.range_pop()
             if self.has_nvfp4:
+                torch.cuda.nvtx.range_push("swizzle_sf")
                 x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                   self.scaling_vector_size)
-
+                torch.cuda.nvtx.range_pop()
         return x, x_sf
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
