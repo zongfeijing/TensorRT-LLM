@@ -369,8 +369,8 @@ class MnnvlMoe:
 
     @staticmethod
     def mnnvl_moe_alltoallv(x: torch.Tensor, alltoall_info: MoEAlltoallInfo,
-                            workspace: torch.Tensor, ep_rank: int,
-                            ep_size: int):
+                            workspace: torch.Tensor, ep_rank: int, ep_size: int,
+                            use_nccl: bool):
         assert x.dim() == 2, "only 2D tensor supported, please reshape."
         output_tensor = torch.empty(alltoall_info.local_token_allocation_count,
                                     x.shape[1],
@@ -381,15 +381,15 @@ class MnnvlMoe:
                                   output_tensor,
                                   alltoall_info.recv_rank_count_cumsum,
                                   alltoall_info.recv_rank_local_indices,
-                                  workspace, ep_rank, ep_size,
-                                  MnnvlMoe.use_nccl())
+                                  workspace, ep_rank, ep_size, use_nccl)
         return output_tensor
 
     @staticmethod
     def mnnvl_moe_alltoallv_combine(x: torch.Tensor,
                                     alltoall_info: MoEAlltoallInfo,
                                     workspace: torch.Tensor, ep_rank: int,
-                                    ep_size: int, top_k: int, token_count: int):
+                                    ep_size: int, top_k: int, token_count: int,
+                                    use_nccl: bool):
         assert x.dim() == 2, "2D tensor supported, please reshape."
         output_tensor = torch.zeros(token_count * top_k,
                                     x.shape[1],
@@ -400,7 +400,7 @@ class MnnvlMoe:
             alltoall_info.recv_rank_local_indices, output_tensor,
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.backward_recv_rank_local_indices, workspace, ep_rank,
-            ep_size, MnnvlMoe.use_nccl())
+            ep_size, use_nccl)
         return torch.sum(output_tensor.reshape(token_count, top_k, x.shape[1]),
                          dim=1,
                          keepdim=False)

@@ -30,8 +30,6 @@
 #include <nccl.h>
 #endif // ENABLE_MULTI_DEVICE
 
-#include "nvtx3/nvtx3.hpp"
-
 #include <cassert>
 #include <set>
 
@@ -44,7 +42,6 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
     torch::Tensor const& recvIndices, int64_t epRank, int64_t epSize)
 {
     TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-    nvtxRangePushA("MOE_NCCL_AllToAll_memcopy");
     // Copy rank cumulative sums to host for processing counts and displacements
     torch::Tensor hostSendRankCumSum
         = torch::empty(sendRankCumSum.sizes(), sendRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
@@ -53,9 +50,6 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
         = torch::empty(recvRankCumSum.sizes(), recvRankCumSum.options().dtype(torch::kInt32).device(torch::kCPU));
     hostRecvRankCumSum.copy_(recvRankCumSum, /*non_blocking=*/true);
 
-    nvtxRangePop();
-
-    nvtxRangePushA("MOE_NCCL_AllToAll_setup");
     // Get CUDA stream
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -75,7 +69,6 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
     // Synchronize stream to ensure host copies are complete before accessing data
     cudaStreamSynchronize(stream);
 
-    nvtxRangePop();
     int* hostSendCounts = hostSendRankCumSum.data_ptr<int>();
     int* hostRecvCounts = hostRecvRankCumSum.data_ptr<int>();
 
@@ -136,48 +129,28 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
     default: TORCH_CHECK(false, "Unsupported data type size (%zu bytes) for MOE gather operation", eltSize);
     }
 
-    nvtxRangePushA("MOE_NCCL_AllToAll_nccl");
-
     // Perform NCCL all-to-all communication
     ncclGroupStart();
 
     for (int peer = 0; peer < epSize; peer++)
     {
-        if (peer != epRank)
+        // Send to peer
+        if (sendCounts[peer] > 0)
         {
-            // Send to peer
-            if (sendCounts[peer] > 0)
-            {
-                void* sendPtr = static_cast<char*>(sendBuffer.data_ptr()) + sendDispls[peer] * featureSize * eltSize;
-                NCCLCHECK_THROW(
-                    ncclSend(sendPtr, sendCounts[peer] * featureSize, ncclDataType, peer, *ncclComm, stream));
-            }
-
-            // Receive from peer
-            if (recvCounts[peer] > 0)
-            {
-                void* recvPtr = static_cast<char*>(recvBuffer.data_ptr()) + recvDispls[peer] * featureSize * eltSize;
-                NCCLCHECK_THROW(
-                    ncclRecv(recvPtr, recvCounts[peer] * featureSize, ncclDataType, peer, *ncclComm, stream));
-            }
+            void* sendPtr = static_cast<char*>(sendBuffer.data_ptr()) + sendDispls[peer] * featureSize * eltSize;
+            NCCLCHECK_THROW(ncclSend(sendPtr, sendCounts[peer] * featureSize, ncclDataType, peer, *ncclComm, stream));
         }
-        else
+
+        // Receive from peer
+        if (recvCounts[peer] > 0)
         {
-            // Local copy for same rank
-            if (sendCounts[peer] > 0)
-            {
-                void* sendPtr = static_cast<char*>(sendBuffer.data_ptr()) + sendDispls[peer] * featureSize * eltSize;
-                void* recvPtr = static_cast<char*>(recvBuffer.data_ptr()) + recvDispls[peer] * featureSize * eltSize;
-                cudaMemcpyAsync(
-                    recvPtr, sendPtr, sendCounts[peer] * featureSize * eltSize, cudaMemcpyDeviceToDevice, stream);
-            }
+            void* recvPtr = static_cast<char*>(recvBuffer.data_ptr()) + recvDispls[peer] * featureSize * eltSize;
+            NCCLCHECK_THROW(ncclRecv(recvPtr, recvCounts[peer] * featureSize, ncclDataType, peer, *ncclComm, stream));
         }
     }
 
     ncclGroupEnd();
-    nvtxRangePop();
 
-    nvtxRangePushA("MOE_NCCL_AllToAll_scatter");
     // Scatter received data according to recv indices using CUDA kernel
     // Use unsigned integer types based on element size for generic memory operations
     switch (eltSize)
@@ -202,8 +175,6 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
         break;
     default: TORCH_CHECK(false, "Unsupported data type size (%zu bytes) for MOE scatter operation", eltSize);
     }
-
-    nvtxRangePop();
 
     TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
 }
@@ -316,7 +287,6 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     torch::Tensor recvRankCumSum, torch::Tensor recvIndices, torch::Tensor allWorkspaces, int64_t epRank,
     int64_t epSize, std::optional<bool> useNccl)
 {
-    nvtxRangePushA("MOE_Comm_Total");
     bool useNcclFlag = useNccl.has_value() ? useNccl.value() : false;
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndices, torch::kInt32);
@@ -348,7 +318,6 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     {
 #if ENABLE_MULTI_DEVICE
         moeCommNcclAllToAll(input, sendRankCumSum, sendIndices, output, recvRankCumSum, recvIndices, epRank, epSize);
-        nvtxRangePop();
         return;
 #else
         TORCH_CHECK(false, "NCCL support is not enabled. Please compile with ENABLE_MULTI_DEVICE=ON");
@@ -382,7 +351,6 @@ void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor 
     auto stream = at::cuda::getCurrentCUDAStream();
 
     tensorrt_llm::kernels::moeAllToAll(worldInfo, sendRecvDataInfo, sendDispls, recvDispls, workspace, stream);
-    nvtxRangePop();
 }
 
 int64_t getWorkspaceSizePerRank(int64_t epSize)
