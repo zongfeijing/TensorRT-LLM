@@ -720,39 +720,57 @@ void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo e
 
 template <int kThreadsGroupSize>
 __global__ void moeLocalGatherDevice(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int localMaxTokenCount, int const* recvRankCountCumSum, int const* localGatherIndices,
-    int const* gatheredExpertIds, float const* gatheredScales, int* localExpertIds, float* localScales)
+    int maxTokenCountPerRank, int localMaxTokenCount, int numChunks, int const* recvRankCountCumSum,
+    int const* localGatherIndices, int const* gatheredExpertIds, float const* gatheredScales, int* localExpertIds,
+    float* localScales)
 {
     cg::thread_block_tile<kThreadsGroupSize> tile = cg::tiled_partition<kThreadsGroupSize>(cg::this_thread_block());
     int laneInTile = tile.thread_rank();
     int tileId = threadIdx.x / kThreadsGroupSize;
     int tileCountPerBlock = blockDim.x / kThreadsGroupSize;
+    int chunkId = blockIdx.z;
 
     int epSize = worldInfo.epSize;
+    int expertCount = expertParallelInfo.expertCount;
+    int expertPerRank = expertCount / worldInfo.epSize;
+    int chunkSize = expertPerRank / numChunks;
     int rankTokenCount = recvRankCountCumSum[epSize - 1];
     bool needLoad = laneInTile < expertParallelInfo.topK;
 
     for (int index = tileId + blockIdx.x * tileCountPerBlock; index < localMaxTokenCount;
          index += tileCountPerBlock * gridDim.x)
     {
-        int localTokenIndice = localGatherIndices[index];
-        int expertId = needLoad && (index < rankTokenCount)
-            ? gatheredExpertIds[localTokenIndice * expertParallelInfo.topK + laneInTile]
-            : expertParallelInfo.expertCount;
-        float scale = needLoad && (index < rankTokenCount)
-            ? gatheredScales[localTokenIndice * expertParallelInfo.topK + laneInTile]
-            : 0.0f;
+        int localTokenIndice = localGatherIndices[index + chunkId * localMaxTokenCount];
+        int expertId = expertParallelInfo.expertCount;
+        float scale = 0.0f;
+
+        if (needLoad && (index < rankTokenCount))
+        {
+            expertId = gatheredExpertIds[localTokenIndice * expertParallelInfo.topK + laneInTile];
+            scale = gatheredScales[localTokenIndice * expertParallelInfo.topK + laneInTile];
+
+            int targetChunkId = (expertId % expertPerRank) / chunkSize;
+            if (targetChunkId != chunkId)
+            {
+                expertId = expertParallelInfo.expertCount;
+                scale = 0.0f;
+            }
+        }
+
         if (needLoad)
         {
-            localExpertIds[index * expertParallelInfo.topK + laneInTile] = expertId;
-            localScales[index * expertParallelInfo.topK + laneInTile] = scale;
+            int offset
+                = chunkId * localMaxTokenCount * expertParallelInfo.topK + index * expertParallelInfo.topK + laneInTile;
+            localExpertIds[offset] = expertId;
+            localScales[offset] = scale;
         }
     }
 }
 
 void moeLocalGather(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
-    int localMaxTokenCount, int const* recvRankCountCumSum, int const* localGatherIndices, int const* gatheredExpertIds,
-    float const* gatheredScales, int* localExpertIds, float* localScales, cudaStream_t stream)
+    int localMaxTokenCount, int numChunks, int const* recvRankCountCumSum, int const* localGatherIndices,
+    int const* gatheredExpertIds, float const* gatheredScales, int* localExpertIds, float* localScales,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(expertParallelInfo.topK <= 32, "Only topK less than or equal to 32 supported now.");
     auto* kernelPtr = moeLocalGatherDevice<32>;
@@ -787,9 +805,10 @@ void moeLocalGather(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParall
     int tokenPerBlock = threadsPerBlock / paddedTopK;
     int blockCount = (localMaxTokenCount + tokenPerBlock - 1) / tokenPerBlock * 2;
 
-    kernelPtr<<<blockCount, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
-        localMaxTokenCount, recvRankCountCumSum, localGatherIndices, gatheredExpertIds, gatheredScales, localExpertIds,
-        localScales);
+    dim3 block(blockCount, numChunks, 1);
+    kernelPtr<<<block, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
+        localMaxTokenCount, numChunks, recvRankCountCumSum, localGatherIndices, gatheredExpertIds, gatheredScales,
+        localExpertIds, localScales);
 }
 
 int AllToAllChannelCommunicatorBase::maxSmCount = -1;

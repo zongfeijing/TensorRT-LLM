@@ -244,7 +244,7 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
 
 void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherIndices, torch::Tensor gatheredExpertIds,
     torch::Tensor gatheredScales, torch::Tensor localExpertIds, torch::Tensor localScales, int64_t maxTokenCountPerRank,
-    int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize)
+    int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize, int64_t numChunks)
 {
     CHECK_INPUT(recvRankCumSum, torch::kInt32);
     CHECK_INPUT(localGatherIndices, torch::kInt32);
@@ -259,21 +259,24 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
     TORCH_CHECK(topK <= expertCount, "topK must be less than or equal to expertCount");
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
 
-    TORCH_CHECK(recvRankCumSum.dim() == 1, "recvRankCumSum must be a 1D tensor");
-    TORCH_CHECK(recvRankCumSum.size(0) == epSize, "recvRankCumSum must have epSize elements");
-    TORCH_CHECK(localGatherIndices.dim() == 1, "localGatherIndices must be a 1D tensor");
+    TORCH_CHECK(recvRankCumSum.dim() == 2, "recvRankCumSum must be a 2D tensor");
+    TORCH_CHECK(recvRankCumSum.size(0) == numChunks, "recvRankCumSum must have numChunks rows");
+    TORCH_CHECK(recvRankCumSum.size(1) == epSize, "recvRankCumSum must have epSize elements");
+    TORCH_CHECK(localGatherIndices.dim() == 2, "localGatherIndices must be a 2D tensor");
     TORCH_CHECK(gatheredExpertIds.dim() == 2, "gatheredExpertIds must be a 2D tensor");
     TORCH_CHECK(gatheredScales.dim() == 2, "gatheredScales must be a 2D tensor");
-    TORCH_CHECK(localExpertIds.dim() == 2, "localExpertIds must be a 2D tensor");
-    TORCH_CHECK(localScales.dim() == 2, "localScales must be a 2D tensor");
     TORCH_CHECK(gatheredExpertIds.size(1) == topK, "gatheredExpertIds must have topK columns");
     TORCH_CHECK(gatheredScales.size(1) == topK, "gatheredScales must have topK columns");
-    TORCH_CHECK(localExpertIds.size(1) == topK, "localExpertIds must have topK columns");
-    TORCH_CHECK(localScales.size(1) == topK, "localScales must have topK columns");
+    TORCH_CHECK(localExpertIds.dim() == 3, "localExpertIds must be a 3D tensor");
+    TORCH_CHECK(localScales.dim() == 3, "localScales must be a 3D tensor");
+    TORCH_CHECK(localExpertIds.size(2) == topK, "localExpertIds must have topK columns");
+    TORCH_CHECK(localScales.size(2) == topK, "localScales must have topK columns");
 
-    int localMaxTokenCount = static_cast<int>(localGatherIndices.size(0));
-    TORCH_CHECK(localExpertIds.size(0) == localMaxTokenCount, "localExpertIds must have localMaxTokenCount rows");
-    TORCH_CHECK(localScales.size(0) == localMaxTokenCount, "localScales must have localMaxTokenCount rows");
+    int localMaxTokenCount = static_cast<int>(localGatherIndices.size(1));
+    TORCH_CHECK(localExpertIds.size(0) == numChunks, "localExpertIds must have numChunks rows");
+    TORCH_CHECK(localScales.size(0) == numChunks, "localScales must have numChunks rows");
+    TORCH_CHECK(localExpertIds.size(1) == localMaxTokenCount, "localExpertIds must have localMaxTokenCount rows");
+    TORCH_CHECK(localScales.size(1) == localMaxTokenCount, "localScales must have localMaxTokenCount rows");
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -283,8 +286,9 @@ void moeLocalGatherOp(torch::Tensor recvRankCumSum, torch::Tensor localGatherInd
 
     tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
     tensorrt_llm::kernels::moeLocalGather(worldInfo, expertParallelInfo, maxTokenCountPerRank, localMaxTokenCount,
-        recvRankCumSum.data_ptr<int>(), localGatherIndices.data_ptr<int>(), gatheredExpertIds.data_ptr<int>(),
-        gatheredScales.data_ptr<float>(), localExpertIds.data_ptr<int>(), localScales.data_ptr<float>(), stream);
+        static_cast<int>(numChunks), recvRankCumSum.data_ptr<int>(), localGatherIndices.data_ptr<int>(),
+        gatheredExpertIds.data_ptr<int>(), gatheredScales.data_ptr<float>(), localExpertIds.data_ptr<int>(),
+        localScales.data_ptr<float>(), stream);
 }
 
 void moeCommOp(torch::Tensor input, torch::Tensor sendRankCumSum, torch::Tensor sendIndices, torch::Tensor output,
@@ -391,7 +395,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_local_gather(Tensor recv_rank_cum_sum, Tensor local_gather_indices, Tensor gathered_expert_ids, Tensor "
         "gathered_scales, Tensor local_expert_ids, Tensor local_scales, int max_token_count_per_rank, int "
         "expert_count, int "
-        "top_k, int ep_rank, int ep_size) -> ()");
+        "top_k, int ep_rank, int ep_size, int num_chunks) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

@@ -262,7 +262,8 @@ void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo e
     int* backwardRecvRankLocalIndices, cudaStream_t stream);
 
 void moeLocalGather(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank,
-    int localMaxTokenCount, int const* recvRankCountCumSum, int const* localGatherIndices, int const* gatheredExpertIds,
-    float const* gatheredScales, int* localExpertIds, float* localScales, cudaStream_t stream);
+    int localMaxTokenCount, int numChunks, int const* recvRankCountCumSum, int const* localGatherIndices,
+    int const* gatheredExpertIds, float const* gatheredScales, int* localExpertIds, float* localScales,
+    cudaStream_t stream);
 
 } // namespace tensorrt_llm::kernels

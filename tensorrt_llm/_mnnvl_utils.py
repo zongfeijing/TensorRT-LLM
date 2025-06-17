@@ -361,15 +361,11 @@ class MnnvlMoe:
                                    device=torch.device('cuda'))
 
         # Note: calculate local_expert_ids and local_scales here.
-        # todo: add num_chunks to the input, modify the kernel to support num_chunks
-
-        for chunk_idx in range(num_chunks):
-            torch.ops.trtllm.moe_local_gather(
-                recv_rank_count_cumsum[chunk_idx],
-                local_gather_indices[chunk_idx], gathered_expert_ids,
-                gathered_scales, local_expert_ids[chunk_idx],
-                local_scales[chunk_idx], max_token_count_per_rank, expert_count,
-                top_k, ep_rank, ep_size)
+        torch.ops.trtllm.moe_local_gather(
+            recv_rank_count_cumsum, local_gather_indices, gathered_expert_ids,
+            gathered_scales, local_expert_ids, local_scales,
+            max_token_count_per_rank, expert_count, top_k, ep_rank, ep_size,
+            num_chunks)
 
         alltoall_info = MoEAlltoallInfo(
             local_gather_indices, send_rank_count_cumsum,
