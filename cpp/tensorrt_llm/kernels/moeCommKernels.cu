@@ -355,17 +355,22 @@ void moeAllToAll(MoeEpWorldInfo worldInfo, SendRecvDataInfo sendRecvDataInfo, Se
 
 template <bool isSend, int kThreadsGroupSize>
 __inline__ __device__ void computeSendRecvRankCountDevice(MoeEpWorldInfo worldInfo,
-    MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank, int const* realRankTokenCountCumSum,
-    int const* gatheredTargetRankIds, int* sharedSendRecvRankCount, int* sendRecvRankCount)
+    MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank, int numChunks,
+    int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds, int* sharedSendRecvRankCount,
+    int* sendRecvRankCount)
 {
     cg::thread_block_tile<kThreadsGroupSize> tile = cg::tiled_partition<kThreadsGroupSize>(cg::this_thread_block());
     int laneInTile = tile.thread_rank();
     int tileId = threadIdx.x / kThreadsGroupSize;
     int tileCountPerBlock = blockDim.x / kThreadsGroupSize;
+    int chunkId = blockIdx.z;
 
     int topK = expertParallelInfo.topK;
     int epRank = worldInfo.epRank;
     int epSize = worldInfo.epSize;
+    int expertCount = expertParallelInfo.expertCount;
+    int expertPerRank = expertCount / worldInfo.epSize;
+    int chunkSize = expertPerRank / numChunks;
 
     if (threadIdx.x == 0)
     {
@@ -377,6 +382,7 @@ __inline__ __device__ void computeSendRecvRankCountDevice(MoeEpWorldInfo worldIn
     int compareRankId = isSend ? blockIdx.x : epRank;
     int const* readRankTargetRankIds = gatheredTargetRankIds + readRank * maxTokenCountPerRank * topK;
     int readRankTokenCount = maxTokenCountPerRank;
+
     if (realRankTokenCountCumSum != nullptr)
     {
         int readRankStart = readRank == 0 ? 0 : realRankTokenCountCumSum[readRank - 1];
@@ -384,9 +390,20 @@ __inline__ __device__ void computeSendRecvRankCountDevice(MoeEpWorldInfo worldIn
         readRankTokenCount = realRankTokenCountCumSum[readRank] - readRankStart;
     }
 
-    for (int i = tileId + blockIdx.z * tileCountPerBlock; i < readRankTokenCount; i += tileCountPerBlock * gridDim.z)
+    // for (int i = tileId + blockIdx.z * tileCountPerBlock; i < readRankTokenCount; i += tileCountPerBlock * gridDim.z)
+    for (int i = tileId; i < readRankTokenCount; i += tileCountPerBlock)
     {
-        int targetRankId = laneInTile < topK ? readRankTargetRankIds[i * topK + laneInTile] : epSize;
+        bool isValid = laneInTile < topK;
+        int expertId = -1;
+
+        if (isValid)
+        {
+            expertId = (readRankTargetRankIds[i * topK + laneInTile]);
+            int targetChunkId = (expertId % expertPerRank) / chunkSize;
+            isValid = targetChunkId == chunkId;
+        }
+
+        int targetRankId = isValid ? expertId / expertPerRank : epSize;
         bool rankMatched = (targetRankId == compareRankId);
         bool hasRankMatched = tile.any(rankMatched);
         if (hasRankMatched && laneInTile == 0)
@@ -398,14 +415,14 @@ __inline__ __device__ void computeSendRecvRankCountDevice(MoeEpWorldInfo worldIn
     __syncthreads();
     if (threadIdx.x == 0)
     {
-        atomicAdd_system(sendRecvRankCount + blockIdx.x, *sharedSendRecvRankCount);
+        atomicAdd_system(sendRecvRankCount + chunkId * epSize + blockIdx.x, *sharedSendRecvRankCount);
     }
 }
 
 template <int kThreadsGroupSize>
 __global__ void computeSendRecvRankCountKernel(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds, int* sendRankCount,
-    int* recvRankCount)
+    int maxTokenCountPerRank, int numChunks, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+    int* sendRankCount, int* recvRankCount)
 {
     static_assert(kThreadsGroupSize == 1 || kThreadsGroupSize == 2 || kThreadsGroupSize == 4 || kThreadsGroupSize == 8
             || kThreadsGroupSize == 16 || kThreadsGroupSize == 32,
@@ -415,19 +432,19 @@ __global__ void computeSendRecvRankCountKernel(MoeEpWorldInfo worldInfo, MoeExpe
     {
         // compute send rank count
         computeSendRecvRankCountDevice<true, kThreadsGroupSize>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
-            realRankTokenCountCumSum, gatheredTargetRankIds, &sharedSendRecvRankCount, sendRankCount);
+            numChunks, realRankTokenCountCumSum, gatheredTargetRankIds, &sharedSendRecvRankCount, sendRankCount);
     }
     else
     {
         // compute recv rank count
         computeSendRecvRankCountDevice<false, kThreadsGroupSize>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
-            realRankTokenCountCumSum, gatheredTargetRankIds, &sharedSendRecvRankCount, recvRankCount);
+            numChunks, realRankTokenCountCumSum, gatheredTargetRankIds, &sharedSendRecvRankCount, recvRankCount);
     }
 }
 
 void computeSendRecvRankCount(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds, int* sendRankCount,
-    int* recvRankCount, cudaStream_t stream)
+    int maxTokenCountPerRank, int numChunks, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+    int* sendRankCount, int* recvRankCount, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(expertParallelInfo.topK <= 32, "Only topK less than or equal to 32 supported now.");
     int threadsPerBlock = 1024;
@@ -452,15 +469,16 @@ void computeSendRecvRankCount(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo ex
     {
         kernelPtr = computeSendRecvRankCountKernel<16>;
     }
-    dim3 block(worldInfo.epSize, 2, 1);
-    kernelPtr<<<block, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
+    dim3 block(worldInfo.epSize, 2, numChunks);
+    kernelPtr<<<block, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank, numChunks,
         realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCount, recvRankCount);
 }
 
 template <int kThreadsPerBlock>
 __global__ void inplaceSendRecvRankCumSumKernel(MoeEpWorldInfo worldInfo, int* sendRankCount, int* recvRankCount)
 {
-    int* inputOutputPtr = blockIdx.x == 0 ? sendRankCount : recvRankCount;
+    int epSize = worldInfo.epSize;
+    int* inputOutputPtr = blockIdx.x == 0 ? sendRankCount + blockIdx.y * epSize : recvRankCount + blockIdx.y * epSize;
     typedef cub::BlockScan<int, kThreadsPerBlock> BlockScan;
     __shared__ typename BlockScan::TempStorage temp_storage;
 
@@ -474,7 +492,8 @@ __global__ void inplaceSendRecvRankCumSumKernel(MoeEpWorldInfo worldInfo, int* s
     }
 }
 
-void inplaceSendRecvRankCumSum(MoeEpWorldInfo worldInfo, int* sendRankCount, int* recvRankCount, cudaStream_t stream)
+void inplaceSendRecvRankCumSum(
+    MoeEpWorldInfo worldInfo, int numChunks, int* sendRankCount, int* recvRankCount, cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(worldInfo.epSize <= 1024, "Only worldInfo.epSize less than or equal to 1024 supported now.");
     auto* kernelPtr = inplaceSendRecvRankCumSumKernel<1024>;
@@ -504,13 +523,14 @@ void inplaceSendRecvRankCumSum(MoeEpWorldInfo worldInfo, int* sendRankCount, int
         kernelPtr = inplaceSendRecvRankCumSumKernel<512>;
         blockSize = 512;
     }
-    kernelPtr<<<2, blockSize, 0, stream>>>(worldInfo, sendRankCount, recvRankCount);
+    dim3 block(2, numChunks, 1);
+    kernelPtr<<<block, blockSize, 0, stream>>>(worldInfo, sendRankCount, recvRankCount);
 }
 
 template <bool isSend, int kThreadsGroupSize, int kThreadsPerBlock>
 __inline__ __device__ void computeSendRecvIndicesDevice(MoeEpWorldInfo worldInfo,
-    MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank, int const* realRankTokenCountCumSum,
-    int const* gatheredTargetRankIds, int const* sendRecvCumSum,
+    MoeExpertParallelInfo expertParallelInfo, int maxTokenCountPerRank, int numChunks,
+    int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds, int const* sendRecvCumSum,
     int* sendRecvIndices,              // send or receive
     int* localGatherIndices,           // receive only
     int* backwardRecvRankLocalIndices, // send only
@@ -520,14 +540,18 @@ __inline__ __device__ void computeSendRecvIndicesDevice(MoeEpWorldInfo worldInfo
     int laneInTile = tile.thread_rank();
     int tileId = threadIdx.x / kThreadsGroupSize;
     int tileCountPerBlock = blockDim.x / kThreadsGroupSize;
+    int chunkId = blockIdx.z;
 
     int topK = expertParallelInfo.topK;
     int epRank = worldInfo.epRank;
     int epSize = worldInfo.epSize;
+    int expertCount = expertParallelInfo.expertCount;
+    int expertPerRank = expertCount / worldInfo.epSize;
+    int chunkSize = expertPerRank / numChunks;
 
     if (threadIdx.x == 0)
     {
-        *sharedSendRecvRankStart = blockIdx.x == 0 ? 0 : sendRecvCumSum[blockIdx.x - 1];
+        *sharedSendRecvRankStart = blockIdx.x == 0 ? 0 : sendRecvCumSum[chunkId * epSize + blockIdx.x - 1];
     }
 
     __syncthreads();
@@ -543,13 +567,22 @@ __inline__ __device__ void computeSendRecvIndicesDevice(MoeEpWorldInfo worldInfo
         readRankTokenCount = realRankTokenCountCumSum[readRank] - readRankStart;
     }
 
-    for (int blockStartId = blockIdx.z * tileCountPerBlock; blockStartId < readRankTokenCount;
-         blockStartId += tileCountPerBlock * gridDim.z)
+    // for (int blockStartId = blockIdx.z * tileCountPerBlock; blockStartId < readRankTokenCount;
+    //      blockStartId += tileCountPerBlock * gridDim.z)
+    for (int i = tileId; i < readRankTokenCount; i += tileCountPerBlock)
     {
-        int stepStartIndice = *sharedSendRecvRankStart;
-        int i = blockStartId + tileId;
-        int targetRankId
-            = (laneInTile < topK && i < readRankTokenCount) ? readRankTargetRankIds[i * topK + laneInTile] : epSize;
+        int stepStartIndice = *sharedSendRecvRankStart + chunkId * maxTokenCountPerRank * epSize;
+        bool isValid = laneInTile < topK;
+        int expertId = -1;
+
+        if (isValid)
+        {
+            expertId = (readRankTargetRankIds[i * topK + laneInTile]);
+            int targetChunkId = (expertId % expertPerRank) / chunkSize;
+            isValid = targetChunkId == chunkId;
+        }
+
+        int targetRankId = isValid ? expertId / expertPerRank : epSize;
         bool rankMatched = (targetRankId == compareRankId);
         bool hasRankMatched = tile.any(rankMatched);
         unsigned int laneMask = tile.ballot(rankMatched);
@@ -571,7 +604,7 @@ __inline__ __device__ void computeSendRecvIndicesDevice(MoeEpWorldInfo worldInfo
             }
             else
             {
-                sendRecvIndices[indice] = indice;
+                sendRecvIndices[indice] = indice - chunkId * maxTokenCountPerRank * epSize;
                 localGatherIndices[indice] = readRankStart + i;
             }
         }
@@ -581,7 +614,7 @@ __inline__ __device__ void computeSendRecvIndicesDevice(MoeEpWorldInfo worldInfo
 
 template <int kThreadsGroupSize, int kThreadsPerBlock>
 __global__ void computeSendRecvIndicesKernel(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+    int maxTokenCountPerRank, int numChunks, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
     int const* sendRankCountCumSum, int const* recvRankCountCumSum, int* localGatherIndices, int* sendRankLocalIndices,
     int* recvRankLocalIndices, int* backwardRecvRankLocalIndices)
 {
@@ -594,7 +627,7 @@ __global__ void computeSendRecvIndicesKernel(MoeEpWorldInfo worldInfo, MoeExpert
     {
         // compute send rank count
         computeSendRecvIndicesDevice<true, kThreadsGroupSize, kThreadsPerBlock>(worldInfo, expertParallelInfo,
-            maxTokenCountPerRank, realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum,
+            maxTokenCountPerRank, numChunks, realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum,
             sendRankLocalIndices, localGatherIndices, backwardRecvRankLocalIndices, &sharedSendRecvRankStart,
             tempStorage);
     }
@@ -602,14 +635,14 @@ __global__ void computeSendRecvIndicesKernel(MoeEpWorldInfo worldInfo, MoeExpert
     {
         // compute recv rank count
         computeSendRecvIndicesDevice<false, kThreadsGroupSize, kThreadsPerBlock>(worldInfo, expertParallelInfo,
-            maxTokenCountPerRank, realRankTokenCountCumSum, gatheredTargetRankIds, recvRankCountCumSum,
+            maxTokenCountPerRank, numChunks, realRankTokenCountCumSum, gatheredTargetRankIds, recvRankCountCumSum,
             recvRankLocalIndices, localGatherIndices, backwardRecvRankLocalIndices, &sharedSendRecvRankStart,
             tempStorage);
     }
 }
 
 void computeSendRecvIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
+    int maxTokenCountPerRank, int numChunks, int const* realRankTokenCountCumSum, int const* gatheredTargetRankIds,
     int const* sendRankCountCumSum, int const* recvRankCountCumSum, int* localGatherIndices, int* sendRankLocalIndices,
     int* recvRankLocalIndices, int* backwardRecvRankLocalIndices, cudaStream_t stream)
 {
@@ -640,14 +673,14 @@ void computeSendRecvIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expe
     {
         kernelPtr = computeSendRecvIndicesKernel<32, 1024>;
     }
-    dim3 block(worldInfo.epSize, 2, 1);
-    kernelPtr<<<block, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank,
+    dim3 block(worldInfo.epSize, 2, numChunks);
+    kernelPtr<<<block, threadsPerBlock, 0, stream>>>(worldInfo, expertParallelInfo, maxTokenCountPerRank, numChunks,
         realRankTokenCountCumSum, gatheredTargetRankIds, sendRankCountCumSum, recvRankCountCumSum, localGatherIndices,
         sendRankLocalIndices, recvRankLocalIndices, backwardRecvRankLocalIndices);
 }
 
 void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
+    int maxTokenCountPerRank, int numChunks, int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
     // indices of gatheredTargetRankIds that has the local rank in topK
     int* localGatherIndices,   // max length = maxTokenCountPerRank * worldInfo.epSize when all ranks send to current
                                // rank
@@ -664,22 +697,23 @@ void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo e
     cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(worldInfo.epSize <= 1024, "Only worldInfo.epSize less than or equal to 1024 supported now.");
-    TLLM_CUDA_CHECK(cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
-    TLLM_CUDA_CHECK(cudaMemsetAsync(recvRankCountCumSum, 0, sizeof(int) * worldInfo.epSize, stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(sendRankCountCumSum, 0, sizeof(int) * numChunks * worldInfo.epSize, stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(recvRankCountCumSum, 0, sizeof(int) * numChunks * worldInfo.epSize, stream));
     int maxSendRanksPerToken = std::max(worldInfo.epSize, expertParallelInfo.topK);
 
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(localGatherIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(sendRankLocalIndices, -1, maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
-    TLLM_CUDA_CHECK(
-        cudaMemsetAsync(recvRankLocalIndices, -1, maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
     TLLM_CUDA_CHECK(cudaMemsetAsync(
-        backwardRecvRankLocalIndices, -1, maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
-    computeSendRecvRankCount(worldInfo, expertParallelInfo, maxTokenCountPerRank, realRankTokenCountCumSum,
+        localGatherIndices, -1, numChunks * maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(
+        sendRankLocalIndices, -1, numChunks * maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(
+        recvRankLocalIndices, -1, numChunks * maxTokenCountPerRank * worldInfo.epSize * sizeof(int), stream));
+    TLLM_CUDA_CHECK(cudaMemsetAsync(backwardRecvRankLocalIndices, -1,
+        numChunks * maxTokenCountPerRank * maxSendRanksPerToken * sizeof(int), stream));
+
+    computeSendRecvRankCount(worldInfo, expertParallelInfo, maxTokenCountPerRank, numChunks, realRankTokenCountCumSum,
         gatheredTargetRankIds, sendRankCountCumSum, recvRankCountCumSum, stream);
-    inplaceSendRecvRankCumSum(worldInfo, sendRankCountCumSum, recvRankCountCumSum, stream);
-    computeSendRecvIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank, realRankTokenCountCumSum,
+    inplaceSendRecvRankCumSum(worldInfo, numChunks, sendRankCountCumSum, recvRankCountCumSum, stream);
+    computeSendRecvIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank, numChunks, realRankTokenCountCumSum,
         gatheredTargetRankIds, sendRankCountCumSum, recvRankCountCumSum, localGatherIndices, sendRankLocalIndices,
         recvRankLocalIndices, backwardRecvRankLocalIndices, stream);
 }

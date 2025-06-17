@@ -420,8 +420,8 @@ class CutlassFusedMoE(MoE):
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
-            token_selected_slots,
-            token_final_scales,
+            token_selected_slots[0],
+            token_final_scales[0],
             w3_w1_weight.view(weight_dtype),
             w2_weight.view(weight_dtype),
             output_dtype,

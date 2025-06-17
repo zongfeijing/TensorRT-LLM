@@ -255,7 +255,7 @@ void moeAllToAll(MoeEpWorldInfo worldInfo, SendRecvDataInfo sendRecvDataInfo, Se
     SendRecvDispls recvDispls, MoeCommWorkspace workspace, cudaStream_t stream);
 
 void moeAllToAllPrepareIndices(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParallelInfo,
-    int maxTokenCountPerRank, int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
+    int maxTokenCountPerRank, int numChunks, int const* gatheredTargetRankIds, int const* realRankTokenCountCumSum,
     int* localGatheredIndices, // indices of gatheredTargetRankIds that has the local rank in topK
     int* sendRankCountCumSum, int* sendRankLocalIndices, int* recvRankCountCumSum, int* recvRankLocalIndices,
     // the rankCountCumSum of combineRecv should be the same as sendRankCountCumSum

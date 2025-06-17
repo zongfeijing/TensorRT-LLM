@@ -182,7 +182,7 @@ void moeCommNcclAllToAll(torch::Tensor const& input, torch::Tensor const& sendRa
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch::Tensor> realRankTokenCountCumSum,
-    int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize)
+    int64_t maxTokenCountPerRank, int64_t expertCount, int64_t topK, int64_t epRank, int64_t epSize, int64_t numChunks)
 {
     CHECK_INPUT(gatheredTargetRankIds, torch::kInt32);
     TORCH_CHECK(gatheredTargetRankIds.dim() == 2, "gatheredTargetRankIds must be a 2D tensor");
@@ -203,6 +203,7 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
         TORCH_CHECK(gatheredTargetRankIds.size(0) == epSize * maxTokenCountPerRank,
             "gatheredTargetRankIds should have shape (epSize * maxTokenCountPerRank, topK)");
     }
+    TORCH_CHECK(numChunks > 0, "numChunks must be greater than 0");
     TORCH_CHECK(maxTokenCountPerRank > 0, "maxTokenCountPerRank must be greater than 0");
     TORCH_CHECK(expertCount > 0, "expertCount must be greater than 0");
     TORCH_CHECK(topK > 0, "topK must be greater than 0");
@@ -213,16 +214,18 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
 
     int maxSendRanksPerToken = std::max(epSize, topK);
 
-    torch::Tensor localGatherIndices
-        = torch::empty({maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-    torch::Tensor sendRankCountCumSum = torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+    torch::Tensor localGatherIndices = torch::empty(
+        {numChunks, maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+    torch::Tensor sendRankCountCumSum
+        = torch::empty({numChunks, epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
     torch::Tensor sendRankLocalIndices = torch::empty(
-        {maxTokenCountPerRank * maxSendRanksPerToken}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-    torch::Tensor recvRankCountCumSum = torch::empty({epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
-    torch::Tensor recvRankLocalIndices
-        = torch::empty({maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+        {numChunks, maxTokenCountPerRank * maxSendRanksPerToken}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+    torch::Tensor recvRankCountCumSum
+        = torch::empty({numChunks, epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+    torch::Tensor recvRankLocalIndices = torch::empty(
+        {numChunks, maxTokenCountPerRank * epSize}, gatheredTargetRankIds.options().dtype(torch::kInt32));
     torch::Tensor backwardRecvRankLocalIndices = torch::empty(
-        {maxTokenCountPerRank * maxSendRanksPerToken}, gatheredTargetRankIds.options().dtype(torch::kInt32));
+        {numChunks, maxTokenCountPerRank * maxSendRanksPerToken}, gatheredTargetRankIds.options().dtype(torch::kInt32));
 
     tensorrt_llm::kernels::MoeExpertParallelInfo expertParallelInfo;
     expertParallelInfo.expertCount = expertCount;
@@ -230,9 +233,10 @@ moeCommPrepareIndicesOp(torch::Tensor gatheredTargetRankIds, c10::optional<torch
 
     tensorrt_llm::kernels::MoeEpWorldInfo worldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
     tensorrt_llm::kernels::moeAllToAllPrepareIndices(worldInfo, expertParallelInfo, maxTokenCountPerRank,
-        gatheredTargetRankIds.data_ptr<int>(), realRankTokenCountCumSumPtr, localGatherIndices.data_ptr<int>(),
-        sendRankCountCumSum.data_ptr<int>(), sendRankLocalIndices.data_ptr<int>(), recvRankCountCumSum.data_ptr<int>(),
-        recvRankLocalIndices.data_ptr<int>(), backwardRecvRankLocalIndices.data_ptr<int>(), stream);
+        static_cast<int>(numChunks), gatheredTargetRankIds.data_ptr<int>(), realRankTokenCountCumSumPtr,
+        localGatherIndices.data_ptr<int>(), sendRankCountCumSum.data_ptr<int>(), sendRankLocalIndices.data_ptr<int>(),
+        recvRankCountCumSum.data_ptr<int>(), recvRankLocalIndices.data_ptr<int>(),
+        backwardRecvRankLocalIndices.data_ptr<int>(), stream);
 
     return std::make_tuple(localGatherIndices, sendRankCountCumSum, sendRankLocalIndices, recvRankCountCumSum,
         recvRankLocalIndices, backwardRecvRankLocalIndices);
@@ -370,7 +374,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "moe_comm_prepare_indices(Tensor gathered_target_rank_ids, Tensor? real_rank_token_count_cum_sum, int "
-        "max_token_count_per_rank, int expert_count, int top_k, int ep_rank, int ep_size) -> (Tensor, Tensor, Tensor, "
+        "max_token_count_per_rank, int expert_count, int top_k, int ep_rank, int ep_size, int num_chunks) -> (Tensor, "
+        "Tensor, Tensor, "
         "Tensor, "
         "Tensor, Tensor)");
 }
