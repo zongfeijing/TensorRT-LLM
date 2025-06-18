@@ -154,17 +154,6 @@ class CutlassFusedMoE(MoE):
         if self.use_dp:
             max_num_tokens *= model_config.mapping.world_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
-        # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
-            self.event_dict = {
-                key: torch.cuda.Event()
-                for key in [EventType.Main, EventType.MoeChunkingOverlap]
-            }
-        else:
-            self.aux_stream = None
-            self.event_dict = None
 
         # The profiler converges on the same best tactic when the number of tokens is large enough.
         # To avoid long profiling time, the max number of tokens used in the profiling is capped to
@@ -178,6 +167,7 @@ class CutlassFusedMoE(MoE):
 
         self.enable_alltoall = enable_alltoall
         self.use_postquant_alltoall = False
+        self.num_expert_chunks = 1
         if self.enable_alltoall:
             assert self.use_dp and self.parallel_size > 1,\
                 "alltoall should only enabled with attention dp and parallel_size > 1"
@@ -186,8 +176,22 @@ class CutlassFusedMoE(MoE):
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
             self.alltoall_use_nccl = MnnvlMoe.use_nccl()
+            self.num_expert_chunks = 2
+            self.tune_max_num_tokens = self.tune_max_num_tokens // self.num_expert_chunks
         self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
             model_config.mapping) if enable_alltoall else None
+
+        # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
+        if self.moe_max_num_tokens < max_num_tokens or self.num_expert_chunks > 1:
+            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
+            )
+            self.event_dict = {
+                key: torch.cuda.Event()
+                for key in [EventType.Main, EventType.MoeChunkingOverlap]
+            }
+        else:
+            self.aux_stream = None
+            self.event_dict = None
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -341,7 +345,7 @@ class CutlassFusedMoE(MoE):
                                                      x,
                                                      token_selected_slots,
                                                      token_final_scales,
-                                                     token_selected_experts_for_statistic)
+                                                     token_selected_experts_for_statistic, self.num_expert_chunks)
         x_sf = None
         if self.has_any_quant:
             if self.has_fp8_qdq:
@@ -415,29 +419,77 @@ class CutlassFusedMoE(MoE):
             quant_scales = self.quant_scales
 
         if self.use_postquant_alltoall:
-            x, x_sf = self.alltoall_postquant_dispatch(x, x_sf, x_row, x_col,
-                                                       alltoall_info)
+            final_hidden_states = []
 
-        final_hidden_states = torch.ops.trtllm.fused_moe(
-            x,
-            token_selected_slots[0],
-            token_final_scales[0],
-            w3_w1_weight.view(weight_dtype),
-            w2_weight.view(weight_dtype),
-            output_dtype,
-            quant_scales=quant_scales,
-            input_sf=x_sf,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            cluster_size=cluster_size,
-            cluster_rank=cluster_rank,
-            use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
-            min_latency_mode=cutlass_min_latency_mode,
-            tune_max_num_tokens=self.tune_max_num_tokens,
-        )
+            x_chunk, x_sf_chunk = self.alltoall_postquant_dispatch(
+                x, x_sf, x_row, x_col, alltoall_info, 0)
+            self.event_dict[EventType.Main].record()
+            for chunk_idx in range(0, self.num_expert_chunks, 2):
+                if chunk_idx > 0:
+                    x_chunk, x_sf_chunk = self.alltoall_postquant_dispatch(
+                        x, x_sf, x_row, x_col, alltoall_info, chunk_idx)
+
+                final_hidden_states_chunk = torch.ops.trtllm.fused_moe(
+                    x_chunk,
+                    token_selected_slots[chunk_idx],
+                    token_final_scales[chunk_idx],
+                    w3_w1_weight.view(weight_dtype),
+                    w2_weight.view(weight_dtype),
+                    output_dtype,
+                    quant_scales=quant_scales,
+                    input_sf=x_sf_chunk,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                    ep_size=ep_size,
+                    ep_rank=ep_rank,
+                    cluster_size=cluster_size,
+                    cluster_rank=cluster_rank,
+                    use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
+                    use_w4a8_group_scaling=use_w4a8_group_scaling,
+                    min_latency_mode=cutlass_min_latency_mode,
+                    tune_max_num_tokens=self.tune_max_num_tokens,
+                )
+                final_hidden_states_chunk = self.alltoall_combine(
+                    final_hidden_states_chunk[0], alltoall_info, token_count,
+                    chunk_idx)
+                final_hidden_states.append(final_hidden_states_chunk)
+
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+                for chunk_idx in range(1, self.num_expert_chunks, 2):
+                    x_chunk, x_sf_chunk = self.alltoall_postquant_dispatch(
+                        x, x_sf, x_row, x_col, alltoall_info, chunk_idx)
+                    final_hidden_states_chunk = torch.ops.trtllm.fused_moe(
+                        x_chunk,
+                        token_selected_slots[chunk_idx],
+                        token_final_scales[chunk_idx],
+                        w3_w1_weight.view(weight_dtype),
+                        w2_weight.view(weight_dtype),
+                        output_dtype,
+                        quant_scales=quant_scales,
+                        input_sf=x_sf_chunk,
+                        tp_size=self.tp_size,
+                        tp_rank=self.tp_rank,
+                        ep_size=ep_size,
+                        ep_rank=ep_rank,
+                        cluster_size=cluster_size,
+                        cluster_rank=cluster_rank,
+                        use_deepseek_fp8_block_scale=
+                        use_deepseek_fp8_block_scale,
+                        use_w4a8_group_scaling=use_w4a8_group_scaling,
+                        min_latency_mode=cutlass_min_latency_mode,
+                        tune_max_num_tokens=self.tune_max_num_tokens,
+                    )
+                    final_hidden_states_chunk = self.alltoall_combine(
+                        final_hidden_states_chunk[0], alltoall_info,
+                        token_count, chunk_idx)
+                    final_hidden_states.append(final_hidden_states_chunk)
+                self.event_dict[EventType.MoeChunkingOverlap].record()
+            self.event_dict[EventType.MoeChunkingOverlap].wait()
+            final_hidden_states = torch.stack(final_hidden_states,
+                                              dim=0).sum(dim=0)
+
+            return final_hidden_states
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_last_call:
@@ -608,10 +660,13 @@ class CutlassFusedMoE(MoE):
         return outputs
 
     def alltoall_prepare_maybe_dispatch(
-            self, all_rank_num_tokens: list, x: torch.Tensor,
+            self,
+            all_rank_num_tokens: list,
+            x: torch.Tensor,
             token_selected_slots: torch.Tensor,
             token_final_scales: torch.Tensor,
-            token_selected_experts_for_statistic: Optional[torch.Tensor]):
+            token_selected_experts_for_statistic: Optional[torch.Tensor],
+            num_expert_chunks: int = 1):
         top_k = self.routing_method.experts_per_token
         # gather router info
         max_num_token = max(all_rank_num_tokens)
@@ -649,7 +704,7 @@ class CutlassFusedMoE(MoE):
         alltoall_info, token_selected_slots, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv_prepare(
             gathered_target_rank_ids, None, gathered_token_selected_slots,
             gathered_token_final_scales, max_num_token, self.num_slots, top_k,
-            self.ep_rank, self.ep_size)
+            self.ep_rank, self.ep_size, num_expert_chunks)
 
         if not self.use_postquant_alltoall:
             assert not isinstance(
@@ -662,12 +717,17 @@ class CutlassFusedMoE(MoE):
 
         return x, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic, alltoall_info
 
-    def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
-                                    x_row: int, x_col: int,
-                                    alltoall_info: MoEAlltoallInfo):
+    def alltoall_postquant_dispatch(self,
+                                    x: torch.Tensor,
+                                    x_sf: torch.Tensor,
+                                    x_row: int,
+                                    x_col: int,
+                                    alltoall_info: MoEAlltoallInfo,
+                                    chunk_idx: int = 0):
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
-                                         self.ep_size, self.alltoall_use_nccl)
+                                         self.ep_size, self.alltoall_use_nccl,
+                                         chunk_idx)
         if x_sf is not None:
             if self.has_nvfp4:
                 x_sf = unswizzle_sf(x_sf, x_row, x_col,
@@ -682,8 +742,11 @@ class CutlassFusedMoE(MoE):
                                   self.scaling_vector_size)
         return x, x_sf
 
-    def alltoall_combine(self, final_hidden_states: torch.Tensor,
-                         alltoall_info: MoEAlltoallInfo, token_count: int):
+    def alltoall_combine(self,
+                         final_hidden_states: torch.Tensor,
+                         alltoall_info: MoEAlltoallInfo,
+                         token_count: int,
+                         chunk_idx: int = 0):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
@@ -695,7 +758,8 @@ class CutlassFusedMoE(MoE):
             ep_size=self.ep_size,
             top_k=top_k,
             token_count=token_count,
-            use_nccl=self.alltoall_use_nccl)
+            use_nccl=self.alltoall_use_nccl,
+            chunk_idx=chunk_idx)
 
         return final_hidden_states
 
