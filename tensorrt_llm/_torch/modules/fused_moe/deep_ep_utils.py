@@ -180,6 +180,9 @@ class BufferPool:
         self.low_latency_buffers: Map[
             Mapping,
             weakref.ReferenceType[VariableLengthLowLatencyBuffer]] = {}
+        self.low_latency_buffers_aux: Map[
+            Mapping,
+            weakref.ReferenceType[VariableLengthLowLatencyBuffer]] = {}
 
     def get_buffer(self, mapping: Mapping) -> VariableLengthBuffer:
         """ Get_buffer is a collective operation that requires all ranks to be sync
@@ -201,6 +204,18 @@ class BufferPool:
         else:
             buffer = VariableLengthLowLatencyBuffer(mapping)
             self.low_latency_buffers[mapping] = weakref.ref(buffer)
+        return buffer
+
+    def get_low_latency_buffer_aux(
+            self, mapping: Mapping) -> VariableLengthLowLatencyBuffer:
+        """ Get_low_latency_buffer is a collective operation that requires all ranks to be sync
+        """
+        if mapping in self.low_latency_buffers_aux and self.low_latency_buffers_aux[
+                mapping]() is not None:
+            buffer = self.low_latency_buffers_aux[mapping]()
+        else:
+            buffer = VariableLengthLowLatencyBuffer(mapping)
+            self.low_latency_buffers_aux[mapping] = weakref.ref(buffer)
         return buffer
 
 
