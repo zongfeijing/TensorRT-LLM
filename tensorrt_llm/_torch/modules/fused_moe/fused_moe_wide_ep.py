@@ -418,9 +418,7 @@ class WideEPMoE(MoE):
                     )
             return x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights
 
-        def combine(x, x_sf, token_selected_slots, token_final_scales,
-                    deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights,
-                    deep_ep_buffer):
+        def compute(x, x_sf, token_selected_slots, token_final_scales):
             if self.smart_router and not cutlass_min_latency_mode:
                 ep_size = self.cluster_size
                 ep_rank = self.cluster_rank
@@ -470,6 +468,10 @@ class WideEPMoE(MoE):
                 tune_max_num_tokens=self.tune_max_num_tokens,
             )
 
+            return final_hidden_states
+
+        def combine(final_hidden_states, deep_ep_handle, deep_ep_topk_idx,
+                    deep_ep_topk_weights, deep_ep_buffer):
             if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
             ) and is_last_call:
                 self.layer_load_balancer.set_cpu_stage()
@@ -495,8 +497,9 @@ class WideEPMoE(MoE):
             x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights = dispatch(
                 0, x, token_selected_slots, token_final_scales,
                 self.deep_ep_buffer)
-            final_hidden_states = combine(x, x_sf, token_selected_slots,
-                                          token_final_scales, deep_ep_handle,
+            final_hidden_states = compute(x, x_sf, token_selected_slots,
+                                          token_final_scales)
+            final_hidden_states = combine(final_hidden_states, deep_ep_handle,
                                           deep_ep_topk_idx,
                                           deep_ep_topk_weights,
                                           self.deep_ep_buffer)
@@ -513,9 +516,11 @@ class WideEPMoE(MoE):
                         x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked = dispatch(
                             chunk_idx, x.clone(), token_selected_slots.clone(),
                             token_final_scales.clone(), self.deep_ep_buffer)
-                    chunked_final_hidden_states = combine(
+                    chunked_final_hidden_states = compute(
                         x_chunked, x_sf_chunked, token_selected_slots_chunked,
-                        token_final_scales_chunked, deep_ep_handle_chunked,
+                        token_final_scales_chunked)
+                    chunked_final_hidden_states = combine(
+                        chunked_final_hidden_states, deep_ep_handle_chunked,
                         deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked,
                         self.deep_ep_buffer)
                     final_hidden_states.append(chunked_final_hidden_states)
@@ -527,10 +532,12 @@ class WideEPMoE(MoE):
                         x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked = dispatch(
                             chunk_idx, x.clone(), token_selected_slots.clone(),
                             token_final_scales.clone(), self.deep_ep_buffer_aux)
-                        chunked_final_hidden_states = combine(
+                        chunked_final_hidden_states = compute(
                             x_chunked, x_sf_chunked,
                             token_selected_slots_chunked,
-                            token_final_scales_chunked, deep_ep_handle_chunked,
+                            token_final_scales_chunked)
+                        chunked_final_hidden_states = combine(
+                            chunked_final_hidden_states, deep_ep_handle_chunked,
                             deep_ep_topk_idx_chunked,
                             deep_ep_topk_weights_chunked,
                             self.deep_ep_buffer_aux)
