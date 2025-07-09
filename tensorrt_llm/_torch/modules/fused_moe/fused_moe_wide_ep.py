@@ -344,8 +344,12 @@ class WideEPMoE(MoE):
         use_w4a8_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
-        def dispatch(chunk_idx, x, token_selected_slots, token_final_scales,
-                     deep_ep_buffer):
+        def dispatch(chunk_idx,
+                     x,
+                     token_selected_slots,
+                     token_final_scales,
+                     deep_ep_buffer,
+                     use_hook=False):
             chunk_expert_mask = (token_selected_slots %
                                  self.expert_size_per_partition
                                  ) // self.chunk_expert_size != chunk_idx
@@ -355,8 +359,8 @@ class WideEPMoE(MoE):
             if not self.use_postquant_alltoall:
                 deep_ep_topk_idx = token_selected_slots.to(torch.int64)
                 deep_ep_topk_weights = token_final_scales
-                x, recv_expert_count, deep_ep_handle = \
-                    deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots)
+                x, recv_expert_count, deep_ep_handle, hook = \
+                    deep_ep_buffer.low_latency_dispatch(x, deep_ep_topk_idx, self.deep_ep_max_num_tokens, self.num_slots, use_hook=use_hook)
                 # x shape: [#local experts, #max recv tokens, hidden_size]
                 # recv_expert_count shape: [#local experts]
 
@@ -416,7 +420,7 @@ class WideEPMoE(MoE):
                     raise ValueError(
                         f"unsupported quantization mode: {self.quant_config.quant_mode}"
                     )
-            return x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights
+            return x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights, hook
 
         def compute(x, x_sf, token_selected_slots, token_final_scales):
             if self.smart_router and not cutlass_min_latency_mode:
@@ -470,8 +474,12 @@ class WideEPMoE(MoE):
 
             return final_hidden_states
 
-        def combine(final_hidden_states, deep_ep_handle, deep_ep_topk_idx,
-                    deep_ep_topk_weights, deep_ep_buffer):
+        def combine(final_hidden_states,
+                    deep_ep_handle,
+                    deep_ep_topk_idx,
+                    deep_ep_topk_weights,
+                    deep_ep_buffer,
+                    use_hook=False):
             if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
             ) and is_last_call:
                 self.layer_load_balancer.set_cpu_stage()
@@ -489,58 +497,84 @@ class WideEPMoE(MoE):
                     final_hidden_states.view(
                         self.expert_size_per_partition,
                         self.deep_ep_max_num_tokens * self.mapping.moe_ep_size,
-                        final_hidden_states.shape[1]), deep_ep_topk_idx,
-                    deep_ep_topk_weights, deep_ep_handle)
+                        final_hidden_states.shape[1]),
+                    deep_ep_topk_idx,
+                    deep_ep_topk_weights,
+                    deep_ep_handle,
+                    use_hook=use_hook)
             return final_hidden_states
 
         if self.num_chunk_experts == 1:
-            x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights = dispatch(
-                0, x, token_selected_slots, token_final_scales,
-                self.deep_ep_buffer)
+            x, x_sf, token_selected_slots, token_final_scales, deep_ep_handle, deep_ep_topk_idx, deep_ep_topk_weights, _ = dispatch(
+                0,
+                x,
+                token_selected_slots,
+                token_final_scales,
+                self.deep_ep_buffer,
+                use_hook=False)
             final_hidden_states = compute(x, x_sf, token_selected_slots,
                                           token_final_scales)
-            final_hidden_states = combine(final_hidden_states, deep_ep_handle,
-                                          deep_ep_topk_idx,
-                                          deep_ep_topk_weights,
-                                          self.deep_ep_buffer)
+            final_hidden_states, _ = combine(final_hidden_states,
+                                             deep_ep_handle,
+                                             deep_ep_topk_idx,
+                                             deep_ep_topk_weights,
+                                             self.deep_ep_buffer,
+                                             use_hook=False)
         else:
             final_hidden_states = []
-            x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked = dispatch(
-                0, x.clone(), token_selected_slots.clone(),
-                token_final_scales.clone(), self.deep_ep_buffer)
+            x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
+                0,
+                x.clone(),
+                token_selected_slots.clone(),
+                token_final_scales.clone(),
+                self.deep_ep_buffer,
+                use_hook=False)
             self.event_dict[EventType.Main].record()
 
             for chunk_idx in range(self.num_chunk_experts):
                 if chunk_idx % 2 == 0:
                     if chunk_idx > 0:
-                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked = dispatch(
-                            chunk_idx, x.clone(), token_selected_slots.clone(),
-                            token_final_scales.clone(), self.deep_ep_buffer)
+                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
+                            chunk_idx,
+                            x.clone(),
+                            token_selected_slots.clone(),
+                            token_final_scales.clone(),
+                            self.deep_ep_buffer,
+                            use_hook=False)
                     chunked_final_hidden_states = compute(
                         x_chunked, x_sf_chunked, token_selected_slots_chunked,
                         token_final_scales_chunked)
-                    chunked_final_hidden_states = combine(
-                        chunked_final_hidden_states, deep_ep_handle_chunked,
-                        deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked,
-                        self.deep_ep_buffer)
+                    chunked_final_hidden_states, _ = combine(
+                        chunked_final_hidden_states,
+                        deep_ep_handle_chunked,
+                        deep_ep_topk_idx_chunked,
+                        deep_ep_topk_weights_chunked,
+                        self.deep_ep_buffer,
+                        use_hook=False)
                     final_hidden_states.append(chunked_final_hidden_states)
                 else:
                     if chunk_idx == 1:
                         with torch.cuda.stream(self.aux_stream):
                             self.event_dict[EventType.Main].wait()
                     with torch.cuda.stream(self.aux_stream):
-                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked = dispatch(
-                            chunk_idx, x.clone(), token_selected_slots.clone(),
-                            token_final_scales.clone(), self.deep_ep_buffer_aux)
+                        x_chunked, x_sf_chunked, token_selected_slots_chunked, token_final_scales_chunked, deep_ep_handle_chunked, deep_ep_topk_idx_chunked, deep_ep_topk_weights_chunked, _ = dispatch(
+                            chunk_idx,
+                            x.clone(),
+                            token_selected_slots.clone(),
+                            token_final_scales.clone(),
+                            self.deep_ep_buffer_aux,
+                            use_hook=False)
                         chunked_final_hidden_states = compute(
                             x_chunked, x_sf_chunked,
                             token_selected_slots_chunked,
                             token_final_scales_chunked)
-                        chunked_final_hidden_states = combine(
-                            chunked_final_hidden_states, deep_ep_handle_chunked,
+                        chunked_final_hidden_states, _ = combine(
+                            chunked_final_hidden_states,
+                            deep_ep_handle_chunked,
                             deep_ep_topk_idx_chunked,
                             deep_ep_topk_weights_chunked,
-                            self.deep_ep_buffer_aux)
+                            self.deep_ep_buffer_aux,
+                            use_hook=False)
                         final_hidden_states.append(chunked_final_hidden_states)
                         if chunk_idx == self.num_chunk_experts - 1:
                             self.event_dict[
