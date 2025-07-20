@@ -601,6 +601,7 @@ class WideEPMoE(MoE):
             output_dtype,
             quant_scales=quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=sf_swizzle,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=ep_size,
@@ -879,7 +880,7 @@ class WideEPMoE(MoE):
                                                 self.alltoall_workspace,
                                                 self.ep_rank, self.ep_size)
 
-            if self.has_nvfp4:
+            if self.has_nvfp4 and is_sf_swizzle:
                 x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
                                   self.scaling_vector_size)
 
