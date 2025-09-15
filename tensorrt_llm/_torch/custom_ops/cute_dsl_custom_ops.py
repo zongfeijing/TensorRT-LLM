@@ -181,9 +181,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_k = pad_up(real_k // sf_vec_size, 4)
             sf_n = pad_up(n, 128)
 
+            assert a_sf_tensor.element_size() == 1
+            assert b_sf_tensor.element_size() == 1
+
             # the scaling tensor is 1D. we need to make sure it has been padded to the correct shape
-            assert a_sf_tensor.shape == (sf_m * sf_k, )
-            assert b_sf_tensor.shape == (sf_n * sf_k, )
+            assert a_sf_tensor.numel() == sf_m * sf_k
+            assert b_sf_tensor.numel() == sf_n * sf_k
 
             a_ptr = self.make_cute_dsl_global_pointer(a_tensor,
                                                       cutlass.Float4E2M1FN, 32)

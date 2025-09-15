@@ -140,6 +140,16 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
+    def gen_fc2_alpha(self, num_tokens, token_selected_experts,
+                      token_final_scales, alpha):
+        # Create a tensor to store the alpha values for each expert
+        fc2_alpha = torch.zeros([num_tokens, self.expert_size_per_partition],
+                                dtype=alpha.dtype,
+                                device=alpha.device)
+        fc2_alpha.scatter_(1, token_selected_experts.long(), token_final_scales)
+        fc2_alpha = fc2_alpha * alpha
+        return fc2_alpha
+
     def forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -175,13 +185,45 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         use_deepseek_fp8_block_scale = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
+        num_tokens = x.shape[0]
         if self.has_any_quant:
             if self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
+            elif self.has_nvfp4:
+                if not isinstance(x, Fp4QuantizedTensor):
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
+
+        if self.has_nvfp4:
+            fc1_output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                x,
+                self.w3_w1_weight.view(x.dtype).reshape(-1, x.shape[-1]), x_sf,
+                self.w3_w1_weight_scale.view(torch.uint8), 1.0, output_dtype)
+            fc1_output = fc1_output.view([
+                num_tokens, self.expert_size_per_partition, -1
+            ]) * self.fc31_alpha.view([1, -1, 1])
+            fc1_output = fc1_output.to(output_dtype)
+
+            swiglu_out = swiglu_fused_moe(fc1_output)
+            alpha = self.gen_fc2_alpha(num_tokens, token_selected_experts,
+                                       token_final_scales, self.fc2_alpha)
+            fc2_input = (swiglu_out * alpha.view(
+                [num_tokens, self.expert_size_per_partition, 1])).view(
+                    [num_tokens, -1]).to(output_dtype)
+            fc2_input, fc2_input_sf = torch.ops.trtllm.fp4_quantize(
+                fc2_input, self.fc2_input_scale, self.scaling_vector_size,
+                False, True)
+            final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                fc2_input,
+                self.w2_weight.view(fc2_input.dtype).reshape(
+                    -1, fc2_input.shape[-1]), fc2_input_sf,
+                self.w2_weight_scale.view(torch.uint8), 1.0, output_dtype)
+            return final_hidden_states
 
         (
             permuted_row_to_unpermuted_row_tensor,
