@@ -5,9 +5,10 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.quantization.utils import fp4_utils
 
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import AuxStreamType, Fp4QuantizedTensor, swizzle_sf, unswizzle_sf
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import MoEWeightLoadingMode
 from .routing import BaseMoeRoutingMethod
@@ -124,6 +125,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         VANILLA,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
+        is_min_latency: bool = True,
     ):
 
         super().__init__(
@@ -140,15 +142,133 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
+        self.is_min_latency = is_min_latency
+
+    def load_weights(self, weights: List[Dict]):
+        super().load_weights(weights)
+        if self.is_min_latency:
+            w2_weight = self.w2_weight.clone()
+            self.w2_weight.reshape([-1]).copy_(w2_weight.transpose(
+                0, 1).reshape([-1]),
+                                               non_blocking=True)
+            if self.has_any_quant and self.has_nvfp4:
+                self._transform_w2_weight_scale_for_min_latency()
+
+    def _transform_w2_weight_scale_for_min_latency(self):
+        """Transform w2_weight_scale for minimum latency path optimization."""
+        # Calculate padded dimensions
+        nrows = fp4_utils.pad_up(self.hidden_size, 128)
+        ncols = fp4_utils.pad_up(
+            self.intermediate_size_per_partition // self.scaling_vector_size, 4)
+
+        # Clone and convert weight scale to uint8
+        w2_weight_scale = self.w2_weight_scale.clone().view(torch.uint8)
+
+        # Unswizzle the scale factor
+        w2_weight_scale = unswizzle_sf(
+            w2_weight_scale, self.hidden_size * self.expert_size_per_partition,
+            self.intermediate_size_per_partition)
+
+        # Reshape and transpose for min latency layout
+        w2_weight_scale = w2_weight_scale.reshape(
+            [self.expert_size_per_partition, nrows, ncols])
+        w2_weight_scale = w2_weight_scale.transpose(0, 1).reshape(
+            nrows, self.expert_size_per_partition * ncols)
+
+        # Swizzle back with new layout
+        w2_weight_scale = swizzle_sf(
+            w2_weight_scale, self.hidden_size, self.expert_size_per_partition *
+            self.intermediate_size_per_partition)
+
+        # Copy back to original tensor
+        self.w2_weight_scale.copy_(w2_weight_scale.view(
+            self.w2_weight_scale.dtype).view(self.w2_weight_scale.shape),
+                                   non_blocking=True)
+
     def gen_fc2_alpha(self, num_tokens, token_selected_experts,
                       token_final_scales, alpha):
         # Create a tensor to store the alpha values for each expert
         fc2_alpha = torch.zeros([num_tokens, self.expert_size_per_partition],
-                                dtype=alpha.dtype,
-                                device=alpha.device)
+                                dtype=torch.float32,
+                                device=token_selected_experts.device)
         fc2_alpha.scatter_(1, token_selected_experts.long(), token_final_scales)
-        fc2_alpha = fc2_alpha * alpha
+        if alpha is not None:
+            fc2_alpha = fc2_alpha * alpha
         return fc2_alpha
+
+    def forward_min_latency(
+        self,
+        x: torch.Tensor,
+        x_sf: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Forward pass optimized for minimum latency (num_tokens <= 512).
+        Handles different quantization types internally.
+
+        Args:
+            x: Input tensor
+            token_selected_experts: Selected experts for each token
+            token_final_scales: Final scales for each token
+
+        Returns:
+            Final hidden states tensor
+        """
+        # Determine output dtype
+        num_tokens = x.shape[0]
+
+        # Handle different quantization paths
+        if self.has_any_quant:
+            if self.has_nvfp4:
+                # NVFP4 quantization path
+                assert x_sf is not None
+                fc1_output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                    x,
+                    self.w3_w1_weight.view(x.dtype).reshape(-1,
+                                                            x.shape[-1]), x_sf,
+                    self.w3_w1_weight_scale.view(torch.uint8), 1.0,
+                    output_dtype)
+                fc1_output = fc1_output.view([
+                    num_tokens, self.expert_size_per_partition, -1
+                ]) * self.fc31_alpha.view([1, -1, 1])
+                fc1_output = fc1_output.to(output_dtype)
+
+                swiglu_out = swiglu_fused_moe(fc1_output)
+                alpha = self.gen_fc2_alpha(num_tokens, token_selected_experts,
+                                           token_final_scales, self.fc2_alpha)
+                fc2_input = (swiglu_out * alpha.view(
+                    [num_tokens, self.expert_size_per_partition, 1])).view(
+                        [num_tokens, -1]).to(output_dtype)
+                fc2_input, fc2_input_sf = torch.ops.trtllm.fp4_quantize(
+                    fc2_input, self.fc2_input_scale, self.scaling_vector_size,
+                    False, True)
+                final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
+                    fc2_input,
+                    self.w2_weight.view(fc2_input.dtype).reshape(
+                        -1, fc2_input.shape[-1]), fc2_input_sf,
+                    self.w2_weight_scale.view(torch.uint8), 1.0, output_dtype)
+                return final_hidden_states
+            else:
+                # TODO: Implement other quantization types (fp8, int8, etc.)
+                raise NotImplementedError(
+                    "Other quantization types not yet implemented for min latency path"
+                )
+        else:
+            fc1_output = torch.nn.functional.linear(
+                x, self.w3_w1_weight.reshape(-1, x.shape[-1]))
+            swiglu_out = swiglu_fused_moe(
+                fc1_output.view(
+                    [num_tokens, self.expert_size_per_partition, -1]))
+            alpha = self.gen_fc2_alpha(num_tokens, token_selected_experts,
+                                       token_final_scales, None)
+            fc2_input = (swiglu_out * alpha.view(
+                [num_tokens, self.expert_size_per_partition, 1])).view(
+                    [num_tokens, -1]).to(output_dtype)
+            final_hidden_states = torch.nn.functional.linear(
+                fc2_input, self.w2_weight.reshape(-1, fc2_input.shape[-1]))
+            return final_hidden_states
 
     def forward_chunk(
         self,
@@ -185,7 +305,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         use_deepseek_fp8_block_scale = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
-        num_tokens = x.shape[0]
+        x.shape[0]
         if self.has_any_quant:
             if self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
@@ -199,31 +319,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     f"unsupported quantization mode for CUTEDSL backend: {self.quant_config.quant_mode}"
                 )
 
-        if self.has_nvfp4:
-            fc1_output = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                x,
-                self.w3_w1_weight.view(x.dtype).reshape(-1, x.shape[-1]), x_sf,
-                self.w3_w1_weight_scale.view(torch.uint8), 1.0, output_dtype)
-            fc1_output = fc1_output.view([
-                num_tokens, self.expert_size_per_partition, -1
-            ]) * self.fc31_alpha.view([1, -1, 1])
-            fc1_output = fc1_output.to(output_dtype)
-
-            swiglu_out = swiglu_fused_moe(fc1_output)
-            alpha = self.gen_fc2_alpha(num_tokens, token_selected_experts,
-                                       token_final_scales, self.fc2_alpha)
-            fc2_input = (swiglu_out * alpha.view(
-                [num_tokens, self.expert_size_per_partition, 1])).view(
-                    [num_tokens, -1]).to(output_dtype)
-            fc2_input, fc2_input_sf = torch.ops.trtllm.fp4_quantize(
-                fc2_input, self.fc2_input_scale, self.scaling_vector_size,
-                False, True)
-            final_hidden_states = torch.ops.trtllm.cute_dsl_nvfp4_gemm_blackwell(
-                fc2_input,
-                self.w2_weight.view(fc2_input.dtype).reshape(
-                    -1, fc2_input.shape[-1]), fc2_input_sf,
-                self.w2_weight_scale.view(torch.uint8), 1.0, output_dtype)
-            return final_hidden_states
+        # if num_tokens <= 512:
+        return self.forward_min_latency(x, x_sf, token_selected_experts,
+                                        token_final_scales, output_dtype)
 
         (
             permuted_row_to_unpermuted_row_tensor,
