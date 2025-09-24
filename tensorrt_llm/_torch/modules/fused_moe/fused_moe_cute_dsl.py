@@ -238,7 +238,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                 swiglu_out = swiglu_fused_moe(fc1_output)
                 alpha = self.gen_fc2_alpha(num_tokens, token_selected_experts,
                                            token_final_scales, self.fc2_alpha)
-                fc2_input = (swiglu_out * alpha.view(
+                alpha_normal_factor = alpha.max()
+                alpha_normalized = alpha / alpha_normal_factor
+                fc2_input = (swiglu_out * alpha_normalized.view(
                     [num_tokens, self.expert_size_per_partition, 1])).view(
                         [num_tokens, -1]).to(output_dtype)
                 fc2_input, fc2_input_sf = torch.ops.trtllm.fp4_quantize(
@@ -248,7 +250,8 @@ class CuteDslFusedMoE(CutlassFusedMoE):
                     fc2_input,
                     self.w2_weight.view(fc2_input.dtype).reshape(
                         -1, fc2_input.shape[-1]), fc2_input_sf,
-                    self.w2_weight_scale.view(torch.uint8), 1.0, output_dtype)
+                    self.w2_weight_scale.view(torch.uint8), alpha_normal_factor,
+                    output_dtype)
                 return final_hidden_states
             else:
                 # TODO: Implement other quantization types (fp8, int8, etc.)
