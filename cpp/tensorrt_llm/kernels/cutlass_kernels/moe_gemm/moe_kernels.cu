@@ -1669,6 +1669,9 @@ INSTANTIATE_EXPAND_INPUT_ROWS(half, half);
 #ifdef ENABLE_BF16
 INSTANTIATE_EXPAND_INPUT_ROWS(__nv_bfloat16, __nv_bfloat16);
 #endif
+#ifdef ENABLE_FP4
+INSTANTIATE_EXPAND_INPUT_ROWS(__nv_fp4_e2m1, __nv_fp4_e2m1);
+#endif
 
 enum class ScaleMode : int
 {

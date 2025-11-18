@@ -61,12 +61,12 @@ void runPermute(void const* input_activations_void, void const* input_sf_void, i
 
     bool use_w4afp8 = false;
     bool fused_prologue_result = false;
-    if (!use_w4afp8)
-    {
-        fused_prologue_result = cutlass_kernels::fusedBuildExpertMapsSortFirstToken(token_selected_experts,
-            permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_, num_rows,
-            num_experts_per_node, experts_per_token, start_expert, end_expert, stream);
-    }
+    // if (!use_w4afp8)
+    // {
+    //     fused_prologue_result = cutlass_kernels::fusedBuildExpertMapsSortFirstToken(token_selected_experts,
+    //         permuted_row_to_unpermuted_row_, unpermuted_row_to_permuted_row, expert_first_token_offset_, num_rows,
+    //         num_experts_per_node, experts_per_token, start_expert, end_expert, stream);
+    // }
     if (!fused_prologue_result)
     {
         TLLM_LOG_TRACE("Falling back to unfused prologue");
@@ -150,12 +150,67 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto blocked_row_to_unpermuted_row_tensor = torch::empty(
         {num_experts_per_node * num_rows}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
 
-    cutlass_kernels::QuantParams quant_params{};
     cutlass_kernels::MoeMinLatencyParams min_latency_params{};
-
     kernels::LoraParams lora_params{};
 
     auto data_type = input.scalar_type();
+
+    // Special handling for torch::kByte - it could be either uint8 or NVFP4
+    // NVFP4 requires input_sf to be present
+    bool is_nvfp4_input = (data_type == torch::kByte) && input_sf.has_value();
+    if (data_type == torch::kByte && !input_sf.has_value())
+    {
+        throw std::invalid_argument(
+            "Input dtype is Byte (uint8), but input_sf is not provided. "
+            "For NVFP4 input, input_sf (scale factors) must be provided. "
+            "If this is regular uint8 data, please convert to a supported dtype.");
+    }
+
+    // Initialize quant_params based on input type
+    cutlass_kernels::QuantParams quant_params{};
+    if (is_nvfp4_input && quant_scales.has_value())
+    {
+        // For NVFP4, we need to set up FP4 quantization parameters
+        auto const& scales_array = quant_scales.value();
+        TORCH_CHECK(scales_array.size() >= 4,
+            "quant_scales must have at least 4 tensors for NVFP4: "
+            "[fc1_weight_block_scale, fc1_global_scale, fc2_weight_block_scale, fc2_global_scale]");
+
+        // Extract scale tensors
+        auto fc1_weight_block_scale = scales_array[0]; // FC1 weight block scales
+        auto fc1_global_scale = scales_array[1];       // FC1 global scale
+        auto fc2_weight_block_scale = scales_array[2]; // FC2 weight block scales
+        auto fc2_global_scale = scales_array[3];       // FC2 global scale
+
+        // Optional: FC1 and FC2 activation global scales (may be nullptr)
+        float const* fc1_act_global_scale = nullptr;
+        float const* fc2_act_global_scale = nullptr;
+        if (scales_array.size() >= 5 && scales_array[4].defined())
+        {
+            fc1_act_global_scale = static_cast<float const*>(scales_array[4].const_data_ptr());
+        }
+        if (scales_array.size() >= 6 && scales_array[5].defined())
+        {
+            fc2_act_global_scale = static_cast<float const*>(scales_array[5].const_data_ptr());
+        }
+
+        quant_params = cutlass_kernels::QuantParams::FP4(fc1_act_global_scale,
+            static_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(
+                fc1_weight_block_scale.data_ptr()),
+            static_cast<float const*>(fc1_global_scale.const_data_ptr()), fc2_act_global_scale,
+            static_cast<cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::ElementSF*>(
+                fc2_weight_block_scale.data_ptr()),
+            static_cast<float const*>(fc2_global_scale.const_data_ptr()));
+    }
+    else if (is_nvfp4_input && !quant_scales.has_value())
+    {
+        throw std::invalid_argument(
+            "NVFP4 input requires quant_scales to be provided. "
+            "quant_scales should contain: [fc1_weight_block_scale, fc1_global_scale, "
+            "fc2_weight_block_scale, fc2_global_scale, fc1_act_global_scale (optional), "
+            "fc2_act_global_scale (optional)]");
+    }
+
     switch (data_type)
     {
     case torch::kFloat32:
@@ -219,9 +274,33 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             static_cast<int*>(blocked_row_to_unpermuted_row_tensor.data_ptr()), parallelism_config, /*use_lora*/ false,
             lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, stream);
         break;
+    case torch::kByte:
+        // NVFP4 support - torch represents fp4_e2m1 as uint8 (packed format: 2 fp4 values per byte)
+        // Note: We've already validated above that input_sf is present when dtype is Byte,
+        // so we can safely assume this is NVFP4 input
+        runPermute<__nv_fp4_e2m1>(input.const_data_ptr(),
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
+            token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
+                                           : nullptr,
+            /*fc1_expert_weights.const_data_ptr()*/ nullptr, /*fc1_expert_biases.const_data_ptr()*/ nullptr,
+            activation_type,
+            /*fc2_expert_weights.const_data_ptr()*/ nullptr, /*fc2_expert_biases.const_data_ptr()*/ nullptr,
+            quant_params, num_rows, hidden_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<int*>(permuted_row_to_unpermuted_row_tensor.data_ptr()),
+            static_cast<int*>(permuted_token_selected_experts_tensor.data_ptr()),
+            static_cast<__nv_fp4_e2m1*>(permuted_data_tensor.data_ptr()),
+            static_cast<int64_t*>(expert_first_token_offset_tensor.data_ptr()),
+            static_cast<float*>(permuted_token_final_scales_tensor.data_ptr()),
+            static_cast<int*>(unpermuted_row_to_permuted_row_tensor.data_ptr()),
+            static_cast<int*>(blocked_expert_counts_tensor.data_ptr()),
+            static_cast<int*>(blocked_expert_counts_cumsum_tensor.data_ptr()),
+            static_cast<int*>(blocked_row_to_unpermuted_row_tensor.data_ptr()), parallelism_config, /*use_lora*/ false,
+            lora_params, use_fp8_block_scaling, min_latency_mode, min_latency_params, stream);
+        break;
     default:
         throw std::invalid_argument(
-            "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
+            "Invalid dtype, only supports input tensor with float32, float16, bfloat16 and nvfp4 (byte) dtype");
         break;
     }
     return std::make_tuple(permuted_row_to_unpermuted_row_tensor, permuted_token_selected_experts_tensor,

@@ -89,6 +89,9 @@ def reswizzle_sf_ref(sf: torch.Tensor,
         (128, 128),  # 1×2 tiles
         (256, 64),  # 2×1 tiles
         (512, 256),  # 4×4 tiles
+        (128, 1536),  # 4×4 tiles
+        (16384, 128),  # 128×128 tiles
+        (128, 7168),  # 128×128 tiles
     ])
 def test_swizzle_sf(rows, cols):
     """Test C++ swizzle_sf against PyTorch reference implementation"""
