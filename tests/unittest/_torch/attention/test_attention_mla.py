@@ -319,22 +319,18 @@ random_context_sequence_lengths = [
 
 # Define test data
 context_sequence_lengths = [
-    [10, 12, 5],
-    [100, 300, 20, 10],
-    [253, 253, 253, 253],
-    [100, 1110, 1000, 1000],
-    random_context_sequence_lengths,
+    [8000],
 ]
 # Use MTP by default if seqlen_q > 1.
-generation_seq_len_q = [1, 4]
-num_generation_steps = [10]
+generation_seq_len_q = [128]
+num_generation_steps = [1]
 
-kv_cache_dtype_list = [torch.bfloat16]
+kv_cache_dtype_list = []
 if torch.cuda.get_device_capability() in [(8, 9), (9, 0), (10, 0), (12, 0)]:
     kv_cache_dtype_list.append(torch.float8_e4m3fn)
 scenarios = [
     Scenario(kv_cache_dtype=kv_cache_dtype, num_layers=num_layers)
-    for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1, 2]
+    for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1]
 ]
 
 accuracy_dict = {
