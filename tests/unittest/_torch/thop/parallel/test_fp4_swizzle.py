@@ -93,6 +93,10 @@ def reswizzle_sf_ref(sf: torch.Tensor,
         (16384, 128),  # 128×128 tiles
         (128, 16384),  # 128×128 tiles
         (128, 7168),  # 128×128 tiles
+        (8192, 1536),  # 128×128 tiles
+        (8192, 16384),  # 128×128 tiles
+        (8192, 7168),  # 128×128 tiles
+        (8192, 2048),  # 128×128 tiles
     ])
 def test_swizzle_sf(rows, cols):
     """Test C++ swizzle_sf against PyTorch reference implementation"""
@@ -228,3 +232,32 @@ def test_reswizzle_sf(num_partitions, rows, cols):
 
     # Verify results are equivalent
     torch.testing.assert_close(result, ref_result)
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "rows,cols",
+    [
+        (8192, 1536),  # 128×128 tiles
+        (8192, 16384),  # 128×128 tiles
+        (8192, 7168),  # 128×128 tiles
+        (8192, 2048),  # 128×128 tiles
+    ])
+def test_fp4_quantize(dtype, rows, cols):
+    """Test FP4 quantization operation"""
+    scaling_vector_size = 16
+    torch.manual_seed(0)
+
+    # Create random input tensor
+    x = torch.randn((rows, cols), dtype=dtype).cuda()
+    x_sf_global = (448 * 6) / x.abs().max().float()
+
+    # Quantize
+    with torch.inference_mode():
+        x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
+            x, x_sf_global, scaling_vector_size, False)
+
+    # Verify output types
+    assert x_fp4.dtype == fp4_utils.float4_e2m1x2
+    assert x_sf_block.dtype == fp4_utils.float4_sf_dtype

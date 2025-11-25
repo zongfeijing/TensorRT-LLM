@@ -27,13 +27,13 @@ class TestMoePermuteOp(unittest.TestCase):
             self.skipTest("CUDA is not available")
 
         self.device = torch.device("cuda")
-        self.num_tokens = 256
+        self.num_tokens = 8192
         self.num_experts_global = 256  # Total number of experts across all ranks
-        self.hidden_size = 128
+        self.hidden_size = 7168
         self.top_k = 8  # Each token selects 8 experts
 
         # Expert Parallelism configuration
-        self.ep_size = 32  # Number of EP ranks
+        self.ep_size = 1  # Number of EP ranks
         self.ep_rank = 0  # Current EP rank (0-31)
 
         # Calculate local expert range based on EP configuration
@@ -47,6 +47,7 @@ class TestMoePermuteOp(unittest.TestCase):
         # This represents how many tokens are assigned to each local expert
         # For ep_rank=0, we have 8 local experts (0-7)
         base_counts = [89, 200, 145, 178, 241, 78, 198, 60]
+        base_counts = [256] * self.num_experts_local
         self.expert_token_counts = base_counts[: self.num_experts_local]
 
         # Control flags

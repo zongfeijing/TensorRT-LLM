@@ -309,7 +309,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 # Set seed for reproducibility.
 random.seed(0)
 min_context_sequence_length = 1
-max_context_sequence_length = 1000
+max_context_sequence_length = 8193
 min_num_contexts = 1
 max_num_contexts = 10
 random_context_sequence_lengths = [
@@ -319,10 +319,10 @@ random_context_sequence_lengths = [
 
 # Define test data
 context_sequence_lengths = [
-    [8000],
+    [8192],
 ]
 # Use MTP by default if seqlen_q > 1.
-generation_seq_len_q = [128]
+generation_seq_len_q = [4]
 num_generation_steps = [1]
 
 kv_cache_dtype_list = []

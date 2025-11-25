@@ -15,6 +15,7 @@ import tensorrt_llm
     "num_tokens,topk,hidden_size",
     [
         (128, 8, 7168),
+        (8192, 8, 7168),
         (256, 4, 2048),
         (64, 16, 8192),
         (1024, 2, 1024),
@@ -55,7 +56,7 @@ def test_reduce_add_correctness(num_tokens, topk, hidden_size, dtype):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize("num_tokens", [128])
+@pytest.mark.parametrize("num_tokens", [128, 152])
 def test_reduce_add_benchmark(num_tokens):
     """
     Benchmark the reduce_add operation.
