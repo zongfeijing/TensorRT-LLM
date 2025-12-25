@@ -148,13 +148,21 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
             if key not in self.event_dict:
                 self.event_dict[key] = torch.cuda.Event()
 
+    def create_weights(self):
+        super().create_weights()
+        alpha = torch.nn.Parameter(
+            torch.tensor([1.0], device=self.w2_weight.device, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.register_parameter("alpha", alpha)
+
     def load_weights(self, weights: List[Dict]):
         super().load_weights(weights)
         w2_weight = self.w2_weight.clone()
         self.w2_weight.reshape([-1]).copy_(
             w2_weight.transpose(0, 1).reshape([-1]), non_blocking=True
         )
-        self.alpha = torch.tensor([1.0], device=self.w2_weight.device, dtype=torch.float32)
+        # self.alpha = torch.tensor([1.0], device=self.w2_weight.device, dtype=torch.float32)
         if self.has_any_quant:
             if self.has_nvfp4:
                 self._transform_w2_weight_scale_for_min_latency()
