@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import gc
 import math
 import os
 from abc import ABC, abstractmethod
@@ -118,6 +119,13 @@ class _PrefillCompiledModel(torch.nn.Module):
             return super().__getattr__(name)
         except AttributeError:
             return getattr(super().__getattr__("eager_model"), name)
+
+
+def _unwrap_compiled_model(module: torch.nn.Module) -> torch.nn.Module:
+    """The eager module under a torch.compile wrapper or a _PrefillCompiledModel."""
+    if isinstance(module, _PrefillCompiledModel):
+        return module.eager_model
+    return getattr(module, "_orig_mod", module)
 
 
 class ModelEngine(ABC):
@@ -533,32 +541,8 @@ class PyTorchModelEngine(ModelEngine):
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
                     mapping=self.mapping)
-                apply_llm_torch_compile = getattr(self.model,
-                                                  "apply_llm_torch_compile",
-                                                  None)
-                if isinstance(self.model, DecoderModelForCausalLM):
-                    eager_model = self.model.model
-                    compiled_model = torch.compile(
-                        eager_model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
-                    self._torch_compile_prefill_only = (
-                        self._torch_compile_piecewise_cuda_graph
-                        and not self.model.use_fx_for_pcg_fallback)
-                    self.model.model = (
-                        _PrefillCompiledModel(eager_model, compiled_model)
-                        if self._torch_compile_prefill_only else compiled_model)
-                elif callable(apply_llm_torch_compile):
-                    # TODO: Move this contract to MultimodalModelMixin once
-                    # multimodal models consistently expose their LLM compile
-                    # scope through the mixin.
-                    apply_llm_torch_compile(backend=self._torch_compile_backend,
-                                            fullgraph=torch_compile_fullgraph)
-                else:
-                    self.model = torch.compile(
-                        self.model,
-                        backend=self._torch_compile_backend,
-                        fullgraph=torch_compile_fullgraph)
+                self._apply_torch_compile(self._torch_compile_backend,
+                                          torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
@@ -1283,6 +1267,80 @@ class PyTorchModelEngine(ModelEngine):
             self._runner.release_graphs()
         if self._torch_compile_backend is not None:
             self._torch_compile_backend.clear_piecewise_cuda_graphs()
+
+    def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
+        """Compile the eager model scope."""
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if isinstance(self.model, DecoderModelForCausalLM):
+            eager_model = _unwrap_compiled_model(self.model.model)
+            compiled_model = torch.compile(eager_model,
+                                           backend=backend,
+                                           fullgraph=fullgraph)
+            self._torch_compile_prefill_only = (
+                self._torch_compile_piecewise_cuda_graph
+                and not self.model.use_fx_for_pcg_fallback)
+            self.model.model = (_PrefillCompiledModel(eager_model,
+                                                      compiled_model)
+                                if self._torch_compile_prefill_only else
+                                compiled_model)
+        elif callable(apply_llm_torch_compile):
+            # Avoid nesting a new wrapper around the previous compile.
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            # TODO: Move this contract to MultimodalModelMixin once
+            # multimodal models consistently expose their LLM compile scope.
+            apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
+        else:
+            eager_model = getattr(self.model, "_orig_mod", self.model)
+            self.model = torch.compile(eager_model,
+                                       backend=backend,
+                                       fullgraph=fullgraph)
+
+    def _remove_torch_compile(self) -> None:
+        """Restore the eager model scope."""
+        if isinstance(self.model, DecoderModelForCausalLM):
+            self.model.model = _unwrap_compiled_model(self.model.model)
+            return
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
+                                          None)
+        if callable(apply_llm_torch_compile):
+            llm = getattr(self.model, "llm", None)
+            compiled_model = getattr(llm, "model", None)
+            if hasattr(compiled_model, "_orig_mod"):
+                llm.model = compiled_model._orig_mod
+            return
+        self.model = getattr(self.model, "_orig_mod", self.model)
+
+    def release_piecewise_cuda_graphs_for_refit(self) -> None:
+        """Release PWCG captures before refit."""
+        if not (self._torch_compile_enabled
+                and self._torch_compile_piecewise_cuda_graph
+                and self._torch_compile_backend is not None):
+            return
+        torch.cuda.synchronize()
+        self._torch_compile_backend.clear_piecewise_cuda_graphs()
+        self._remove_torch_compile()
+
+    @with_warmup_flag
+    @warmup_with_kv_cache_cleanup
+    def recapture_piecewise_cuda_graphs_after_refit(
+            self, resource_manager: ResourceManager) -> None:
+        """Recapture PWCG after refit."""
+        if not (self._torch_compile_enabled
+                and self._torch_compile_piecewise_cuda_graph):
+            return
+        # Post-load hooks may replace tensors referenced by the old FX graph.
+        torch.compiler.reset()
+        torch_compile_fullgraph = self.torch_compile_config.enable_fullgraph
+        self._apply_torch_compile(self._torch_compile_backend,
+                                  torch_compile_fullgraph)
+        gc.collect()
+        # Padding requests own live KV-cache sequences and must survive recapture.
+        with self.cuda_graph_runner.allow_capture():
+            self._capture_piecewise_cuda_graphs(resource_manager)
 
     def get_max_num_sequences(self) -> int:
         """
