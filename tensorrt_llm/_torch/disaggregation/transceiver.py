@@ -63,6 +63,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+    CppMambaHybridCacheManager,
     MambaHybridCacheManager,
     MambaHybridCacheManagerV2,
 )
@@ -405,8 +406,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _exchange_rank_info(self):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
+        # The Mixed manager's KV side is attention-only, so its recurrent
+        # layers are added here. The unified-pool Cpp manager already counts
+        # them in pp_layers (registered with the parent KVCacheManager under
+        # the RECURRENT_STATES sentinel window), like V2 owns its own.
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager) and not isinstance(
-            self._kv_cache_manager, MambaHybridCacheManagerV2
+            self._kv_cache_manager, (MambaHybridCacheManagerV2, CppMambaHybridCacheManager)
         ):
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
@@ -504,6 +509,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             if self._kv_cache_manager.local_num_mamba_layers > 0:
                 return self._kv_cache_manager._request_id_to_state_index[req.py_request_id]
+        elif isinstance(self._kv_cache_manager, CppMambaHybridCacheManager):
+            # The request's recurrent-state block at the end of prefill in
+            # the unified C++ pool (the state at prompt_len -- exactly what
+            # the generation engine needs). Not the raw primary slot: a folded
+            # save-last chunk keeps the snapshot at the fold point there, and
+            # under the overlap scheduler the manager's fold table has already
+            # been rebuilt for the next batch when this send runs, so pass the
+            # prompt length and let the manager resolve the end-of-prompt block.
+            if self._kv_cache_manager.local_num_mamba_layers > 0:
+                return self._kv_cache_manager.get_final_state_index(
+                    req.py_request_id, prompt_len=req.prompt_len
+                )
         elif isinstance(self._kv_cache_manager, MambaHybridCacheManager):
             return self._kv_cache_manager.mamba_cache_index[req.py_request_id]
         return None
@@ -560,7 +577,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for idx, lg in enumerate(layer_groups):
             if lg.kind == CacheKind.STATE:
                 slot = self._get_mamba_slot_for_request(req)
-                group = np.array([slot], dtype=np.int64) if slot is not None else empty
+                slots = [slot] if slot is not None else []
+                if slot is not None and isinstance(
+                    self._kv_cache_manager, CppMambaHybridCacheManager
+                ):
+                    # Cpp hybrid manager: also ship the prompt-range recurrent
+                    # snapshot slots (grid order) so a reuse-enabled receiver
+                    # can commit a matchable hybrid prefix -- the C++ reuse walk
+                    # floors matches to materialized snapshots. The receiver
+                    # lists only the suffix it is missing (its reuse hit is
+                    # snapshot-floored, so a point-per-point suffix of the
+                    # sender's grid); the sender lists all points and
+                    # Sender._mamba_slot_pairs suffix-aligns. The Mixed and V2
+                    # managers keep the single current-state slot.
+                    pts, snapshot_slots = self._kv_cache_manager.get_prompt_recurrent_snapshot_slots(
+                        req
+                    )
+                    if is_gen_only and adapter.enable_block_reuse:
+                        cached = adapter._global_cached_token_count(req)
+                        snapshot_slots = [s for p, s in zip(pts, snapshot_slots) if p > cached]
+                    slots.extend(int(s) for s in snapshot_slots)
+                group = np.array(slots, dtype=np.int64) if slots else empty
             else:
                 # Block lists carry beam 0 only (beam-search attention reads
                 # prompt positions through beam 0's block table), so the
@@ -623,9 +660,10 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 # The view's byte regions within one slot (all of its layers).
                 view_bytes = get_pool_view_slot_bytes(pv)
                 if lg.kind == CacheKind.STATE:
-                    # STATE: one slot per request; the transfer covers each
-                    # view region once regardless of the block count.
-                    total += view_bytes
+                    # STATE: one view region per slot -- the current state plus,
+                    # for the Cpp hybrid manager, any prompt-range recurrent
+                    # snapshot slots shipped with it (see _describe_local).
+                    total += n * view_bytes
                 else:
                     # Attention: n blocks, each covering the view's regions.
                     total += n * view_bytes
@@ -1636,6 +1674,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return True
 
     def commit_blocks_for_reuse(self, req) -> None:
+        # Hybrid models: skip the transmission-complete commit and rely on the
+        # aggregated-validated store-at-free path. Storing a hybrid sequence
+        # mid-lifecycle produced recurrent-window branches whose later claims
+        # tripped `match.isPartialMatch == false` (kvCacheManager.cpp:1747,
+        # two production runs) even with partial reuse disabled; the free-path
+        # store carries the generation-phase snapshot protections
+        # (save_last_snapshot) the early commit lacks. Sequential agent turns
+        # still reuse turn N-1's freed branch, so only intra-turn duplicate
+        # admission loses reuse.
+        if isinstance(self._kv_cache_manager, CppMambaHybridCacheManager):
+            return
         # Verified-range admission (fail-closed): commit the received range
         # to the reuse tree only when every published destination byte has
         # attested write coverage on every rank. Transfer SUCCESS alone is

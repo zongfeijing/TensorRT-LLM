@@ -1453,6 +1453,20 @@ def test_KvCacheConfig_migrates_deprecated_mamba_interval(monkeypatch):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_deprecated_mamba_interval_survives_revalidation():
+    # The alias stays set on the instance after the migration, so validating
+    # the same values again (KvCacheConfig object passed to TorchLlmArgs, or a
+    # model_dump/reload round trip) must not report a conflict.
+    config = KvCacheConfig(mamba_state_cache_interval=64)
+    again = KvCacheConfig(mamba_state_cache_interval=64,
+                          mamba_state_config=config.mamba_state_config)
+    assert again.mamba_state_config.periodic_snapshot_interval == 64
+
+    with pytest.raises(ValueError, match="Cannot set both"):
+        KvCacheConfig(mamba_state_cache_interval=64,
+                      mamba_state_config={"periodic_snapshot_interval": 128})
+
+@pytest.mark.cpu_only
 def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
         monkeypatch):
     warnings_seen = []
@@ -1531,6 +1545,8 @@ def test_config_file_merge_preserves_null_for_field_validation() -> None:
 
 @pytest.mark.cpu_only
 def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
+    # Equal values count as an already-migrated alias; the conflict needs
+    # two different intervals.
     with pytest.raises(ValueError, match="Cannot set both"):
         update_llm_args_with_extra_dict(
             {"model": "dummy"},
@@ -1538,7 +1554,7 @@ def test_config_file_merge_rejects_legacy_and_new_mamba_intervals():
                 "kv_cache_config": {
                     "mamba_state_cache_interval": 64,
                     "mamba_state_config": {
-                        "periodic_snapshot_interval": 64,
+                        "periodic_snapshot_interval": 128,
                     },
                 },
             },

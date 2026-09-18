@@ -237,7 +237,9 @@ class TestRxSessionVerification:
 
 def _commit(req) -> MagicMock:
     adapter = MagicMock()
-    stub = SimpleNamespace(_reuse_adapter=adapter)
+    # No CppMambaHybridCacheManager: the hybrid skip that precedes the gate
+    # does not apply.
+    stub = SimpleNamespace(_reuse_adapter=adapter, _kv_cache_manager=None)
     KvCacheTransceiverV2.commit_blocks_for_reuse(stub, req)
     return adapter
 
