@@ -209,6 +209,7 @@ def _make_llm_args():
         enable_partial_reuse=False,
         tokens_per_block=32,
         max_attention_window=None,
+        mamba_max_off_grid_snapshots_per_chain=0,
         mamba_state_config=SimpleNamespace(
             periodic_snapshot_interval=256,
             additional_snapshot_offsets_from_start=[],

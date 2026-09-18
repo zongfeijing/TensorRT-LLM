@@ -18,7 +18,7 @@ import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import release_gc
+from tensorrt_llm._utils import mpi_disabled, release_gc
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
@@ -36,6 +36,7 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
@@ -546,6 +547,32 @@ class PyTorchModelEngine(ModelEngine):
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
+                if mpi_disabled() and self.mapping.world_size > 1:
+                    # Resolve the device-mesh dims the compiled forward reads
+                    # (mapping.tp_group & friends) while still eager: the
+                    # DeviceMesh resolver is compiler-disabled and must never
+                    # run under tracing; once memoized these reads trace as
+                    # constants.
+                    _ = self.mapping.tp_group
+                    _ = self.mapping.pp_group
+                    _ = self.mapping.cp_group
+                    if self.mapping.moe_ep_size > 1:
+                        _ = self.mapping.moe_tp_group
+                        _ = self.mapping.moe_ep_group
+                # torch.compile traces AllReduce.forward, whose lazy MNNVL
+                # workspace rescale cannot allocate inside the traced region -
+                # grow the workspaces to the engine maximum up front.
+                num_mnnvl_allreduces = 0
+                for module in self.model.modules():
+                    if isinstance(module, MNNVLAllReduce):
+                        module.prescale_workspace(self.max_num_tokens,
+                                                  self.model.config.hidden_size)
+                        num_mnnvl_allreduces += 1
+                if num_mnnvl_allreduces:
+                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
+                                f"{num_mnnvl_allreduces} modules to cover "
+                                f"max_num_tokens={self.max_num_tokens} before "
+                                "torch.compile.")
                 use_ub = not use_ub_for_nccl and (
                     torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
@@ -1363,7 +1390,6 @@ class PyTorchModelEngine(ModelEngine):
         self._remove_torch_compile()
 
     @with_warmup_flag
-    @warmup_with_kv_cache_cleanup
     def restore_compiled_model_after_refit(
             self, resource_manager: ResourceManager) -> None:
         """Re-install the torch.compile wrapper after refit.
@@ -1377,9 +1403,18 @@ class PyTorchModelEngine(ModelEngine):
         were still live afterwards, so the captures survive intact and PWCG
         stays hot.
 
-        ``resource_manager`` is unused here but is required by the
-        ``warmup_with_kv_cache_cleanup`` decorator, and is part of the signature
-        callers (including NeMo-RL) already pass.
+        Deliberately NOT decorated with ``warmup_with_kv_cache_cleanup``: that
+        decorator ends with ``check_invalid_values_in_kv_cache(fill_with_zero=
+        True)``, which zero-fills every attention KV pool whether or not it
+        found a NaN. It belongs after a capture warm-up that ran forwards on
+        placeholder inputs; this hook never runs a forward, and under an
+        in-flight weight update (``drain=False``) the zero-fill would wipe the
+        KV of every request kept across the refit. The wrapper also ran when
+        torch.compile is disabled, because the early return below happens
+        inside the wrapped method.
+
+        ``resource_manager`` is unused here; it stays in the signature because
+        callers (including NeMo-RL) already pass it.
         """
         if not self._torch_compile_enabled:
             return
@@ -1434,6 +1469,32 @@ class PyTorchModelEngine(ModelEngine):
                                                  inputs.runtime_draft_len)
         return outputs
 
+    def make_graph_batch(
+        self, scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager
+    ) -> Tuple[ScheduledRequests, frozenset[int]]:
+        """The batch ``forward`` would hand to the CUDA-graph runner.
+
+        For the executor's packed attention-DP post-schedule exchange
+        (TLLM_ADP_PACKED_SYNC): evaluated right after scheduling with the
+        same execution-batch transform, spec-decode state and KV cache manager
+        the forward uses, so the padding hint it yields equals what the runner
+        would gather. Runners without graph-batch promotion return the batch
+        unchanged.
+        """
+        runner = self._runner
+        make = getattr(runner, "make_graph_batch", None)
+        if make is None:
+            return scheduled_requests, frozenset()
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        execution_batch = runner._get_attention_dp_execution_batch(
+            scheduled_requests)
+        return make(execution_batch,
+                    kv_cache_manager,
+                    enable_spec_decode=self.enable_spec_decode,
+                    runtime_draft_len=self.runtime_draft_len)
+
     def _forward_scheduled(
         self,
         inputs: ScheduledInputs,
@@ -1451,6 +1512,18 @@ class PyTorchModelEngine(ModelEngine):
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
+            return False
+
+        # The userbuffers bootstrap exchanges CUDA memory handles over raw
+        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
+        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
+        # 1-rank MPI world, so importer ranks would receive uninitialized
+        # bytes instead of peer handles and crash in
+        # cuMemImportFromShareableHandle with 'operation not supported'.
+        if mpi_disabled():
+            logger.info(
+                "Disabling userbuffers: its bootstrap requires MPI, which is "
+                "disabled under this orchestrator.")
             return False
 
         # Disable UB for unsupported platforms

@@ -583,7 +583,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     scheduler = make_scheduler(make_kv_cache_manager())
     transceiver = SimpleNamespace(get_status_dump=Mock()) if has_transceiver else None
     dist = SimpleNamespace(
-        rank=0, tp_size=4, pp_size=1, cp_size=1, mapping=object(), barrier=Mock()
+        rank=0, tp_size=4, world_size=4, pp_size=1, cp_size=1, mapping=object(), barrier=Mock()
     )
     dummy = object()
     runner = SimpleNamespace(enabled=False, padding_enabled=True, padding_dummy_requests={})
@@ -644,7 +644,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
         resource_manager,
         scheduler,
         engine,
-        SimpleNamespace(),
+        SimpleNamespace(warmup=lambda model_engine: None),
         dist,
         max_num_sequences=8,
         kv_cache_transceiver=transceiver,

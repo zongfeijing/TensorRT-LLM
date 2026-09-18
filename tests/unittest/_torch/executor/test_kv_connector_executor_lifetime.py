@@ -49,6 +49,8 @@ def _executor() -> PyExecutor:
     executor.canceled_req_ids = []
     executor.waiting_queue = Mock()
     executor.dist = SimpleNamespace(rank=0)
+    # One rank: the drain=True control gate takes no attention-DP vote.
+    executor.enable_attention_dp = False
     executor._disagg_pp_termination_handler = None
     executor._do_terminate_request = Mock()
     executor._enqueue_responses = Mock()
@@ -411,7 +413,7 @@ def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> Non
                 wire["payload"] = deepcopy(value)
             return deepcopy(wire["payload"])
 
-        def broadcast_count(value, root, *, rank=rank):
+        def broadcast_count(value, root, *, rank=rank, prefer_cpu=False):
             assert root == 0
             if rank == 0:
                 wire["count"] = value
