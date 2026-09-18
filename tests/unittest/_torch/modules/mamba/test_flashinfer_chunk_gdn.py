@@ -23,7 +23,7 @@ def _supported_arch() -> bool:
 
 skip_unsupported = pytest.mark.skipif(
     not _supported_arch(),
-    reason="FlashInfer GDN prefill requires SM90 (Hopper) or SM100/SM103/SM120/SM121 (Blackwell)",
+    reason="FlashInfer GDN prefill requires SM90 (Hopper), SM100/SM103/SM120/SM121 (Blackwell) or SM107 (Rubin)",
 )
 
 
@@ -36,6 +36,7 @@ skip_unsupported = pytest.mark.skipif(
         (90, True),  # Hopper
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
+        (107, True),  # Rubin (VR200), SM100 CuTe-DSL kernels
         (120, True),  # consumer Blackwell (RTX 5090 / PRO 6000)
         (121, True),  # consumer Blackwell (GB10 / DGX Spark)
         (89, False),  # Ada
@@ -55,6 +56,7 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
         (90, True),  # Hopper
         (100, True),  # datacenter Blackwell (B200)
         (103, True),  # datacenter Blackwell (B300/GB200)
+        (107, True),  # Rubin (VR200), SM100 CuTe-DSL kernels
         (120, False),  # consumer Blackwell: prefill kernel exists, decode does not
         (121, False),  # consumer Blackwell: prefill kernel exists, decode does not
         (89, False),  # Ada
@@ -62,8 +64,9 @@ def test_is_flashinfer_gdn_prefill_supported_arch(sm_version, expected):
     ],
 )
 def test_is_flashinfer_gdn_decode_supported_arch(sm_version, expected):
-    """The bf16-state decode / MTP-verify kernels are SM90/SM100/SM103 only --
-    narrower than the prefill set, which also covers SM120/SM121. Pure predicate,
+    """The bf16-state decode / MTP-verify kernels are SM90/SM100/SM103 (and SM107
+    through the SM100 kernels) only -- narrower than the prefill set, which also
+    covers SM120/SM121. Pure predicate,
     no GPU required."""
     from tensorrt_llm._utils import is_flashinfer_gdn_decode_supported_arch
 

@@ -19,7 +19,7 @@
 // Kernel inventory:
 //   1. routingIndicesBlockKernel      — single-block fused kernel (≤8 tokens, one warp per token)
 //  1a. routingIndicesCoopBlockKernel  — single-block, one thread per expert (≤4 tokens, ≤1024 experts)
-//  1b. routingIndicesDynBlockKernel   — dynamic-block fused kernel (≤16 tokens, ≤512 experts)
+//  1b. routingIndicesDynBlockKernel   — dynamic-block fused kernel (≤32 tokens, ≤512 experts)
 //  1c. routingIndicesSmallTokenKernel — single-block, pair-map histogram, ≤8 tokens (default for ≤512 experts)
 //   2. routingIndicesClusterKernel    — single-cluster fused kernel (≤256 tokens, SM90+)
 //   3. routingIndicesHistogramScoresKernel — TopK + histogram from raw scores
