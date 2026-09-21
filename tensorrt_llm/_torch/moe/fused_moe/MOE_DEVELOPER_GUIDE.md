@@ -368,11 +368,34 @@ revision, `rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py`), through
 - The output is accumulated into, so `moe_output_memset_inplace` must run
   first; the per-launch readiness/scheduler counters are zero-initialized
   inside the op runner.
-- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler)` with
+- Tactic = `(mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
+  stream_weights, fc2_stream_weights)` with
   `mma_tiler_m == routing tile_size in {128, 256}`, `mma_n in {128, 256}`,
   `mma_tiler_k in {128, 256}`, cluster `(cta_group, 1)`, scheduler
-  `l2_atomic` / `static`. The outer `CuteDslFusedMoEMxfp8Runner` tunes the
-  routing tile and the comb checker pins the inner `mma_tiler_m` to it.
+  `l2_atomic` / `static`, and L2 evict-first weight loads for both GEMMs
+  (`stream_weights`) or for FC2 alone (`fc2_stream_weights`; only decoupled
+  for locality-domain shards). Shorter tactics from older caches normalize.
+  The outer `CuteDslFusedMoEMxfp8Runner` tunes the routing tile and the comb
+  checker pins the inner `mma_tiler_m` to it.
+- **Locality domains** (`enable_locality_domains`, `plan_moe` op
+  `mxfp8_moe`): `trtllm::cute_dsl_mxfp8_fused_fc12_moe_locality_domain_inplace_rubin`
+  runs the fused kernel on two compute partitions, each holding half of every
+  expert's inner channels (FC1 weights/scales sliced along N as whole gate/up
+  pairs and 128-row scale atoms, FC2 weights/scales along K; together one copy
+  of the weights, built by `_split_mxfp8_weights_for_locality_domain`). Both
+  shards scatter-add into the shared, pre-zeroed output, so the split is not
+  bitwise equal to the full-GPU kernel. It is a separate autotuned op:
+  `CuteDslFusedMoE.run_moe_mxfp8` profiles it only for shapes passing
+  `CuteDslFusedMoEMxfp8Runner.admits_locality_domain` (at most 2048 rows and
+  ~4096 estimated local routes, the measured neutral point) and uses it for a
+  token count only when the autotuner's recorded time beats the full-GPU op
+  by at least 1% (`_select_mxfp8_locality_domain`); every other shape runs
+  the unchanged full-GPU path. Measured on Rubin at the peak HBM clock with
+  the strict 100+100 SM split (TEP8, 64 local experts): -3 to -15% from 2 to
+  1024 rows (most at 16-32), neutral at 2048, +3 to +22% from 3072 rows up
+  and +20% on DEP4 prefill (hence excluded).
+  The MXFP8 path keeps the full weights resident after sharding so RLHF refit
+  can reload them and rebuild the shards in `post_load_weights`.
 - **DSL build requirement.** The kernel needs a newer internal Cutlass DSL
   than the bare `rubin_helpers` probe guarantees. `cute_dsl_utils.py` exposes
   `IS_CUTLASS_DSL_FUSED_FC12_AVAILABLE` (true when `cutlass.memory` and
