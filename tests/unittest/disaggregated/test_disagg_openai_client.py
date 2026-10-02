@@ -890,7 +890,10 @@ class TestDisaggIdRegenOnRetry:
         )
 
         await client.send_request(request)
-        expected_ids = [42, 1000 if regenerate_id else 42]
+        # Only a context retry takes a fresh ID; a generation retry keeps the
+        # one the context worker registered its KV send session under.
+        id_regenerated = regenerate_id and role == ServerRole.CONTEXT
+        expected_ids = [42, 1000 if id_regenerated else 42]
 
         # Serialized attempts retain their own IDs when a context retry
         # regenerates the request ID.
@@ -916,7 +919,7 @@ class TestDisaggIdRegenOnRetry:
             assert (
                 headers[0][INTERNAL_DISAGG_AUTH_HEADER] == headers[1][INTERNAL_DISAGG_AUTH_HEADER]
             )
-        if regenerate_id:
+        if id_regenerated:
             assert (
                 headers[0][SUBAGENT_AFFINITY_AUTH_HEADER]
                 != headers[1][SUBAGENT_AFFINITY_AUTH_HEADER]
@@ -1547,13 +1550,17 @@ class TestRemoteTailHandoffRetry:
 
         response = await openai_client.send_request(completion_request, hooks=hooks, req_id=42)
 
-        assert response == response_body
+        # The client relays worker output as RelayedCompletionResponse (extra fields kept).
+        assert response.model_dump() == response_body.model_dump()
         assert mock_session.post.call_count == 2
-        if request_type is not None:
+        if request_type == "context_only":
             assert completion_request.disaggregated_params.disagg_request_id == 999
             openai_client._disagg_id_generator.assert_awaited_once_with()
             hooks.on_disagg_request_id.assert_called_once_with(999)
         else:
+            # A generation retry keeps its disagg_request_id.
+            if request_type is not None:
+                assert completion_request.disaggregated_params.disagg_request_id == 123
             openai_client._disagg_id_generator.assert_not_awaited()
             hooks.on_disagg_request_id.assert_not_called()
         mock_router.finish_request.assert_awaited_once_with(
