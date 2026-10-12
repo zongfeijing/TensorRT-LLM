@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import gc
 import math
 import os
 from abc import ABC, abstractmethod
@@ -1376,6 +1375,13 @@ class PyTorchModelEngine(ModelEngine):
         path, and ``allow_partial_loading=True`` then skips the whole compiled
         subtree in silence, so it simply keeps its pre-refit weights.
 
+        The loader now strips ``_orig_mod`` from module paths itself
+        (``modeling_utils.strip_torch_compile_wrapper``), so a load into a
+        wrapped model matches again. The unwrap stays because callers that key
+        their own module maps by ``named_modules()`` path (NeMo-RL's direct
+        expert load) still expect wrapper-free names during the refit, and
+        the swap itself is just two attribute writes.
+
         The piecewise captures are deliberately NOT cleared. Refit moves no
         tensor (0 of 1405 parameters, buffers and tensor attributes change
         address), so the captures stay valid; clearing them only forces PWCG
@@ -1413,6 +1419,12 @@ class PyTorchModelEngine(ModelEngine):
         torch.compile is disabled, because the early return below happens
         inside the wrapped method.
 
+        No ``gc.collect()`` either. The previous wrapper is released by
+        reference count when it is replaced, and a full collection in a
+        process holding the executor, the request bookkeeping and the
+        trainer-side Ray state costs seconds; this hook sits inside the
+        refit bubble, so that was pure generation-idle time.
+
         ``resource_manager`` is unused here; it stays in the signature because
         callers (including NeMo-RL) already pass it.
         """
@@ -1420,7 +1432,6 @@ class PyTorchModelEngine(ModelEngine):
             return
         self._apply_torch_compile(self._torch_compile_backend,
                                   self.torch_compile_config.enable_fullgraph)
-        gc.collect()
 
     # Back-compat aliases. Callers probe these names with getattr() and fall
     # back to doing nothing, so removing them would silently skip the unwrap
