@@ -477,10 +477,7 @@ class RequestBroadcaster:
             return request_count
 
         if not self.dist.has_pp:
-            return int(
-                self.dist.broadcast_int64([request_count],
-                                          root=0,
-                                          prefer_cpu=prefer_cpu)[0])
+            return int(self.dist.broadcast_int64([request_count], root=0, prefer_cpu=prefer_cpu)[0])
 
         if self.dist.is_first_pp_rank:
             with nvtx_range("tp_broadcast_request_count"):

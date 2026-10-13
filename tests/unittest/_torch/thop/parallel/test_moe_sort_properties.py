@@ -3,6 +3,7 @@
 """Structural properties of trtllm::moe_sort (post-topK routing sort) that
 every kernel variant (single block, dynamic block, cluster, cooperative) has to
 satisfy, checked across the token counts that pick different variants."""
+
 import pytest
 import torch
 
@@ -15,10 +16,16 @@ TILE = 128
 
 def _check(num_tokens, num_experts, top_k, local_offset, local_num_experts, seed):
     torch.manual_seed(seed)
-    ids = torch.stack([torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]).to(torch.int32)
+    ids = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
     scales = torch.rand(num_tokens, top_k, device="cuda", dtype=torch.float32)
-    outs = torch.ops.trtllm.moe_sort(ids, scales, num_experts, top_k, local_offset, local_num_experts, TILE)
-    tile_to_expert, tile_limit, exp_to_perm, perm_to_exp, total_padded, num_tiles = [o.cpu() for o in outs]
+    outs = torch.ops.trtllm.moe_sort(
+        ids, scales, num_experts, top_k, local_offset, local_num_experts, TILE
+    )
+    tile_to_expert, tile_limit, exp_to_perm, perm_to_exp, total_padded, num_tiles = [
+        o.cpu() for o in outs
+    ]
     ids = ids.cpu()
     num_tiles = int(num_tiles.item())
     total_padded = int(total_padded.item())
@@ -56,17 +63,30 @@ def _check(num_tokens, num_experts, top_k, local_offset, local_num_experts, seed
         seen_rows += hi - lo
     assert seen_rows == int(local.sum().item())
     # Per-expert tile counts match the histogram.
-    tiles_per_expert = torch.bincount(tile_to_expert[:num_tiles].long(), minlength=local_num_experts)
+    tiles_per_expert = torch.bincount(
+        tile_to_expert[:num_tiles].long(), minlength=local_num_experts
+    )
     assert torch.equal(tiles_per_expert, (counts + TILE - 1) // TILE)
 
 
 TOKENS = [1, 3, 4, 5, 8, 12, 16, 17, 31, 32, 33, 64, 200, 1025]
-CASES = ([(t, 512, 10, 8) for t in TOKENS] + [(t, 256, 8, 1) for t in TOKENS] + [(t, 64, 6, 2) for t in TOKENS]
-         + [(700, 8, 2, 1)])  # few experts, many tokens: experts own several tiles each
+CASES = (
+    [(t, 512, 10, 8) for t in TOKENS]
+    + [(t, 256, 8, 1) for t in TOKENS]
+    + [(t, 64, 6, 2) for t in TOKENS]
+    + [(700, 8, 2, 1)]
+)  # few experts, many tokens: experts own several tiles each
 
 
 @pytest.mark.parametrize("num_tokens,num_experts,top_k,ep_size", CASES)
 def test_moe_sort_properties(num_tokens, num_experts, top_k, ep_size):
     local_num_experts = num_experts // ep_size
     for rank in {0, ep_size - 1}:
-        _check(num_tokens, num_experts, top_k, rank * local_num_experts, local_num_experts, seed=num_tokens * 7 + rank)
+        _check(
+            num_tokens,
+            num_experts,
+            top_k,
+            rank * local_num_experts,
+            local_num_experts,
+            seed=num_tokens * 7 + rank,
+        )

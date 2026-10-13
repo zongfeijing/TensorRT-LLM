@@ -510,9 +510,7 @@ def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
     # (and its retained snapshot slots) travels as the slot list of the
     # CacheKind.STATE group over the MambaLayerGroup built below, so drop the
     # sentinel group from the attention layer groups.
-    sorted_window_sizes = [
-        w for w in sorted_window_sizes if w is None or w > 0
-    ]
+    sorted_window_sizes = [w for w in sorted_window_sizes if w is None or w > 0]
 
     pool_groups: List[PhysicalPoolGroup] = []
     layer_groups: List[LayerGroup] = []

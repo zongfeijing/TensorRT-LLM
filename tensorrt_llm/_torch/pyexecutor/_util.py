@@ -344,8 +344,7 @@ def get_kv_cache_manager_cls(
                     # reuse (incl. recurrent-state snapshots) can stay on with
                     # the V1 manager. Off by default until the combination has
                     # broader coverage.
-                    if os.environ.get("TRTLLM_HYBRID_DISAGG_REUSE",
-                                      "0") == "1":
+                    if os.environ.get("TRTLLM_HYBRID_DISAGG_REUSE", "0") == "1":
                         logger.warning(
                             "TRTLLM_HYBRID_DISAGG_REUSE=1: keeping block reuse "
                             "enabled for a hybrid model under disagg + Python "

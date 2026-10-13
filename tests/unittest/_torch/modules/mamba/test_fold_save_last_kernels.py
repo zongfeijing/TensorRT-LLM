@@ -46,19 +46,29 @@ def test_fold_tail_launch_matches_two_chunk_schedule(split):
     num_v_heads, head_dim = v.shape[2], v.shape[3]
     dev = q.device
     S1, S2 = 1, 3
-    init_pool = torch.randn(4, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16, device=dev) * 0.01
+    init_pool = (
+        torch.randn(4, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16, device=dev) * 0.01
+    )
 
     def run_chunk(rows, indices, out_indices=None, cu=None, pool=None):
         sl = slice(rows[0], rows[1])
-        cu_t = torch.tensor([0, rows[1] - rows[0]] if cu is None else cu, dtype=torch.long, device=dev)
+        cu_t = torch.tensor(
+            [0, rows[1] - rows[0]] if cu is None else cu, dtype=torch.long, device=dev
+        )
         out, _ = chunk_gated_delta_rule(
-            q=q[:, sl], k=k[:, sl], v=v[:, sl], g=g[:, sl], beta=beta[:, sl],
+            q=q[:, sl],
+            k=k[:, sl],
+            v=v[:, sl],
+            g=g[:, sl],
+            beta=beta[:, sl],
             initial_state=pool,
             initial_state_indices=torch.tensor(indices, dtype=torch.int32, device=dev),
             inplace_indexed_state_update=True,
             output_final_state=False,
             cu_seqlens=cu_t,
-            output_state_indices=None if out_indices is None else torch.tensor(out_indices, dtype=torch.int32, device=dev),
+            output_state_indices=None
+            if out_indices is None
+            else torch.tensor(out_indices, dtype=torch.int32, device=dev),
         )
         return out
 
@@ -104,10 +114,14 @@ def test_conv_state_at_fold_point_is_the_raw_tail():
     bias = torch.randn(dim, dtype=torch.bfloat16, device=dev) * 0.1
     conv_states = torch.zeros(4, dim, width - 1, dtype=torch.bfloat16, device=dev)
 
-    raw_tail = x[:, split - (width - 1):split].clone()   # what _fold_conv_tail captures
+    raw_tail = x[:, split - (width - 1) : split].clone()  # what _fold_conv_tail captures
     x_a = x[:, :split].clone()
     causal_conv1d_fn(
-        x_a, weight, bias, activation="silu", conv_states=conv_states,
+        x_a,
+        weight,
+        bias,
+        activation="silu",
+        conv_states=conv_states,
         has_initial_state=torch.tensor([False], device=dev),
         cache_indices=torch.tensor([1], dtype=torch.int32, device=dev),
         query_start_loc=torch.tensor([0, split], dtype=torch.int32, device=dev),
@@ -118,9 +132,13 @@ def test_conv_state_at_fold_point_is_the_raw_tail():
     # independent of the fold (this is what lands in S2)
     x_full = x.clone()
     causal_conv1d_fn(
-        x_full, weight, bias, activation="silu", conv_states=conv_states,
+        x_full,
+        weight,
+        bias,
+        activation="silu",
+        conv_states=conv_states,
         has_initial_state=torch.tensor([False], device=dev),
         cache_indices=torch.tensor([2], dtype=torch.int32, device=dev),
         query_start_loc=torch.tensor([0, total], dtype=torch.int32, device=dev),
     )
-    assert torch.equal(conv_states[2], x[:, total - (width - 1):total])
+    assert torch.equal(conv_states[2], x[:, total - (width - 1) : total])

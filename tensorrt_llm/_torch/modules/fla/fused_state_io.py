@@ -274,7 +274,9 @@ def _copy_pool_rows_kernel(
     tl.store(pool_ptr + dst_seq * stride_n + offs, data, mask=mask)
 
 
-def copy_pool_rows(pool: torch.Tensor, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
+def copy_pool_rows(
+    pool: torch.Tensor, src_indices: torch.Tensor, dst_indices: torch.Tensor
+) -> None:
     """``pool[dst_indices[i]] = pool[src_indices[i]]`` for every ``i`` in one launch.
 
     ``pool`` is the ``[slots, H, V, K]`` recurrent-state pool; the two index

@@ -1343,9 +1343,7 @@ class TestFinishReasons:
         @contextmanager
         def raising_stop_words_ctx() -> Generator[None, None, None]:
             with monkeypatch.context() as patch_ctx:
-                patch_ctx.setattr(
-                    FinishReasonsHandler, "_are_stop_words", stop_words_that_raises
-                )
+                patch_ctx.setattr(FinishReasonsHandler, "_are_stop_words", stop_words_that_raises)
                 patch_ctx.setattr(
                     FinishReasonsHandler,
                     "_are_stop_words_single_token",

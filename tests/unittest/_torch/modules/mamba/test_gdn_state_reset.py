@@ -31,13 +31,23 @@ from tensorrt_llm._torch.modules.mamba.recurrent_state_cache import reset_recurr
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _cpp_style_pool(num_layers, num_slots, heads, head_dim, d_state, conv_dim, d_conv, ssm_dtype, dev):
+def _cpp_style_pool(
+    num_layers, num_slots, heads, head_dim, d_state, conv_dim, d_conv, ssm_dtype, dev
+):
     """One byte pool per (layer, slot) holding ssm then conv, viewed like CppMambaHybridCacheManager."""
     ssm_bytes = heads * head_dim * d_state * ssm_dtype.itemsize
     conv_bytes = conv_dim * (d_conv - 1) * 2
-    pool = torch.randint(1, 255, (num_layers, num_slots, ssm_bytes + conv_bytes), dtype=torch.uint8, device=dev)
-    ssm = pool[:, :, :ssm_bytes].view(ssm_dtype).view(num_layers, num_slots, heads, head_dim, d_state)
-    conv = pool[:, :, ssm_bytes:].view(torch.bfloat16).view(num_layers, num_slots, conv_dim, d_conv - 1)
+    pool = torch.randint(
+        1, 255, (num_layers, num_slots, ssm_bytes + conv_bytes), dtype=torch.uint8, device=dev
+    )
+    ssm = (
+        pool[:, :, :ssm_bytes].view(ssm_dtype).view(num_layers, num_slots, heads, head_dim, d_state)
+    )
+    conv = (
+        pool[:, :, ssm_bytes:]
+        .view(torch.bfloat16)
+        .view(num_layers, num_slots, conv_dim, d_conv - 1)
+    )
     return pool, ssm, conv
 
 
@@ -85,19 +95,32 @@ def test_reset_prefill_states_gate_and_hoist(monkeypatch):
     monkeypatch.setattr(gm, "reset_recurrent_state_rows", lambda *a: calls.append("layer"))
     ssm = torch.zeros(2, 3, 4, 8, 8)
     conv = torch.zeros(2, 3, 16, 3)
-    attn = SimpleNamespace(kv_cache_manager=SimpleNamespace(all_ssm_states=ssm, all_conv_states=conv))
+    attn = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(all_ssm_states=ssm, all_conv_states=conv)
+    )
     layer = SimpleNamespace(_reset_prefill_states=gm.Qwen3NextGatedDeltaNet._reset_prefill_states)
-    args = (attn, None, ssm[0], conv[0], torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.bool))
+    args = (
+        attn,
+        None,
+        ssm[0],
+        conv[0],
+        torch.zeros(1, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.bool),
+    )
 
     meta = _Meta()
     layer._reset_prefill_states(layer, attn, meta, *args[2:])
-    assert calls == []                                  # gated off: nothing to reset
+    assert calls == []  # gated off: nothing to reset
     meta.prefill_needs_state_reset = True
     layer._reset_prefill_states(layer, attn, meta, *args[2:])
     layer._reset_prefill_states(layer, attn, meta, *args[2:])
-    assert calls == ["all"] and meta.state_reset_done   # first layer resets every layer, the next skips
+    assert (
+        calls == ["all"] and meta.state_reset_done
+    )  # first layer resets every layer, the next skips
     meta.state_reset_done = False
     attn_no_pool = SimpleNamespace(kv_cache_manager=SimpleNamespace())
     layer._reset_prefill_states(layer, attn_no_pool, meta, *args[2:])
     layer._reset_prefill_states(layer, attn_no_pool, meta, *args[2:])
-    assert calls == ["all", "layer", "layer"] and not meta.state_reset_done   # no all-layer pool: per-layer fallback
+    assert (
+        calls == ["all", "layer", "layer"] and not meta.state_reset_done
+    )  # no all-layer pool: per-layer fallback

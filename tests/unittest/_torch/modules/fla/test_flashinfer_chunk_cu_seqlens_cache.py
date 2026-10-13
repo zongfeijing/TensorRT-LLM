@@ -16,6 +16,7 @@
 int32 once per iteration: the cast is cached per buffer until
 ``Mamba2Metadata.prepare`` invalidates it, and inference-mode tensors (no
 version counter) are handled."""
+
 import pytest
 import torch
 

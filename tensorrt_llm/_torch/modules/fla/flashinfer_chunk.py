@@ -156,11 +156,7 @@ def chunk_gated_delta_rule_indexed_direct(
     launching when the direct launcher is unavailable or the sequence count is
     above the indexed threshold; the caller then uses the generic entry."""
     launcher = _sm100_direct_launcher() if _INDEXED_STATE_IO else None
-    if (
-        launcher is None
-        or cu_seqlens.shape[0] - 1 > _INDEXED_STATE_IO_MAX_SEQS
-        or not is_sm_100f()
-    ):
+    if launcher is None or cu_seqlens.shape[0] - 1 > _INDEXED_STATE_IO_MAX_SEQS or not is_sm_100f():
         return False
     # FlashInfer's SM100 CuTe DSL kernel takes int32 cu_seqlens; the public
     # wrapper casts, so the direct launch has to as well (once per iteration,

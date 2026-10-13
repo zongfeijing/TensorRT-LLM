@@ -8,6 +8,7 @@ fused buffer; the b and a gate rows are copied into two 32-byte-aligned column
 blocks on every post_load_weights (checkpoint load, RL refit), so the decode
 kernel never clones a misaligned gate slice. The forward runs a single GEMM
 whose column slices feed the GDN kernels exactly like the two projections did."""
+
 import pytest
 import torch
 from transformers import Qwen3NextConfig
@@ -74,12 +75,12 @@ def test_fused_projection_matches_the_two_linears(monkeypatch):
     assert b_col >= rows_q and (b_col * itemsize) % 32 == 0 and (a_col * itemsize) % 32 == 0
     assert a_col >= b_col + n_gate and fused.shape[0] >= a_col + n_gate
     assert (fused.shape[0] * itemsize) % 32 == 0, "row stride keeps every token row aligned"
-    assert torch.equal(fused[b_col:b_col + n_gate], mixer.in_proj_ba.weight[:n_gate])
-    assert torch.equal(fused[a_col:a_col + n_gate], mixer.in_proj_ba.weight[n_gate:])
+    assert torch.equal(fused[b_col : b_col + n_gate], mixer.in_proj_ba.weight[:n_gate])
+    assert torch.equal(fused[a_col : a_col + n_gate], mixer.in_proj_ba.weight[n_gate:])
     pad = torch.ones(fused.shape[0], dtype=torch.bool, device=fused.device)
     pad[:rows_q] = False
-    pad[b_col:b_col + n_gate] = False
-    pad[a_col:a_col + n_gate] = False
+    pad[b_col : b_col + n_gate] = False
+    pad[a_col : a_col + n_gate] = False
     assert torch.count_nonzero(fused[pad]) == 0
     for num_tokens in (1, 8, 130):
         x = torch.randn(num_tokens, mixer.hidden_size, device="cuda", dtype=torch.bfloat16)
@@ -89,7 +90,9 @@ def test_fused_projection_matches_the_two_linears(monkeypatch):
             assert r.shape == g.shape, name
             torch.testing.assert_close(g, r, atol=2e-2, rtol=2e-2, msg=name)
         mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
-        assert a.data_ptr() % 32 == 0 and b.data_ptr() % 32 == 0, "gate slices aligned for the decode kernel"
+        assert a.data_ptr() % 32 == 0 and b.data_ptr() % 32 == 0, (
+            "gate slices aligned for the decode kernel"
+        )
         assert a[1:].data_ptr() % 32 == 0 if num_tokens > 1 else True
         assert a.stride(1) == 1 and b.stride(1) == 1
 
@@ -108,11 +111,13 @@ def test_in_place_weight_updates_reach_the_fused_weight():
     copy_weight(mixer.in_proj_ba.weight, new_ba)
     fused_before = mixer._in_proj_fused_weight
     mixer.post_load_weights()
-    assert mixer._in_proj_fused_weight is fused_before, "same buffer: captured graphs keep a valid address"
+    assert mixer._in_proj_fused_weight is fused_before, (
+        "same buffer: captured graphs keep a valid address"
+    )
     n = mixer.num_v_heads_per_tp
     b_col, a_col = mixer._in_proj_b_col, mixer._in_proj_a_col
-    assert torch.equal(fused_before[b_col:b_col + n], new_ba[:n].to(torch.bfloat16))
-    assert torch.equal(fused_before[a_col:a_col + n], new_ba[n:].to(torch.bfloat16))
+    assert torch.equal(fused_before[b_col : b_col + n], new_ba[:n].to(torch.bfloat16))
+    assert torch.equal(fused_before[a_col : a_col + n], new_ba[n:].to(torch.bfloat16))
     x = torch.randn(4, mixer.hidden_size, device="cuda", dtype=torch.bfloat16)
     _, _, a, b = mixer._compute_tokenwise_inputs(x)
     ref = torch.nn.functional.linear(x, new_ba.to(torch.bfloat16)).float()
@@ -137,12 +142,16 @@ def test_replaced_parameter_storage_is_re_aliased_on_post_load():
 def test_ineligible_projections_fall_back_to_the_pair(monkeypatch):
     mixer = _make_mixer()
     mixer.in_proj_ba.bias = torch.nn.Parameter(
-        torch.zeros(mixer.in_proj_ba.weight.shape[0], device="cuda", dtype=torch.bfloat16))
+        torch.zeros(mixer.in_proj_ba.weight.shape[0], device="cuda", dtype=torch.bfloat16)
+    )
     mixer.cache_derived_state()
     assert mixer._in_proj_fused_weight is None
     x = torch.randn(3, mixer.hidden_size, device="cuda", dtype=torch.bfloat16)
     mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
-    assert mixed_qkv.shape == (3, mixer.conv_dim_per_tp) and b.shape == (3, mixer.num_v_heads_per_tp)
+    assert mixed_qkv.shape == (3, mixer.conv_dim_per_tp) and b.shape == (
+        3,
+        mixer.num_v_heads_per_tp,
+    )
     mixer.in_proj_ba.bias = None
     mixer.cache_derived_state()
     assert mixer._in_proj_fused_weight is not None

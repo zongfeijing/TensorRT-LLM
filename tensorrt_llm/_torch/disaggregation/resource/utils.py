@@ -276,7 +276,10 @@ def get_unique_pool_memory_descs(
                 # registration covers both (two overlapping registrations are
                 # backend-dependent).
                 pools = sorted(
-                    ((get_physical_pool(page_table, lg_idx, pv.pool_idx), pv) for pv in lg.pool_views),
+                    (
+                        (get_physical_pool(page_table, lg_idx, pv.pool_idx), pv)
+                        for pv in lg.pool_views
+                    ),
                     key=lambda item: item[0].base_address,
                 )
                 for pool, pv in pools:

@@ -4755,7 +4755,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "traversable, the recurrent-state block is freed). 0 (default) keeps every historical "
         "snapshot until LRU eviction. Interval-grid snapshots are never demoted. Requires "
         "enable_block_reuse; under disaggregated serving it additionally requires the Python "
-        "cache transceiver runtime with TRTLLM_HYBRID_DISAGG_REUSE=1, otherwise it is forced to 0.")
+        "cache transceiver runtime with TRTLLM_HYBRID_DISAGG_REUSE=1, otherwise it is forced to 0."
+    )
 
     use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
         default=True,
@@ -4932,8 +4933,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             return self
         if ("periodic_snapshot_interval"
                 in self.mamba_state_config.model_fields_set):
-            if (self.mamba_state_config.periodic_snapshot_interval
-                    == self.mamba_state_cache_interval):
+            if (self.mamba_state_config.periodic_snapshot_interval ==
+                    self.mamba_state_cache_interval):
                 # Already migrated: the deprecated field stays set on the
                 # instance, so a re-validation (a KvCacheConfig object handed
                 # to TorchLlmArgs, or a model_dump/reload) sees both fields.

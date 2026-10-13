@@ -44,7 +44,8 @@ except (ImportError, RuntimeError):
 # the compiled-kernel shortcut of flashinfer_gdn_tail_recurrent (internal
 # symbols; any of them missing keeps the tail on the public entry).
 try:
-    from flashinfer.gdn_kernels import gdn_decode_bf16_state as _fi_gdn_decode_mod
+    from flashinfer.gdn_kernels import \
+        gdn_decode_bf16_state as _fi_gdn_decode_mod
     _fi_mtp_compiled = _fi_gdn_decode_mod._compiled_kernels_mtp
     _fi_wide_vec_compiled = _fi_gdn_decode_mod._compiled_kernels_wide_vec
     _fi_get_bf16_mtp_config = _fi_gdn_decode_mod._get_bf16_mtp_config
@@ -69,6 +70,7 @@ def _current_cu_stream(device_index: int):
             _cu_streams.clear()
         stream = _cu_streams[handle] = _cuda_driver.CUstream(handle)
     return stream
+
 
 # TLLM_GDN_FI_DIRECT_LAUNCH=0 keeps every FlashInfer GDN call on the validating
 # public entries (A/B; shared with the prefill adapter's knob).
@@ -637,7 +639,8 @@ def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
                              q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                              a: torch.Tensor, b: torch.Tensor,
                              pool: torch.Tensor, indices: torch.Tensor,
-                             output: torch.Tensor, scale: float) -> torch.Tensor:
+                             output: torch.Tensor,
+                             scale: float) -> torch.Tensor:
     """One-token-per-sequence GDN decode straight into FlashInfer's bf16-state
     launchers, for callers that already hold the kernel's layouts.
 
@@ -652,16 +655,16 @@ def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
     Callers check ``flashinfer_gdn_decode_direct_available`` and the alignment."""
     tile_v = _fi_select_wide_vec_tile_v(q.shape[0], v.shape[2])
     if tile_v is not None and tile_v >= 64:
-        entry = _fi_wide_vec_compiled_entry(q.shape[2], v.shape[2], pool, A_log, dt_bias, indices, scale,
-                                            tile_v)
+        entry = _fi_wide_vec_compiled_entry(q.shape[2], v.shape[2], pool, A_log,
+                                            dt_bias, indices, scale, tile_v)
         if entry is not None:
             # FlashInfer's compiled wide-vector kernel straight from its cache
             # (filled by the public entry on the first call for this tile):
             # the entry's per-call Python (casts, asserts, key, defaults) goes
             # from ~12 us to ~7 us. Same kernel, same arguments.
             compiled, inter = entry
-            compiled(pool, inter, A_log, a, dt_bias, q, k, v, b, output, indices, indices,
-                     _current_cu_stream(q.device.index))
+            compiled(pool, inter, A_log, a, dt_bias, q, k, v, b, output,
+                     indices, indices, _current_cu_stream(q.device.index))
             return output
         return _fi_gdn_decode_t1_wide_vec(
             A_log=A_log,
@@ -703,10 +706,11 @@ def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
 
 
 def flashinfer_gdn_tail_recurrent(A_log: torch.Tensor, dt_bias: torch.Tensor,
-                                  q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                                  a: torch.Tensor, b: torch.Tensor,
-                                  pool: torch.Tensor, s1: torch.Tensor,
-                                  s2: torch.Tensor, output: torch.Tensor,
+                                  q: torch.Tensor, k: torch.Tensor,
+                                  v: torch.Tensor, a: torch.Tensor,
+                                  b: torch.Tensor, pool: torch.Tensor,
+                                  s1: torch.Tensor, s2: torch.Tensor,
+                                  output: torch.Tensor,
                                   scale: float) -> torch.Tensor:
     """A folded save-last tail of ``n`` tokens through FlashInfer's recurrent
     (MTP) kernel: the state is read from pool slot ``s1`` and written to slot
@@ -721,7 +725,8 @@ def flashinfer_gdn_tail_recurrent(A_log: torch.Tensor, dt_bias: torch.Tensor,
     the two-chunk schedule (fold_tail_mtp_bench.py). The kernel is compiled per
     ``n`` (~1 s each); warm up the lengths that occur."""
     n = q.shape[1]
-    entry = _fi_tail_recurrent_compiled(n, q.shape[2], v.shape[2], pool, A_log, dt_bias, s1, scale)
+    entry = _fi_tail_recurrent_compiled(n, q.shape[2], v.shape[2], pool, A_log,
+                                        dt_bias, s1, scale)
     if entry is not None:
         # The compiled kernel from FlashInfer's own cache (filled by the public
         # entry on the first call for this tail length): the entry's ~14 us of
@@ -756,32 +761,40 @@ _fi_tail_entries: dict = {}
 _fi_wide_vec_entries: dict = {}
 
 
-def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor, A_log: torch.Tensor,
-                                dt_bias: torch.Tensor, indices: torch.Tensor, scale: float,
+def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor,
+                                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                                indices: torch.Tensor, scale: float,
                                 tile_v: int):
     """``(compiled, dummy_intermediate)`` of FlashInfer's wide-vector T=1 decode
     kernel for this pool geometry / tile, or None when the shortcut is off,
     FlashInfer's internals are unavailable or the kernel is not compiled yet."""
     if not _FI_TAIL_DIRECT or _fi_wide_vec_compiled is None:
         return None
-    key = (H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype, dt_bias.dtype,
-           indices.dtype, scale, tile_v)
+    key = (H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype,
+           dt_bias.dtype, indices.dtype, scale, tile_v)
     entry = _fi_wide_vec_entries.get(key)
     if entry is not None:
         return entry
     K = V = pool.shape[-1]
     contiguous = pool.is_contiguous()
     cache_key = (
-        "v3_mtp_bf16_tiled_dynB", 1, H, HV, K, V,
+        "v3_mtp_bf16_tiled_dynB",
+        1,
+        H,
+        HV,
+        K,
+        V,
         -1 if contiguous else pool.shape[0],
-        (-1,) if contiguous else tuple(int(s) for s in pool.stride()),
+        (-1, ) if contiguous else tuple(int(s) for s in pool.stride()),
         tile_v,
         False,  # effective_disable_final
         False,  # cache_intermediate_states
-        True,   # use_qk_l2norm_in_kernel
-        scale, 1.0, 20.0,
+        True,  # use_qk_l2norm_in_kernel
+        scale,
+        1.0,
+        20.0,
         _fi_use_packed_fma,
-        True,   # same_pool: read and write the same slots
+        True,  # same_pool: read and write the same slots
         _fi_dtype_key(A_log, dt_bias, indices),
     )
     cache = _fi_wide_vec_compiled.get(cache_key)
@@ -803,8 +816,8 @@ def _fi_tail_recurrent_compiled(n: int, H: int, HV: int, pool: torch.Tensor,
     kernel has not been compiled yet (the public entry compiles it)."""
     if not _FI_TAIL_DIRECT or _fi_mtp_compiled is None:
         return None
-    key = (n, H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype, dt_bias.dtype,
-           indices.dtype, scale)
+    key = (n, H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype,
+           A_log.dtype, dt_bias.dtype, indices.dtype, scale)
     entry = _fi_tail_entries.get(key)
     if entry is not None:
         return entry
@@ -812,14 +825,22 @@ def _fi_tail_recurrent_compiled(n: int, H: int, HV: int, pool: torch.Tensor,
     tile_v, ilp_rows = _fi_get_bf16_mtp_config(1, n, HV, V)
     contiguous = pool.is_contiguous()
     cache_key = (
-        "mtp_bf16_dynB", n, H, HV, K, V,
+        "mtp_bf16_dynB",
+        n,
+        H,
+        HV,
+        K,
+        V,
         -1 if contiguous else pool.shape[0],
-        (-1,) if contiguous else tuple(int(s) for s in pool.stride()),
-        tile_v, ilp_rows,
+        (-1, ) if contiguous else tuple(int(s) for s in pool.stride()),
+        tile_v,
+        ilp_rows,
         False,  # disable_state_update
         False,  # cache_intermediate_states
-        True,   # use_qk_l2norm_in_kernel
-        scale, 1.0, 20.0,  # scale, softplus_beta, softplus_threshold
+        True,  # use_qk_l2norm_in_kernel
+        scale,
+        1.0,
+        20.0,  # scale, softplus_beta, softplus_threshold
         _fi_use_packed_fma,
         False,  # same_pool: the tail reads S1 and writes S2
         False,  # disable_output

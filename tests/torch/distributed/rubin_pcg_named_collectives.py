@@ -20,13 +20,13 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 
-import tensorrt_llm  # Registers TensorRT-LLM custom operators.
+import tensorrt_llm  # noqa: F401  # Registers TensorRT-LLM custom operators.
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 
 
-def _custom_workload(x: torch.Tensor, ranks: list[int], rank: int,
-                     group_name: str) -> Tuple[torch.Tensor, torch.Tensor,
-                                               torch.Tensor]:
+def _custom_workload(
+    x: torch.Tensor, ranks: list[int], rank: int, group_name: str
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exercise the exact named C++ collective operators used under PCG."""
     reduced = torch.ops.trtllm.allreduce_pg_by_name(
         input=x,
@@ -43,40 +43,36 @@ def _custom_workload(x: torch.Tensor, ranks: list[int], rank: int,
         eps=1e-6,
         trigger_completion_at_end=True,
     )[0]
-    gathered = torch.ops.trtllm.allgather_pg_by_name(x, None, ranks,
-                                                      group_name)
+    gathered = torch.ops.trtllm.allgather_pg_by_name(x, None, ranks, group_name)
     # Every rank provides world-size equal chunks.  Reduce-scatter should
     # therefore produce the same sum on each rank.
     scattered = torch.ops.trtllm.reducescatter_pg_by_name(
-        x.repeat((len(ranks), 1)), None, ranks, rank, group_name)
+        x.repeat((len(ranks), 1)), None, ranks, rank, group_name
+    )
     return reduced, gathered, scattered
 
 
-def _functional_workload(x: torch.Tensor, group: dist.ProcessGroup,
-                         world_size: int) -> Tuple[torch.Tensor, torch.Tensor,
-                                                   torch.Tensor]:
+def _functional_workload(
+    x: torch.Tensor, group: dist.ProcessGroup, world_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Graph-native control path used by the Rubin Python workaround."""
     reduced = funcol.all_reduce(x, "sum", group)
     gathered = funcol.all_gather_tensor(x, 0, group)
-    scattered = funcol.reduce_scatter_tensor(x.repeat((world_size, 1)), "sum",
-                                               0, group)
+    scattered = funcol.reduce_scatter_tensor(x.repeat((world_size, 1)), "sum", 0, group)
     return reduced, gathered, scattered
 
 
-def _expected(x: torch.Tensor, world_size: int) -> Tuple[torch.Tensor,
-                                                          torch.Tensor,
-                                                          torch.Tensor]:
+def _expected(x: torch.Tensor, world_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Inputs on rank r contain r + 1.  The sum across TP is triangular(world).
     summed = torch.full_like(x, world_size * (world_size + 1) / 2)
-    gathered = torch.cat(
-        [torch.full_like(x, rank + 1) for rank in range(world_size)], dim=0)
+    gathered = torch.cat([torch.full_like(x, rank + 1) for rank in range(world_size)], dim=0)
     return summed, gathered, summed
 
 
-def _assert_outputs(label: str, outputs: Tuple[torch.Tensor, ...],
-                    expected: Tuple[torch.Tensor, ...]) -> None:
-    for name, actual, want in zip(("allreduce", "allgather", "reducescatter"),
-                                  outputs, expected):
+def _assert_outputs(
+    label: str, outputs: Tuple[torch.Tensor, ...], expected: Tuple[torch.Tensor, ...]
+) -> None:
+    for name, actual, want in zip(("allreduce", "allgather", "reducescatter"), outputs, expected):
         torch.testing.assert_close(
             actual,
             want,
@@ -86,10 +82,14 @@ def _assert_outputs(label: str, outputs: Tuple[torch.Tensor, ...],
         )
 
 
-def _capture_and_replay(workload: Callable[[torch.Tensor], Tuple[torch.Tensor,
-                                                                  ...]],
-                        x: torch.Tensor, replays: int,
-                        expected: Tuple[torch.Tensor, ...], label: str, warmup_iterations: int = 3) -> None:
+def _capture_and_replay(
+    workload: Callable[[torch.Tensor], Tuple[torch.Tensor, ...]],
+    x: torch.Tensor,
+    replays: int,
+    expected: Tuple[torch.Tensor, ...],
+    label: str,
+    warmup_iterations: int = 3,
+) -> None:
     # Warmup is outside capture, matching the engine's PCG capture lifecycle.
     for _ in range(warmup_iterations):
         _assert_outputs(label + " warmup", workload(x), expected)
@@ -151,18 +151,20 @@ def main() -> None:
     assert local_group is not None
     from tensorrt_llm._utils import torch_pybind11_abi
     from tensorrt_llm.bindings.internal.process_group import init_pg
+
     init_pg(dist.group.WORLD, local_group, torch_pybind11_abi())
 
     # Must be eager: this is the production pre-capture native warmup.
     ranks = list(range(world_size))
     if not args.skip_native_warmup:
         torch.ops.trtllm.allreduce_pg_warmup_by_name(
-            torch.ones(1, device=device, dtype=torch.float32), ranks, rank,
-            group_name)
+            torch.ones(1, device=device, dtype=torch.float32), ranks, rank, group_name
+        )
 
     try:
-        x = torch.full((args.tokens, args.hidden_size), rank + 1,
-                       device=device, dtype=torch.bfloat16)
+        x = torch.full(
+            (args.tokens, args.hidden_size), rank + 1, device=device, dtype=torch.bfloat16
+        )
         expected = _expected(x, world_size)
 
         _capture_and_replay(

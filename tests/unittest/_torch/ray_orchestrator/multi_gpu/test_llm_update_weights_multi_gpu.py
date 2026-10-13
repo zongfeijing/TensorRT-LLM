@@ -29,8 +29,8 @@ from utils.torch_ref import RefHFModel
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 from tensorrt_llm import LLM
-from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm._torch.moe.fused_moe.triton_dequant_nvfp4 import dequant_nvfp4_2d_triton
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.executor.ray.utils import control_action_decorator
 from tensorrt_llm.llmapi import (
@@ -1431,8 +1431,12 @@ def _run_qwen35_397b_bf16_tp8_multinode(
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
-    groups = sorted({_qwen35_35b_weight_group(name)
-                     for name in _qwen35_35b_selected_checkpoint_names(model_dir)})
+    groups = sorted(
+        {
+            _qwen35_35b_weight_group(name)
+            for name in _qwen35_35b_selected_checkpoint_names(model_dir)
+        }
+    )
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = [tokenizer.encode(prompt) for prompt in ["Hello, my name is", "The future of AI is"]]
     del tokenizer
@@ -1454,8 +1458,9 @@ def _run_qwen35_397b_bf16_tp8_multinode(
         max_batch_size=2,
         max_seq_len=256,
         max_num_tokens=256,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.05,
-                                      mamba_ssm_cache_dtype="float32"),
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False, free_gpu_memory_fraction=0.05, mamba_ssm_cache_dtype="float32"
+        ),
         model_kwargs=_qwen35_35b_model_kwargs(),
         moe_config=MoeConfig(backend="CUTLASS"),
         enable_chunked_prefill=True,
@@ -1466,8 +1471,10 @@ def _run_qwen35_397b_bf16_tp8_multinode(
         for group in groups:
             llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, group))
         llm._collective_rpc("update_weights_from_local_checkpoint", (model_dir, None))
-        return [output.outputs[0].generation_logits.detach().cpu()
-                for output in llm.generate(prompts, sampling_params)]
+        return [
+            output.outputs[0].generation_logits.detach().cpu()
+            for output in llm.generate(prompts, sampling_params)
+        ]
 
 
 @pytest.mark.high_cuda_memory

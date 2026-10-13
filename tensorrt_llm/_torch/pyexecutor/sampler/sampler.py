@@ -31,6 +31,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -123,6 +124,9 @@ from .two_model_spec_dec import (
     get_rejected_indices,  # noqa: F401  (re-exported for tests via the package __getattr__)
     sample_rejected,  # noqa: F401
 )
+
+if TYPE_CHECKING:
+    from ...speculative.spec_tree_manager import SpecTreeManager
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override

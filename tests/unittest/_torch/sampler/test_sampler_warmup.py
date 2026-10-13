@@ -276,7 +276,10 @@ _REPLAY_BATTERY: list[tuple[str, list[_ReqSpec]]] = [
     ("rows1_processed_only", [_ReqSpec()]),
     ("mixed_raw_subset", [_ReqSpec(raw=(i % 3 == 0)) for i in range(48)]),
     ("raw_m1_of_48", [_ReqSpec(raw=(i == 47)) for i in range(48)]),
-    ("no_logprobs_then_raw", [_ReqSpec(logprobs=False) for _ in range(16)] + [_ReqSpec(raw=True) for _ in range(32)]),
+    (
+        "no_logprobs_then_raw",
+        [_ReqSpec(logprobs=False) for _ in range(16)] + [_ReqSpec(raw=True) for _ in range(32)],
+    ),
     ("steps2_subset_raw", [_ReqSpec(num_steps=2, raw=(i < 3)) for i in range(24)]),
 ]
 
@@ -298,6 +301,8 @@ def test_warmup_covers_runtime_faithful_replay():
             f"{name} took {elapsed_ms:.1f} ms after warmup "
             f"(>{MAX_COMPILE_FREE_CALL_MS} ms; likely a recompile)"
         )
+
+
 def _make_sampler() -> TorchSampler:
     return TorchSampler(
         TorchSampler.Args(

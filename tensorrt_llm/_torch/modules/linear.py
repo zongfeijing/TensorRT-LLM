@@ -3635,14 +3635,14 @@ class MXFP8LinearMethod(LinearMethodBase):
         return "weight_scale"
 
     def load_weight_scales(
-            self,
-            weights: List[Dict],
-            tp_size: int = 1,
-            tp_rank: int = 0,
-            tp_mode: Optional[TensorParallelMode] = None,
-            pad_missing: bool = False,
-            module: Optional[Linear] = None,
-            shard_names: Optional[Sequence[Optional[str]]] = None,
+        self,
+        weights: List[Dict],
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_mode: Optional[TensorParallelMode] = None,
+        pad_missing: bool = False,
+        module: Optional[Linear] = None,
+        shard_names: Optional[Sequence[Optional[str]]] = None,
     ) -> List[torch.Tensor]:
         """Load per-shard UE8M0 block scales.
 

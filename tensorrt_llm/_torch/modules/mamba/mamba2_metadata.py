@@ -635,8 +635,8 @@ class Mamba2Metadata:
         kv_cache_manager = attn_metadata.kv_cache_manager
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size, 0)
-        self._prepare_fold_segments(kv_cache_manager, attn_metadata,
-                                    batch_size, 0)
+        self._prepare_fold_segments(kv_cache_manager, attn_metadata, batch_size,
+                                    0)
 
         self.query_start_loc = None
         self.query_start_loc_long = self._arange_buffer_long[:batch_size + 1]
@@ -861,8 +861,7 @@ class Mamba2Metadata:
         num_decodes = batch_size - num_contexts
         if num_contexts > 0 and num_decodes > 0:
             self.state_indices_decode[:num_decodes].copy_(
-                self.state_indices[num_contexts:batch_size],
-                non_blocking=True)
+                self.state_indices[num_contexts:batch_size], non_blocking=True)
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

@@ -322,13 +322,23 @@ def _fused_gdn_post_conv_kernel(
                 slot2 = tl.load(fold_s2_ptr + r).to(tl.int64)
                 coffs = j * CONV_BLOCK + tl.arange(0, CONV_BLOCK)
                 cmask = coffs < CONV_STATE_SIZE
-                src = tl.load(conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs, mask=cmask)
-                tl.store(conv_states_ptr + slot2 * conv_state_stride.to(tl.int64) + coffs, src, mask=cmask)
+                src = tl.load(
+                    conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs, mask=cmask
+                )
+                tl.store(
+                    conv_states_ptr + slot2 * conv_state_stride.to(tl.int64) + coffs,
+                    src,
+                    mask=cmask,
+                )
                 c = coffs // WIDTH
                 w = coffs - c * WIDTH
                 base = (tl.load(fold_conv_tok_ptr + r) - WIDTH).to(tl.int64) * x_stride_token
                 t = tl.load(x_ptr + base + w.to(tl.int64) * x_stride_token + c, mask=cmask)
-                tl.store(conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs, t.to(src.dtype), mask=cmask)
+                tl.store(
+                    conv_states_ptr + slot1 * conv_state_stride.to(tl.int64) + coffs,
+                    t.to(src.dtype),
+                    mask=cmask,
+                )
             return
 
     token_offsets = token_block * BLOCK_TOKENS + tl.arange(0, BLOCK_TOKENS)
@@ -544,7 +554,13 @@ def fused_gdn_post_conv(
         grid = (triton.cdiv(num_tokens, block_tokens), num_heads + n_folds * conv_programs)
     else:
         # placeholders (never dereferenced: FOLD_CONV=False)
-        x, conv_states, fold_s1, fold_s2, fold_conv_tok = prefill, prefill, prefill, prefill, prefill
+        x, conv_states, fold_s1, fold_s2, fold_conv_tok = (
+            prefill,
+            prefill,
+            prefill,
+            prefill,
+            prefill,
+        )
         width, conv_state_size, conv_block, conv_programs = 1, 1, 1, 1
         x_stride_token, conv_state_stride = 0, 0
         grid = (triton.cdiv(num_tokens, block_tokens), num_heads)

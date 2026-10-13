@@ -11,6 +11,7 @@ fold tails call FlashInfer's compiled kernel from its cache
 layouts and re-validate arguments on every call. A mixed batch through
 forward_core must reproduce the generic entries bit for bit on the same
 kernels."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -34,11 +35,22 @@ def _sm100():
 
 def _make_mixer():
     config = Qwen3NextConfig(
-        hidden_size=256, intermediate_size=512, num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
-        linear_num_key_heads=2, linear_num_value_heads=8, linear_key_head_dim=128, linear_value_head_dim=128,
-        linear_conv_kernel_dim=4, vocab_size=1024, torch_dtype=torch.bfloat16,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        linear_num_key_heads=2,
+        linear_num_value_heads=8,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        vocab_size=1024,
+        torch_dtype=torch.bfloat16,
     )
-    mixer = Qwen3NextGatedDeltaNet(ModelConfig(pretrained_config=config), aux_stream=torch.cuda.Stream(), layer_idx=0).cuda()
+    mixer = Qwen3NextGatedDeltaNet(
+        ModelConfig(pretrained_config=config), aux_stream=torch.cuda.Stream(), layer_idx=0
+    ).cuda()
     torch.manual_seed(1)
     with torch.no_grad():
         for p in mixer.parameters():
@@ -61,7 +73,12 @@ class _CacheManager:
 
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
 @pytest.mark.parametrize(
-    "ctx_lens,folds,n_dec", [([70, 45], [None, None], 6), ([96, 50], [(64, 7), None], 3), ([130, 100], [(96, 7), (64, 8)], 70)]
+    "ctx_lens,folds,n_dec",
+    [
+        ([70, 45], [None, None], 6),
+        ([96, 50], [(64, 7), None], 3),
+        ([130, 100], [(96, 7), (64, 8)], 70),
+    ],
 )
 @torch.no_grad()
 def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_lens, folds, n_dec):
@@ -81,7 +98,12 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
     total = sum(ctx_lens) + n_dec
     x = torch.randn(total, mixer.hidden_size, dtype=torch.bfloat16, device=dev)
     conv0 = torch.randn(batch + 12, conv_dim, width, dtype=torch.bfloat16, device=dev)
-    ssm0 = torch.randn(batch + 12, mixer.num_v_heads_per_tp, 128, 128, dtype=torch.bfloat16, device=dev) * 0.01
+    ssm0 = (
+        torch.randn(
+            batch + 12, mixer.num_v_heads_per_tp, 128, 128, dtype=torch.bfloat16, device=dev
+        )
+        * 0.01
+    )
     launched = {"scan": 0, "decode": 0, "tail": 0}
     real_scan, real_decode = gm.chunk_gated_delta_rule_indexed_direct, gm.flashinfer_gdn_decode_t1
     real_tail = gm.flashinfer_gdn_tail_recurrent
@@ -101,15 +123,24 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
 
     def run(direct):
         conv, ssm = conv0.clone(), ssm0.clone()
-        layer_cache = SimpleNamespace(conv=conv, temporal=ssm, intermediate_conv_window=None, intermediate_ssm=None)
+        layer_cache = SimpleNamespace(
+            conv=conv, temporal=ssm, intermediate_conv_window=None, intermediate_ssm=None
+        )
         manager = _CacheManager(slots, folds + [None] * n_dec)
         manager.mamba_layer_cache = lambda layer_idx: layer_cache
         manager.is_speculative = lambda: False
         md = Mamba2Metadata(max_batch_size=128, chunk_size=64)
         attn = SimpleNamespace(
-            seq_lens=seq_lens, seq_lens_cuda=seq_lens.cuda(), num_contexts=num_ctx, num_ctx_tokens=sum(ctx_lens),
-            num_tokens=total, kv_cache_manager=manager, request_ids=list(range(100, 100 + batch)),
-            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=torch.tensor([0] * num_ctx + [9] * n_dec, dtype=torch.int)),
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=num_ctx,
+            num_ctx_tokens=sum(ctx_lens),
+            num_tokens=total,
+            kv_cache_manager=manager,
+            request_ids=list(range(100, 100 + batch)),
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0] * num_ctx + [9] * n_dec, dtype=torch.int)
+            ),
         )
         md.prepare(attn)
         out = torch.empty(1, total, mixer.num_v_heads_per_tp, 128, dtype=torch.bfloat16, device=dev)
@@ -121,7 +152,9 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
             else:
                 m.setattr(gm, "chunk_gated_delta_rule_indexed_direct", lambda *a, **k: False)
                 m.setattr(gm, "flashinfer_gdn_decode_direct_available", lambda *a: False)
-                m.setattr(fsg, "_FI_TAIL_DIRECT", False)  # fold tails through the public recurrent entry
+                m.setattr(
+                    fsg, "_FI_TAIL_DIRECT", False
+                )  # fold tails through the public recurrent entry
             mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
             mixer.forward_core(mixed_qkv, a, b, attn, md, output=out)
         torch.cuda.synchronize()
@@ -140,4 +173,6 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
     if fc._sm100_direct_launcher() is not None:
         assert launched["scan"] == expected_scans, launched
     assert launched["tail"] == expected_tails, launched
-    assert launched["decode"] == (1 if fsg.flashinfer_gdn_decode_direct_available(torch.bfloat16, 128, 128) else 0)
+    assert launched["decode"] == (
+        1 if fsg.flashinfer_gdn_decode_direct_available(torch.bfloat16, 128, 128) else 0
+    )

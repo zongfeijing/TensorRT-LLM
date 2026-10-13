@@ -10,9 +10,9 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import math
 from dataclasses import dataclass
 from types import SimpleNamespace
-import math
 from unittest.mock import Mock, patch
 
 import pytest
@@ -1030,9 +1030,7 @@ def test_cpp_hybrid_affine_cost_reserves_save_last_snapshot_slot(
         )
 
     state_bytes_per_rank = local_mamba_layers * state_bytes_per_layer
-    expected_slope = 64 + (
-        math.ceil(state_bytes_per_rank / interval) if enable_block_reuse else 0
-    )
+    expected_slope = 64 + (math.ceil(state_bytes_per_rank / interval) if enable_block_reuse else 0)
     # max_batch_size * pp_size resident sequences x (live + save-last) slots,
     # plus the CUDA-graph dummy slot.
     expected_intercept = (

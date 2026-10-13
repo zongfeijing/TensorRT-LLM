@@ -33,15 +33,19 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tensorrt_llm._torch.disaggregation.orchestration.coordinator import DisaggTransferCoordinator
 from tensorrt_llm._torch.pyexecutor.py_executor import AsyncTransferManager, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.bindings import LlmRequestState
-from tensorrt_llm._torch.disaggregation.orchestration.coordinator import (
-    DisaggTransferCoordinator)
 
 
-def _request(request_id: int, *, state=LlmRequestState.GENERATION_IN_PROGRESS,
-             is_context_only: bool = False, is_generation_only: bool = False):
+def _request(
+    request_id: int,
+    *,
+    state=LlmRequestState.GENERATION_IN_PROGRESS,
+    is_context_only: bool = False,
+    is_generation_only: bool = False,
+):
     request = MagicMock()
     request.py_request_id = request_id
     request.state = state
@@ -59,8 +63,7 @@ class _RecomputeExecutor:
     _DISAGG_TRANSFER_BOUND_STATES = PyExecutor._DISAGG_TRANSFER_BOUND_STATES
     _is_disagg_transfer_bound = PyExecutor._is_disagg_transfer_bound
 
-    def __init__(self, active_requests, *, transceiver, transfer_manager,
-                 previous_batch=None):
+    def __init__(self, active_requests, *, transceiver, transfer_manager, previous_batch=None):
         self.active_requests = list(active_requests)
         self.kv_cache_transceiver = transceiver
         self.async_transfer_manager = transfer_manager
@@ -127,7 +130,6 @@ def _transfer_manager():
 
 
 class TestRecomputeSkipsTransferBoundRequests:
-
     def test_aggregated_engine_recomputes_everything(self):
         """Without a transceiver (aggregated engine) nothing is skipped."""
         reqs = [_request(1), _request(2, state=LlmRequestState.CONTEXT_INIT)]
@@ -142,8 +144,9 @@ class TestRecomputeSkipsTransferBoundRequests:
     def test_in_flight_batch_is_a_precondition_violation(self):
         """The control action retires the overlap batch first; recompute must
         never consume it itself (that path gathers on some ADP ranks only)."""
-        ex = _RecomputeExecutor([_request(3)], transceiver=None, transfer_manager=None,
-                                previous_batch=MagicMock())
+        ex = _RecomputeExecutor(
+            [_request(3)], transceiver=None, transfer_manager=None, previous_batch=MagicMock()
+        )
 
         with pytest.raises(RuntimeError, match="quiescent"):
             PyExecutor.recompute_active_requests(ex)
@@ -160,8 +163,9 @@ class TestRecomputeSkipsTransferBoundRequests:
         unstarted_ctx = _request(10, state=LlmRequestState.CONTEXT_INIT, is_context_only=True)
         in_transfer = _request(11, is_context_only=True)
         manager.start_transfer(in_transfer)  # -> DISAGG_CONTEXT_TRANS_IN_PROGRESS, pinned
-        ex = _RecomputeExecutor([unstarted_ctx, in_transfer],
-                                transceiver=MagicMock(), transfer_manager=manager)
+        ex = _RecomputeExecutor(
+            [unstarted_ctx, in_transfer], transceiver=MagicMock(), transfer_manager=manager
+        )
 
         PyExecutor.recompute_active_requests(ex)
 
@@ -184,14 +188,20 @@ class TestRecomputeSkipsTransferBoundRequests:
         """
         manager, _ = _transfer_manager()
         decoding = _request(20, is_generation_only=True)
-        waiting = _request(21, state=LlmRequestState.DISAGG_GENERATION_INIT,
-                           is_generation_only=True)
-        receiving = _request(22, state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
-                             is_generation_only=True)
-        landed = _request(23, state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE,
-                          is_generation_only=True)
-        ex = _RecomputeExecutor([decoding, waiting, receiving, landed],
-                                transceiver=MagicMock(), transfer_manager=manager)
+        waiting = _request(
+            21, state=LlmRequestState.DISAGG_GENERATION_INIT, is_generation_only=True
+        )
+        receiving = _request(
+            22, state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS, is_generation_only=True
+        )
+        landed = _request(
+            23, state=LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE, is_generation_only=True
+        )
+        ex = _RecomputeExecutor(
+            [decoding, waiting, receiving, landed],
+            transceiver=MagicMock(),
+            transfer_manager=manager,
+        )
 
         PyExecutor.recompute_active_requests(ex)
 
@@ -203,8 +213,10 @@ class TestRecomputeSkipsTransferBoundRequests:
         ex.dist.tp_allgather.assert_not_called()
         ex.dist.tp_gather.assert_not_called()
         # Operators verify the fix from this marker on every gen rank.
-        assert ("TRTLLM_RECOMPUTE_ACTIVE_REQUESTS_CALLED active_requests=4 "
-                "recompute=0 disagg_transfer_bound=4") in capfd.readouterr().out
+        assert (
+            "TRTLLM_RECOMPUTE_ACTIVE_REQUESTS_CALLED active_requests=4 "
+            "recompute=0 disagg_transfer_bound=4"
+        ) in capfd.readouterr().out
 
     def test_mixed_engine_still_recomputes_full_requests(self, capfd):
         """A request that is neither context-only nor generation-only (an
@@ -216,10 +228,12 @@ class TestRecomputeSkipsTransferBoundRequests:
         ctx_only = _request(26, state=LlmRequestState.CONTEXT_INIT, is_context_only=True)
         # Neither flag set but sitting in a transfer state: the state-set
         # safety net must still keep it out of the recompute.
-        in_transfer_state = _request(
-            28, state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
-        ex = _RecomputeExecutor([full, gen_only, ctx_only, in_transfer_state],
-                                transceiver=MagicMock(), transfer_manager=manager)
+        in_transfer_state = _request(28, state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+        ex = _RecomputeExecutor(
+            [full, gen_only, ctx_only, in_transfer_state],
+            transceiver=MagicMock(),
+            transfer_manager=manager,
+        )
 
         PyExecutor.recompute_active_requests(ex)
 
@@ -227,8 +241,7 @@ class TestRecomputeSkipsTransferBoundRequests:
         assert ex.paused == [full]
         assert ex.reset_calls == 1
         ex.dist.tp_allgather.assert_not_called()
-        assert ("active_requests=4 recompute=1 disagg_transfer_bound=3"
-                in capfd.readouterr().out)
+        assert "active_requests=4 recompute=1 disagg_transfer_bound=3" in capfd.readouterr().out
 
     def test_aggregated_engine_recomputes_generation_only_typed_requests_too(self):
         """Without a transceiver the type is irrelevant: everything is recomputed."""
@@ -240,8 +253,9 @@ class TestRecomputeSkipsTransferBoundRequests:
         assert ex.terminated == [req]
         assert ex.paused == [req]
 
-    @pytest.mark.parametrize("with_transceiver", [True, False],
-                             ids=["transceiver", "kv_connector_only"])
+    @pytest.mark.parametrize(
+        "with_transceiver", [True, False], ids=["transceiver", "kv_connector_only"]
+    )
     def test_pinned_by_async_send_is_bound_regardless_of_state(self, with_transceiver):
         """Blocks pinned for an asynchronous send must never be freed by a
         recompute, whether the send belongs to the cache transceiver or to a
@@ -250,9 +264,11 @@ class TestRecomputeSkipsTransferBoundRequests:
         req = _request(30, is_context_only=False)
         manager.start_transfer(req)
         req.state = LlmRequestState.GENERATION_IN_PROGRESS  # state alone would not protect it
-        ex = _RecomputeExecutor([req, _request(31)],
-                                transceiver=MagicMock() if with_transceiver else None,
-                                transfer_manager=manager)
+        ex = _RecomputeExecutor(
+            [req, _request(31)],
+            transceiver=MagicMock() if with_transceiver else None,
+            transfer_manager=manager,
+        )
 
         assert PyExecutor._is_disagg_transfer_bound(ex, req) is True
         PyExecutor.recompute_active_requests(ex)
@@ -282,21 +298,23 @@ def _coordinator(manager, kv_cache_manager, transceiver):
 
 
 class TestSendKvAsyncFailsRequestNotLoop:
-
     def _build(self):
         manager, kv_cache_manager = _transfer_manager()
         transceiver = MagicMock()
         transceiver.kv_transfer_timeout_ms = None
-        return _coordinator(manager, kv_cache_manager, transceiver), manager, kv_cache_manager, transceiver
+        return (
+            _coordinator(manager, kv_cache_manager, transceiver),
+            manager,
+            kv_cache_manager,
+            transceiver,
+        )
 
     def test_missing_blocks_fail_only_that_request(self):
         coordinator, manager, kv_cache_manager, transceiver = self._build()
         bad = _request(40, is_context_only=True)
         good = _request(41, is_context_only=True)
         # Only the first send raises; the second must still go through.
-        transceiver.respond_and_send_async.side_effect = [
-            IndexError("unordered_map::at"), None
-        ]
+        transceiver.respond_and_send_async.side_effect = [IndexError("unordered_map::at"), None]
 
         coordinator.send_completed_context([bad, good])
 

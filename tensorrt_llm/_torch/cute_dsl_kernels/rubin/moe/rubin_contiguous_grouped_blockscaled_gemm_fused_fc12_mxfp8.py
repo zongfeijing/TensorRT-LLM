@@ -79,7 +79,9 @@ from cutlass.pipeline import (
 from cutlass.pipeline.sm90 import MbarrierArray
 from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
-from . import manual_mma_128dp_mxfp8 as manual_mma_128dp  # packaged as an intra-package module in TensorRT-LLM
+from . import (
+    manual_mma_128dp_mxfp8 as manual_mma_128dp,
+)  # packaged as an intra-package module in TensorRT-LLM
 
 # ============================================================================
 # Inline utility functions

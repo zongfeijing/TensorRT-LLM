@@ -4,6 +4,7 @@
 by kernel class and overlaps independent branches, and TLLM_MULTI_STREAM_MAX_TOKENS keeps the
 schedule for pieces running at most that many tokens while a single-stream twin over the same
 parameters serves the larger ones."""
+
 import copy
 from unittest.mock import MagicMock
 
@@ -20,7 +21,6 @@ def test_schedule_overlaps_independent_branches():
     on a cross-stream event and the simulated makespan is shorter than serial execution."""
 
     class Block(torch.nn.Module):
-
         def forward(self, h, w_router, w_routed, w_up, w_down):
             logits = torch.ops.aten.mm.default(h, w_router)
             routed = torch.ops.aten.mm.default(logits, w_routed)
@@ -63,7 +63,10 @@ def _runner(default, large, limit, capture=(8, 64, 512)):
 def test_token_gate_selects_the_twin(monkeypatch):
     """Captures and eager token counts at or below the limit keep the multi-stream callable, the
     larger ones take the single-stream twin; without a limit or a twin the default serves all."""
-    ms, plain = MagicMock(name="multi_stream", return_value="ms"), MagicMock(name="single_stream", return_value="plain")
+    ms, plain = (
+        MagicMock(name="multi_stream", return_value="ms"),
+        MagicMock(name="single_stream", return_value="plain"),
+    )
     r = _runner(ms, plain, limit=256)
     assert r.entries[8].callable is ms and r.entries[64].callable is ms
     assert r.entries[512].callable is plain
@@ -84,7 +87,6 @@ def test_single_stream_twin_shares_parameters():
     shared by reference, only the graph is copied (and only when the limit is set)."""
 
     class M(torch.nn.Module):
-
         def __init__(self):
             super().__init__()
             self.w1 = torch.nn.Parameter(torch.randn(8, 8, device="cuda"))

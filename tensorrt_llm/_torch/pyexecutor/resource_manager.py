@@ -2414,7 +2414,8 @@ class KVCacheManager(BaseResourceManager):
         # sequences. Mirror KVCacheManagerV2's max_num_sequences scaling.
         pp_size = self.mapping.pp_size if self.mapping is not None else 1
         save_last = int(
-            getattr(self.linear_attention_metadata, "save_last_snapshot", False))
+            getattr(self.linear_attention_metadata, "save_last_snapshot",
+                    False))
         # Retained save-last snapshots. A finished request keeps the newest K
         # off-grid save-last snapshots of its reuse chain
         # (``mamba_max_off_grid_snapshots_per_chain``) so the next turn of the

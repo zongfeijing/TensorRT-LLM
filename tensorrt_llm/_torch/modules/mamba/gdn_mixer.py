@@ -19,8 +19,8 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
-from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule_indexed_direct
+from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _can_use_flashinfer_gdn_decode,
     _can_use_flashinfer_gdn_verify,
@@ -357,7 +357,9 @@ class _GdnPrefillScratch:
             self._views.clear()
         return buf
 
-    def conv_input(self, conv_dim: int, num_tokens: int, dtype: torch.dtype, device) -> torch.Tensor:
+    def conv_input(
+        self, conv_dim: int, num_tokens: int, dtype: torch.dtype, device
+    ) -> torch.Tensor:
         """``[conv_dim, num_tokens]`` for extract_transpose_prefill_slice / the in-place conv."""
         key = ("conv", conv_dim, num_tokens, dtype, device)
         view = self._views.get(key)
@@ -377,7 +379,9 @@ class _GdnPrefillScratch:
             self._views[key] = view
         return view
 
-    def conv_tail(self, num_folds: int, conv_dim: int, width: int, dtype: torch.dtype, device) -> torch.Tensor:
+    def conv_tail(
+        self, num_folds: int, conv_dim: int, width: int, dtype: torch.dtype, device
+    ) -> torch.Tensor:
         """``[num_folds, conv_dim, width]``: the fold-point conv states written by the extract launch."""
         key = ("tail", num_folds, conv_dim, width, dtype, device)
         view = self._views.get(key)
@@ -388,7 +392,9 @@ class _GdnPrefillScratch:
             self._views[key] = view
         return view
 
-    def tail_rows(self, num_rows: int, q: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor):
+    def tail_rows(
+        self, num_rows: int, q: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor
+    ):
         """Gathered tail rows ``(q, k, v, g, beta, out)`` for ``num_rows`` packed tokens (fold_scan_tails)."""
         dev = q.device
         hq, dk = q.shape[2], q.shape[3]
@@ -408,11 +414,18 @@ class _GdnPrefillScratch:
             self._views[("rows3",) + key[1:]] = tuple(t.squeeze(0) for t in views)
         return views
 
-    def tail_rows_packed(self, num_rows: int, q: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor):
-        """The packed ``[rows, ...]`` views of the buffers ``tail_rows`` returned for the same arguments (call it first)."""
+    def tail_rows_packed(
+        self, num_rows: int, q: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor
+    ):
+        """The packed ``[rows, ...]`` views of the buffers ``tail_rows`` returned.
+
+        Same arguments as that call, which has to come first.
+        """
         hq, dk = q.shape[2], q.shape[3]
         hv, dv = v.shape[2], v.shape[3]
-        return self._views.get(("rows3", num_rows, hq, dk, hv, dv, q.dtype, v.dtype, g.dtype, beta.dtype, q.device))
+        return self._views.get(
+            ("rows3", num_rows, hq, dk, hv, dv, q.dtype, v.dtype, g.dtype, beta.dtype, q.device)
+        )
 
     def post_conv(
         self,
@@ -426,17 +439,37 @@ class _GdnPrefillScratch:
         beta_dtype: torch.dtype = torch.float32,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """``(q, k, v, g, beta)`` of fused_gdn_post_conv's shapes for ``num_tokens``."""
-        key = ("post", num_tokens, num_k_heads, head_k_dim, num_v_heads, head_v_dim, dtype, beta_dtype, device)
+        key = (
+            "post",
+            num_tokens,
+            num_k_heads,
+            head_k_dim,
+            num_v_heads,
+            head_v_dim,
+            dtype,
+            beta_dtype,
+            device,
+        )
         views = self._views.get(key)
         if views is None:
             nk = num_tokens * num_k_heads * head_k_dim
             nv = num_tokens * num_v_heads * head_v_dim
             ng = num_tokens * num_v_heads
-            q = self._flat(("q", device, dtype), nk, dtype, device)[:nk].view(1, num_tokens, num_k_heads, head_k_dim)
-            k = self._flat(("k", device, dtype), nk, dtype, device)[:nk].view(1, num_tokens, num_k_heads, head_k_dim)
-            v = self._flat(("v", device, dtype), nv, dtype, device)[:nv].view(1, num_tokens, num_v_heads, head_v_dim)
-            g = self._flat(("g", device), ng, torch.float32, device)[:ng].view(1, num_tokens, num_v_heads)
-            beta = self._flat(("beta", device, beta_dtype), ng, beta_dtype, device)[:ng].view(1, num_tokens, num_v_heads)
+            q = self._flat(("q", device, dtype), nk, dtype, device)[:nk].view(
+                1, num_tokens, num_k_heads, head_k_dim
+            )
+            k = self._flat(("k", device, dtype), nk, dtype, device)[:nk].view(
+                1, num_tokens, num_k_heads, head_k_dim
+            )
+            v = self._flat(("v", device, dtype), nv, dtype, device)[:nv].view(
+                1, num_tokens, num_v_heads, head_v_dim
+            )
+            g = self._flat(("g", device), ng, torch.float32, device)[:ng].view(
+                1, num_tokens, num_v_heads
+            )
+            beta = self._flat(("beta", device, beta_dtype), ng, beta_dtype, device)[:ng].view(
+                1, num_tokens, num_v_heads
+            )
             views = (q, k, v, g, beta)
             self._views[key] = views
             self._views[("packed",) + key[1:]] = _PackedPostConv(t.squeeze(0) for t in views)
@@ -453,9 +486,22 @@ class _GdnPrefillScratch:
         device,
         beta_dtype: torch.dtype = torch.float32,
     ) -> Optional[_PackedPostConv]:
-        """The ``_PackedPostConv`` views of the buffers ``post_conv`` returned for the same arguments (call it first)."""
+        """The ``_PackedPostConv`` views of the buffers ``post_conv`` returned.
+
+        Same arguments as that call, which has to come first.
+        """
         return self._views.get(
-            ("packed", num_tokens, num_k_heads, head_k_dim, num_v_heads, head_v_dim, dtype, beta_dtype, device)
+            (
+                "packed",
+                num_tokens,
+                num_k_heads,
+                head_k_dim,
+                num_v_heads,
+                head_v_dim,
+                dtype,
+                beta_dtype,
+                device,
+            )
         )
 
 
@@ -611,7 +657,9 @@ def gather_tail_rows(q, k, v, g, beta, rows: torch.Tensor, out) -> None:
     hv, dv = v.shape[2], v.shape[3]
     for t in (q, k, v, g, beta):
         assert t.dim() >= 3 and t.shape[0] == 1 and t.stride(-1) == 1
-    assert q.stride(2) == dk and k.stride(2) == dk and v.stride(2) == dv, "heads contiguous within a token"
+    assert q.stride(2) == dk and k.stride(2) == dk and v.stride(2) == dv, (
+        "heads contiguous within a token"
+    )
     assert all(t.is_contiguous() for t in out)
     _gather_tail_rows_kernel[(n,)](
         rows,
@@ -685,7 +733,9 @@ def _fold_seed_terminal_slots_kernel(
         v_offs = (vk // num_k_blocks) * BLOCK_V + tl.arange(0, BLOCK_V)
         k_offs = (vk % num_k_blocks) * BLOCK_K + tl.arange(0, BLOCK_K)
         tile_mask = (v_offs < V)[:, None] & (k_offs < K)[None, :]
-        tile_offs = h * pool_stride_h + v_offs[:, None] * pool_stride_v + k_offs[None, :] * pool_stride_k
+        tile_offs = (
+            h * pool_stride_h + v_offs[:, None] * pool_stride_v + k_offs[None, :] * pool_stride_k
+        )
         data = tl.load(pool + slot1 * pool_stride_n + tile_offs, mask=tile_mask, other=0.0)
         tl.store(pool + slot2 * pool_stride_n + tile_offs, data, mask=tile_mask)
     elif HAS_CONV:
@@ -779,11 +829,17 @@ def fold_seed_terminal_slots(
     )
 
 
-def _fold_tail_recurrent_ready(inputs: Optional["_FoldTailRecurrentInputs"], ssm_states: torch.Tensor, fold) -> bool:
+def _fold_tail_recurrent_ready(
+    inputs: Optional["_FoldTailRecurrentInputs"], ssm_states: torch.Tensor, fold
+) -> bool:
     """Whether the folds of this call take the recurrent tail path: knob on, few
     enough folds, the FlashInfer bf16-state kernels available for this pool, a
     token-major conv output and 32-byte aligned gate columns."""
-    if inputs is None or not _FOLD_TAIL_RECURRENT or fold.fold_count > _FOLD_TAIL_RECURRENT_MAX_FOLDS:
+    if (
+        inputs is None
+        or not _FOLD_TAIL_RECURRENT
+        or fold.fold_count > _FOLD_TAIL_RECURRENT_MAX_FOLDS
+    ):
         return False
     if fold.fold_count > 1 and not hasattr(fold, "fold_s1_aligned"):
         return False  # one aligned slot index per fold (Mamba2Metadata); a fold_s1[i:i + 1] slice is not
@@ -791,7 +847,12 @@ def _fold_tail_recurrent_ready(inputs: Optional["_FoldTailRecurrentInputs"], ssm
     if not flashinfer_gdn_bf16_state_available(ssm_states.dtype, dk, dv):
         return False
     x, a, b = inputs.conv_out, inputs.a, inputs.b
-    if x.dim() != 2 or x.stride(1) != 1 or (x.stride(0) * x.element_size()) % 32 or x.data_ptr() % 32:
+    if (
+        x.dim() != 2
+        or x.stride(1) != 1
+        or (x.stride(0) * x.element_size()) % 32
+        or x.data_ptr() % 32
+    ):
         return False
     for t in (a, b):
         if t.stride(1) != 1 or t.data_ptr() % 32 or (t.stride(0) * t.element_size()) % 32:
@@ -929,13 +990,20 @@ def fold_scan_tails(
     sliceable = fused and ranges and out.is_contiguous() and out.dtype == q.dtype
     if sliceable and _fold_tail_recurrent_ready(recurrent, ssm_states, fold):
         if conv_commit is not None:
-            fold_seed_terminal_slots(ssm_states, fold, conv_commit[0], conv_commit[1], copy_ssm=False)
+            fold_seed_terminal_slots(
+                ssm_states, fold, conv_commit[0], conv_commit[1], copy_ssm=False
+            )
         x, a, b, A_log, dt_bias, (hk, dk, hv, dv) = recurrent
         kd = hk * dk
         xs, as_, bs, os_ = x.stride(0), a.stride(0), b.stride(0), out.stride(1)
         # as_strided offsets are absolute in the storage: add each view's own offset
         # (a / b are column slices of the projection, x and out may be slices too).
-        xbase, abase, bbase, obase = x.storage_offset(), a.storage_offset(), b.storage_offset(), out.storage_offset()
+        xbase, abase, bbase, obase = (
+            x.storage_offset(),
+            a.storage_offset(),
+            b.storage_offset(),
+            out.storage_offset(),
+        )
         scale = dk**-0.5
         aligned = fold.fold_count > 1
         for i, (start, n) in enumerate(ranges):
@@ -1390,8 +1458,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if weight is None or weight.dim() != 2:
                 return False
         wq, wb = self.in_proj_qkvz.weight, self.in_proj_ba.weight
-        return (wq.dtype == wb.dtype and wq.device == wb.device
-                and wq.shape[1] == wb.shape[1])
+        return wq.dtype == wb.dtype and wq.device == wb.device and wq.shape[1] == wb.shape[1]
 
     def _refresh_fused_in_proj(self) -> None:
         """Keep one ``[qkvz | b | pad | a | pad]`` weight for the two input projections.
@@ -1424,16 +1491,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         a_col = b_col + _up(n_gate)
         shape = (a_col + _up(n_gate), wq.shape[1])
         fused = self._in_proj_fused_weight
-        if (fused is None or fused.shape != shape or fused.dtype != wq.dtype
-                or fused.device != wq.device):
+        if (
+            fused is None
+            or fused.shape != shape
+            or fused.dtype != wq.dtype
+            or fused.device != wq.device
+        ):
             fused = torch.zeros(shape, dtype=wq.dtype, device=wq.device)
             self._in_proj_fused_weight = fused
         slab = fused[:rows_q]
         if wq.data.data_ptr() != slab.data_ptr() or wq.data.stride() != slab.stride():
             slab.copy_(wq.data)
             wq.data = slab
-        fused[b_col:b_col + n_gate].copy_(wb.data[:n_gate])
-        fused[a_col:a_col + n_gate].copy_(wb.data[n_gate:])
+        fused[b_col : b_col + n_gate].copy_(wb.data[:n_gate])
+        fused[a_col : a_col + n_gate].copy_(wb.data[n_gate:])
         self._in_proj_qkvz_rows = rows_q
         self._in_proj_b_col = b_col
         self._in_proj_a_col = a_col
@@ -1892,7 +1963,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 has_initial_states_p = has_initial_states[:num_prefill]
 
             mixed_qkv_p_t, fold_conv_tail = self._prefill_conv(
-                mixed_qkv_p, conv_states_to_use, has_initial_states_p, state_indices_p, query_start_loc_p, fold
+                mixed_qkv_p,
+                conv_states_to_use,
+                has_initial_states_p,
+                state_indices_p,
+                query_start_loc_p,
+                fold,
             )
 
             if is_target_verify:
@@ -1958,22 +2034,42 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 # kernel after the scan (see _mixed_decode_recurrent).
                 decode_recurrent = (mixed_qkv_d, a[num_prefill_tokens:], b[num_prefill_tokens:])
                 recurrent, fold_conv = self._fold_tail_recurrent_setup(
-                    fold, mixed_qkv_p_t, mixed_qkv_p, a[:num_prefill_tokens], b[:num_prefill_tokens],
-                    conv_states_to_use, fold_conv_tail, ssm_states,
+                    fold,
+                    mixed_qkv_p_t,
+                    mixed_qkv_p,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    conv_states_to_use,
+                    fold_conv_tail,
+                    ssm_states,
                 )
                 query, key, value, g, beta, packed = self._post_conv(
-                    mixed_qkv_p_t, None, a[:num_prefill_tokens], b[:num_prefill_tokens], g_linear, fold_conv
+                    mixed_qkv_p_t,
+                    None,
+                    a[:num_prefill_tokens],
+                    b[:num_prefill_tokens],
+                    g_linear,
+                    fold_conv,
                 )
             else:
-                query, key, value, g, beta, packed = self._post_conv(mixed_qkv_p_t, mixed_qkv_d, a, b, g_linear)
+                query, key, value, g, beta, packed = self._post_conv(
+                    mixed_qkv_p_t, mixed_qkv_d, a, b, g_linear
+                )
         else:
             mixed_qkv_t, fold_conv_tail = self._prefill_conv(
-                mixed_qkv, conv_states_to_use, has_initial_states, cache_indices, query_start_loc, fold
+                mixed_qkv,
+                conv_states_to_use,
+                has_initial_states,
+                cache_indices,
+                query_start_loc,
+                fold,
             )
             recurrent, fold_conv = self._fold_tail_recurrent_setup(
                 fold, mixed_qkv_t, mixed_qkv, a, b, conv_states_to_use, fold_conv_tail, ssm_states
             )
-            query, key, value, g, beta, packed = self._post_conv(mixed_qkv_t, None, a, b, g_linear, fold_conv)
+            query, key, value, g, beta, packed = self._post_conv(
+                mixed_qkv_t, None, a, b, g_linear, fold_conv
+            )
 
         if is_target_verify and num_decode_tokens > 0:
             attn_out_prefill = None
@@ -2101,7 +2197,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 return attn_out_decode
             return torch.cat((attn_out_prefill, attn_out_decode), dim=1)
 
-        if kwargs.get("scan_state_indices") is not None and kwargs.get("scan_cu_seqlens") is not None:
+        if (
+            kwargs.get("scan_state_indices") is not None
+            and kwargs.get("scan_cu_seqlens") is not None
+        ):
             scan_state_indices = kwargs["scan_state_indices"]
             scan_cu_seqlens = kwargs["scan_cu_seqlens"]
         elif fold is None:
@@ -2248,7 +2347,12 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         """
         n = mixed_qkv_d.shape[0]
         kd = self.key_dim_per_tp
-        hk, dk, hv, dv = self.num_k_heads_per_tp, self.head_k_dim, self.num_v_heads_per_tp, self.head_v_dim
+        hk, dk, hv, dv = (
+            self.num_k_heads_per_tp,
+            self.head_k_dim,
+            self.num_v_heads_per_tp,
+            self.head_v_dim,
+        )
         if (
             output_d is not None
             and flashinfer_gdn_decode_direct_available(ssm_states.dtype, dk, dv)
@@ -2333,17 +2437,34 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         out = tail = None
         conv_tok = getattr(fold, "fold_conv_tok", None) if fold is not None else None
         if _GDN_PREFILL_SCRATCH:
-            out = _gdn_prefill_scratch.conv_input(width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device)
+            out = _gdn_prefill_scratch.conv_input(
+                width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
+            )
             if conv_tok is not None:
                 tail = _gdn_prefill_scratch.conv_tail(
-                    fold.fold_count, width, self.conv_kernel_size - 1, mixed_qkv_p.dtype, mixed_qkv_p.device
+                    fold.fold_count,
+                    width,
+                    self.conv_kernel_size - 1,
+                    mixed_qkv_p.dtype,
+                    mixed_qkv_p.device,
                 )
         elif conv_tok is not None:
             tail = torch.empty(
-                fold.fold_count, width, self.conv_kernel_size - 1, dtype=mixed_qkv_p.dtype, device=mixed_qkv_p.device
+                fold.fold_count,
+                width,
+                self.conv_kernel_size - 1,
+                dtype=mixed_qkv_p.dtype,
+                device=mixed_qkv_p.device,
             )
         x_t = extract_transpose_prefill_slice(
-            mixed_qkv_p, num_tokens, 0, width, out=out, tail=tail, conv_tok=conv_tok, check=out is None
+            mixed_qkv_p,
+            num_tokens,
+            0,
+            width,
+            out=out,
+            tail=tail,
+            conv_tok=conv_tok,
+            check=out is None,
         )
         if fold is not None and tail is None:
             tail = self._fold_conv_tail(x_t, fold)
@@ -2366,7 +2487,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         and the fold tails (``None`` without a fold)."""
         if _GDN_CONV_CHANNEL_LAST and _GDN_PREFILL_SCRATCH and mixed_qkv_p.stride(1) == 1:
             num_tokens, width = mixed_qkv_p.shape
-            out = _gdn_prefill_scratch.conv_out(width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device)
+            out = _gdn_prefill_scratch.conv_out(
+                width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
+            )
             y = causal_conv1d_fn(
                 mixed_qkv_p.t(),
                 self.conv1d.weight,
@@ -2474,14 +2597,22 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 and conv_pool.shape[0] >= 6
                 and ssm_pool.shape[0] >= 6
                 and conv_pool.shape[1:] == (conv_dim, width)
-                and ssm_pool.shape[1:] == (self.num_v_heads_per_tp, self.head_v_dim, self.head_k_dim)
+                and ssm_pool.shape[1:]
+                == (self.num_v_heads_per_tp, self.head_v_dim, self.head_k_dim)
             ):
                 conv_states, ssm_states = conv_pool, ssm_pool
-                dtype = ssm_pool.dtype if ssm_pool.dtype in (torch.bfloat16, torch.float16) else dtype
+                dtype = (
+                    ssm_pool.dtype if ssm_pool.dtype in (torch.bfloat16, torch.float16) else dtype
+                )
         if conv_states is None:
             conv_states = torch.zeros(6, conv_dim, width, dtype=dtype, device=dev)
             ssm_states = torch.zeros(
-                6, self.num_v_heads_per_tp, self.head_v_dim, self.head_k_dim, dtype=dtype, device=dev
+                6,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+                self.head_k_dim,
+                dtype=dtype,
+                device=dev,
             )
         query_start_loc = torch.tensor([0, lens[0], total], dtype=torch.int32, device=dev)
         cache_indices = torch.tensor([1, 4], dtype=torch.int32, device=dev)
@@ -2506,22 +2637,41 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             [tok - w + j for tok in (16, 40) for j in range(w)], dtype=torch.long, device=dev
         )
         g_linear = _gdn_prefill_uses_flashinfer()
-        x_t, tail = self._prefill_conv(mixed_qkv, conv_states, has_initial_state, cache_indices, query_start_loc, fold)
+        x_t, tail = self._prefill_conv(
+            mixed_qkv, conv_states, has_initial_state, cache_indices, query_start_loc, fold
+        )
         q, k, v, g, beta, packed = self._post_conv(x_t, None, a, b, g_linear)
-        out = torch.empty(1, total, self.num_v_heads_per_tp, self.head_v_dim, dtype=dtype, device=dev)
+        out = torch.empty(
+            1, total, self.num_v_heads_per_tp, self.head_v_dim, dtype=dtype, device=dev
+        )
         # tails: seed + commit from the input rows, gather + indexed scan (2 folds) ...
         fold_scan_tails(
-            q, k, v, g, beta, ssm_states, fold, out, g_is_linear=g_linear, conv_commit=(conv_states, tail), packed=packed
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states,
+            fold,
+            out,
+            g_is_linear=g_linear,
+            conv_commit=(conv_states, tail),
+            packed=packed,
         )
         # ... the single-fold slice scan, and the staged-tail commit variant
         fold1 = SimpleNamespace(**{k_: v_ for k_, v_ in vars(fold).items()})
         fold1.fold_count, fold1.fold_b_ranges_host = 1, [(16, 8)]
         fold1.fold_s1, fold1.fold_s2 = fold.fold_s1[:1], fold.fold_s2[:1]
         fold1.fold_conv_tok = fold.fold_conv_tok[:1]
-        fold1.fold_b_rows, fold1.fold_b_cu_seqlens_long = fold.fold_b_rows[:8], fold.fold_b_cu_seqlens_long[:2]
+        fold1.fold_b_rows, fold1.fold_b_cu_seqlens_long = (
+            fold.fold_b_rows[:8],
+            fold.fold_b_cu_seqlens_long[:2],
+        )
         fold1.fold_tail_cu_seqlens_long = fold.fold_tail_cu_seqlens_long
         fold1.conv_tail_index = lambda w: fold.conv_tail_index(w)[:w]
-        fold_scan_tails(q, k, v, g, beta, ssm_states, fold1, out, g_is_linear=g_linear, packed=packed)
+        fold_scan_tails(
+            q, k, v, g, beta, ssm_states, fold1, out, g_is_linear=g_linear, packed=packed
+        )
         staged = torch.zeros(1, conv_dim, width, dtype=dtype, device=dev)
         fold_seed_terminal_slots(ssm_states, fold1, conv_states, staged)
         if _FOLD_TAIL_RECURRENT and flashinfer_gdn_bf16_state_available(
@@ -2533,13 +2683,26 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             # the post-conv launch with the fused conv commit (one and two folds)
             for f in (fold, fold1):
                 self._post_conv(
-                    x_t, None, a, b, g_linear,
+                    x_t,
+                    None,
+                    a,
+                    b,
+                    g_linear,
                     fold_conv=(mixed_qkv, conv_states, f.fold_s1, f.fold_s2, f.fold_conv_tok),
                 )
-            xr = x_t.t() if x_t.stride(0) == 1 else torch.randn(total, conv_dim, dtype=dtype, device=dev)
+            xr = (
+                x_t.t()
+                if x_t.stride(0) == 1
+                else torch.randn(total, conv_dim, dtype=dtype, device=dev)
+            )
             a32 = torch.randn(total, 32, dtype=dtype, device=dev)[:, :n_gate] if n_gate % 16 else a
             b32 = torch.randn(total, 32, dtype=dtype, device=dev)[:, :n_gate] if n_gate % 16 else b
-            hk, dk, hv, dv = self.num_k_heads_per_tp, self.head_k_dim, self.num_v_heads_per_tp, self.head_v_dim
+            hk, dk, hv, dv = (
+                self.num_k_heads_per_tp,
+                self.head_k_dim,
+                self.num_v_heads_per_tp,
+                self.head_v_dim,
+            )
             kd = hk * dk
             for n in range(1, min(32, total) + 1):
                 xs = xr[:n]
@@ -2559,7 +2722,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 )
         torch.cuda.synchronize()
 
-    def _fold_tail_recurrent_setup(self, fold, conv_out_t, x, a, b, conv_states, fold_conv_tail, ssm_states):
+    def _fold_tail_recurrent_setup(
+        self, fold, conv_out_t, x, a, b, conv_states, fold_conv_tail, ssm_states
+    ):
         """``(recurrent inputs, fold_conv)`` for a folded iteration on the recurrent
         tail path, ``(None, None)`` otherwise. ``fold_conv`` lets the post-conv launch
         commit the conv states (S2 <- chunk end, S1 <- fold point from the pre-conv
@@ -2579,7 +2744,13 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             return None, None
         fold_conv = None
         if isinstance(fold_conv_tail, _ConvTailFromInput) and conv_states is not None:
-            fold_conv = (fold_conv_tail.x, conv_states, fold.fold_s1, fold.fold_s2, fold_conv_tail.conv_tok)
+            fold_conv = (
+                fold_conv_tail.x,
+                conv_states,
+                fold.fold_s1,
+                fold.fold_s2,
+                fold_conv_tail.conv_tok,
+            )
         return recurrent, fold_conv
 
     def _fold_scan_tails(
@@ -2704,7 +2875,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if is_target_verify
             else None
         )
-        use_replay = is_target_verify and getattr(kv_cache_manager, "use_replay_state_update", False)
+        use_replay = is_target_verify and getattr(
+            kv_cache_manager, "use_replay_state_update", False
+        )
         replay_metadata = (
             kv_cache_manager.get_replay_state_update_metadata() if use_replay else None
         )
@@ -2731,7 +2904,10 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if fold is None:
                 scan_state_indices, scan_cu_seqlens = state_indices, query_start_loc_long
             else:
-                scan_state_indices, scan_cu_seqlens = fold.scan_state_indices, fold.scan_cu_seqlens_long
+                scan_state_indices, scan_cu_seqlens = (
+                    fold.scan_state_indices,
+                    fold.scan_cu_seqlens_long,
+                )
             if scan_cu_seqlens is not None:
                 scan_prefill_layout = _mixed_scan_prefill_layout(
                     num_prefills, fold, scan_state_indices, scan_cu_seqlens

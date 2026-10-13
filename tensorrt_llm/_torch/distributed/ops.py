@@ -110,8 +110,7 @@ _named_allreduce_topology_warmups = set()
 _named_allreduce_topology_warmups_lock = threading.Lock()
 
 
-def _warmup_named_allreduce_topology(mapping: Mapping,
-                                     group_name: str) -> None:
+def _warmup_named_allreduce_topology(mapping: Mapping, group_name: str) -> None:
     """Complete native TP topology discovery before PCG capture.
 
     ``allreduce_pg_by_name`` keeps its optimized C++ collective implementation.
@@ -128,8 +127,8 @@ def _warmup_named_allreduce_topology(mapping: Mapping,
             return
         token = torch.ones(1, device="cuda", dtype=torch.float32)
         torch.ops.trtllm.allreduce_pg_warmup_by_name(token, mapping.tp_group,
-                                                      mapping.tp_rank,
-                                                      group_name)
+                                                     mapping.tp_rank,
+                                                     group_name)
         _named_allreduce_topology_warmups.add(group_name)
 
 
@@ -312,7 +311,8 @@ def _get_or_scale_allreduce_mnnvl_workspace(
 
     # The handle probe is a nanobind call, which dynamo cannot trace; the
     # compiled path relies on the pre-scaled workspace being attached.
-    if mapping in allreduce_mnnvl_workspaces and not torch.compiler.is_compiling():
+    if mapping in allreduce_mnnvl_workspaces and not torch.compiler.is_compiling(
+    ):
         workspace = allreduce_mnnvl_workspaces[mapping]
         if not workspace["handle"].is_mapped():
             raise RuntimeError("MNNVL workspace handles are not attached")

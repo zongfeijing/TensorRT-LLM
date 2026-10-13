@@ -7647,8 +7647,7 @@ TEST(KVCacheManagerReuseAccountingTest, HybridAlignedLookAheadIsReservedOnlyForC
             /*numPrimaryBlocks=*/512);
         auto const tokens
             = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(testCase.promptLength), 7);
-        auto request
-            = LlmRequest{0, /*maxNewTokens=*/2, tokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
+        auto request = LlmRequest{0, /*maxNewTokens=*/2, tokens, tle::SamplingConfig{1}, /*isStreaming=*/true};
 
         EXPECT_EQ(kvCacheManager->getNeededBlocksOneStep(request, /*twoStepsLookAhead=*/false, recurrentWindow),
             testCase.expectedOneStepBlocks)
@@ -8071,10 +8070,8 @@ TEST(KVCacheManagerReuseAccountingTest, HybridDemoteRespectsInFlightRefs)
         = std::make_shared<std::vector<TokenIdType>>(tokensA->begin(), tokensA->begin() + siblingPromptLength);
     auto siblingTokensB
         = std::make_shared<std::vector<TokenIdType>>(tokensB->begin(), tokensB->begin() + siblingPromptLength);
-    auto siblingA
-        = LlmRequest{1, 1, siblingTokensA, tle::SamplingConfig{1}, /*isStreaming=*/true};
-    auto siblingB
-        = LlmRequest{2, 1, siblingTokensB, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto siblingA = LlmRequest{1, 1, siblingTokensA, tle::SamplingConfig{1}, /*isStreaming=*/true};
+    auto siblingB = LlmRequest{2, 1, siblingTokensB, tle::SamplingConfig{1}, /*isStreaming=*/true};
     std::vector<std::tuple<LlmRequest::RequestIdType, SizeType32, SizeType32>> const requestInfos{
         {siblingA.mRequestId, siblingA.getPromptLen(), 1}, {siblingB.mRequestId, siblingB.getPromptLen(), 1}};
     kvCacheManager->addSequenceBatch(requestInfos, {std::ref(siblingA), std::ref(siblingB)});

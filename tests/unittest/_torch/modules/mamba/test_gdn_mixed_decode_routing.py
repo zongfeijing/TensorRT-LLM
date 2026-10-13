@@ -38,7 +38,10 @@ def test_mixed_scan_prefill_layout_plain_and_folded():
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN prefill + decode kernels (SM100/SM103)")
 @pytest.mark.parametrize("ctx_lens,n_dec", [([37], 5), ([300, 64], 40), ([1000], 190)])
 def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
-    """chunk scan over [ctx + one-token decode] == chunk scan over ctx + recurrent kernel over decode (same raw inputs)."""
+    """Chunk scan over [ctx + one-token decode] == chunk scan over ctx + recurrent decode kernel.
+
+    Both sides get the same raw inputs.
+    """
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as fi_cgdr
     from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
@@ -52,8 +55,8 @@ def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
     P = sum(ctx_lens)
     T = P + n_dec
     # post-conv activations as forward_extend sees them: prefill channels-first, decode token-major
-    prefill_t = (torch.randn(qkv_dim, P, dtype=torch.bfloat16, device=dev) * 0.5)
-    decode = (torch.randn(n_dec, qkv_dim, dtype=torch.bfloat16, device=dev) * 0.5)
+    prefill_t = torch.randn(qkv_dim, P, dtype=torch.bfloat16, device=dev) * 0.5
+    decode = torch.randn(n_dec, qkv_dim, dtype=torch.bfloat16, device=dev) * 0.5
     a = torch.randn(T, HV, dtype=torch.bfloat16, device=dev)
     b = torch.randn(T, HV, dtype=torch.bfloat16, device=dev)
     A_log = torch.randn(HV, dtype=torch.float32, device=dev) - 2.0
@@ -62,32 +65,76 @@ def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
     ctx_slots = torch.arange(1, 1 + len(ctx_lens), dtype=torch.int32, device=dev)
     dec_slots = torch.arange(8, 8 + n_dec, dtype=torch.int32, device=dev)
     all_slots = torch.cat([ctx_slots, dec_slots])
-    cu_all = torch.tensor([0] + list(torch.tensor(ctx_lens).cumsum(0).tolist()) + [P + i for i in range(1, n_dec + 1)],
-                          dtype=torch.long, device=dev)
+    cu_all = torch.tensor(
+        [0]
+        + list(torch.tensor(ctx_lens).cumsum(0).tolist())
+        + [P + i for i in range(1, n_dec + 1)],
+        dtype=torch.long,
+        device=dev,
+    )
     cu_ctx = cu_all[: len(ctx_lens) + 1]
     cu_dec = torch.arange(0, n_dec + 1, dtype=torch.long, device=dev)
 
     # reference: everything through the chunk scan (the pre-change mixed path)
     pool_ref = pool.clone()
-    q, k, v, g, beta = fused_gdn_post_conv(prefill_t, decode, a, b, A_log, dt_bias, HK, D, HV, D, g_linear=True)
-    out_ref, _ = fi_cgdr(q, k, v, g, beta, initial_state=pool_ref, initial_state_indices=all_slots,
-                         inplace_indexed_state_update=True, output_final_state=False, cu_seqlens=cu_all,
-                         use_qk_l2norm_in_kernel=False, use_cp=False, g_is_linear=True)
+    q, k, v, g, beta = fused_gdn_post_conv(
+        prefill_t, decode, a, b, A_log, dt_bias, HK, D, HV, D, g_linear=True
+    )
+    out_ref, _ = fi_cgdr(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=pool_ref,
+        initial_state_indices=all_slots,
+        inplace_indexed_state_update=True,
+        output_final_state=False,
+        cu_seqlens=cu_all,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=False,
+        g_is_linear=True,
+    )
 
     # new: ctx rows through the scan, decode rows through the recurrent kernel (raw a/b, in-kernel L2 norm)
     pool_new = pool.clone()
-    qp, kp, vp, gp, bp = fused_gdn_post_conv(prefill_t, None, a[:P], b[:P], A_log, dt_bias, HK, D, HV, D, g_linear=True)
-    out_p, _ = fi_cgdr(qp, kp, vp, gp, bp, initial_state=pool_new, initial_state_indices=ctx_slots,
-                       inplace_indexed_state_update=True, output_final_state=False, cu_seqlens=cu_ctx,
-                       use_qk_l2norm_in_kernel=False, use_cp=False, g_is_linear=True)
+    qp, kp, vp, gp, bp = fused_gdn_post_conv(
+        prefill_t, None, a[:P], b[:P], A_log, dt_bias, HK, D, HV, D, g_linear=True
+    )
+    out_p, _ = fi_cgdr(
+        qp,
+        kp,
+        vp,
+        gp,
+        bp,
+        initial_state=pool_new,
+        initial_state_indices=ctx_slots,
+        inplace_indexed_state_update=True,
+        output_final_state=False,
+        cu_seqlens=cu_ctx,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=False,
+        g_is_linear=True,
+    )
     key_dim = HK * D
     qd = decode[..., :key_dim].view(1, n_dec, HK, D)
     kd = decode[..., key_dim : 2 * key_dim].view(1, n_dec, HK, D)
     vd = decode[..., 2 * key_dim :].view(1, n_dec, HV, D)
     out_d = fused_sigmoid_gating_delta_rule_update(
-        A_log=A_log, dt_bias=dt_bias, q=qd, k=kd, v=vd, a=a[P:], b=b[P:], initial_state_source=pool_new,
-        initial_state_indices=dec_slots, cu_seqlens=cu_dec, use_qk_l2norm_in_kernel=True, softplus_beta=1.0,
-        softplus_threshold=20.0)
+        A_log=A_log,
+        dt_bias=dt_bias,
+        q=qd,
+        k=kd,
+        v=vd,
+        a=a[P:],
+        b=b[P:],
+        initial_state_source=pool_new,
+        initial_state_indices=dec_slots,
+        cu_seqlens=cu_dec,
+        use_qk_l2norm_in_kernel=True,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+    )
     torch.cuda.synchronize()
     out_new = torch.cat([out_p, out_d.view(1, n_dec, HV, D)], dim=1)
     assert out_new.shape == out_ref.shape == (1, T, HV, D)
@@ -103,7 +150,10 @@ def test_recurrent_decode_matches_one_token_scan(ctx_lens, n_dec):
 @pytest.mark.skipif(not _sm100(), reason="FlashInfer GDN decode kernel (SM100/SM103)")
 @pytest.mark.parametrize("offset", [1, 2, 3, 5])
 def test_decode_kernel_accepts_misaligned_slot_slice(offset):
-    """A tail slice of the slot buffer (offset = number of context requests) must give the same result as an aligned copy."""
+    """A tail slice of the slot buffer must give the same result as an aligned copy.
+
+    The offset is the number of context requests.
+    """
     from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -118,20 +168,37 @@ def test_decode_kernel_accepts_misaligned_slot_slice(offset):
     A_log = torch.randn(HV, dtype=torch.float32, device=dev) - 2.0
     dt_bias = torch.randn(HV, dtype=torch.float32, device=dev) * 0.1
     pool = torch.randn(64, HV, D, D, dtype=torch.bfloat16, device=dev) * 0.05
-    big = torch.arange(3, 3 + offset + n, dtype=torch.int32, device=dev)  # ctx slots first, then the decode slots
+    big = torch.arange(
+        3, 3 + offset + n, dtype=torch.int32, device=dev
+    )  # ctx slots first, then the decode slots
     slots_view, slots_copy = big[offset:], big[offset:].clone()
     assert slots_view.data_ptr() % 32 != 0 or offset % 8 == 0
     key_dim = HK * D
-    q = decode[..., :key_dim].view(1, n, HK, D); k = decode[..., key_dim : 2 * key_dim].view(1, n, HK, D)
+    q = decode[..., :key_dim].view(1, n, HK, D)
+    k = decode[..., key_dim : 2 * key_dim].view(1, n, HK, D)
     v = decode[..., 2 * key_dim :].view(1, n, HV, D)
     cu = torch.arange(0, n + 1, dtype=torch.long, device=dev)
     outs, pools = [], []
     for slots in (slots_copy, slots_view):
         p = pool.clone()
-        out = fused_sigmoid_gating_delta_rule_update(A_log=A_log, dt_bias=dt_bias, q=q, k=k, v=v, a=a, b=b,
-                                                     initial_state_source=p, initial_state_indices=slots, cu_seqlens=cu,
-                                                     use_qk_l2norm_in_kernel=True, softplus_beta=1.0, softplus_threshold=20.0)
-        torch.cuda.synchronize(); outs.append(out.float()); pools.append(p)
+        out = fused_sigmoid_gating_delta_rule_update(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            initial_state_source=p,
+            initial_state_indices=slots,
+            cu_seqlens=cu,
+            use_qk_l2norm_in_kernel=True,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+        )
+        torch.cuda.synchronize()
+        outs.append(out.float())
+        pools.append(p)
     torch.testing.assert_close(outs[1], outs[0], atol=0, rtol=0)
     assert torch.equal(pools[1], pools[0])
 
@@ -149,9 +216,15 @@ def test_metadata_steady_gen_step_skips_state_index_staging():
 
     md = Mamba2Metadata(max_batch_size=8, chunk_size=64)
     seq_lens = torch.ones(3, dtype=torch.int)
-    attn = SimpleNamespace(seq_lens=seq_lens, seq_lens_cuda=seq_lens.cuda(), num_contexts=0, num_ctx_tokens=0,
-                           kv_cache_manager=CacheManager(), request_ids=[100, 101, 102],
-                           kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[9, 9, 9]))
+    attn = SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens.cuda(),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        kv_cache_manager=CacheManager(),
+        request_ids=[100, 101, 102],
+        kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=[9, 9, 9]),
+    )
     md.prepare(attn)
     assert CacheManager.calls == 1
     md.prefill_needs_state_reset = True

@@ -1198,10 +1198,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """
         return (type(self) is TrtllmAttentionMetadata
                 and self.fp4_mla_state is None
-                and self.kv_cache_manager is not None
-                and getattr(self.kv_cache_manager, 'tokens_per_block', None)
-                is not None and not self.enable_helix
-                and not self.has_cross_sub_metadata
+                and self.kv_cache_manager is not None and getattr(
+                    self.kv_cache_manager, 'tokens_per_block', None) is not None
+                and not self.enable_helix and not self.has_cross_sub_metadata
                 and not getattr(self, 'locality_domain_enabled', False)
                 and not self.enable_flash_mla
                 and not self.enable_context_mla_with_cached_kv

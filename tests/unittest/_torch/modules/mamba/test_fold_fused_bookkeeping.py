@@ -195,7 +195,6 @@ def test_fold_scan_tails_two_folds_keep_gather_path_and_match():
 
 @pytest.mark.skipif(not _supported_arch(), reason="FlashInfer GDN prefill requires SM90/SM100")
 @torch.no_grad()
-
 def _flashinfer_has_sm100_cp_kernel() -> bool:
     """FlashInfer < 0.6.18 implements the chunk-parallel (use_cp=True) delta rule
     only for SM90/SM120; the DLFW 26.08 image ships 0.6.17."""
@@ -206,8 +205,11 @@ def _flashinfer_has_sm100_cp_kernel() -> bool:
         return False
     return Version(flashinfer.__version__.split("+")[0]) >= Version("0.6.18")
 
-@pytest.mark.skipif(not _flashinfer_has_sm100_cp_kernel(),
-                    reason="FlashInfer without the SM100 chunk-parallel delta-rule kernel")
+
+@pytest.mark.skipif(
+    not _flashinfer_has_sm100_cp_kernel(),
+    reason="FlashInfer without the SM100 chunk-parallel delta-rule kernel",
+)
 def test_fold_tail_plain_chunked_kernel_matches_chunk_parallel_path():
     """The fold tails force use_cp=False (one launch); the result must match FlashInfer's chunk-parallel path."""
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule as fi_cgdr
@@ -222,7 +224,9 @@ def test_fold_tail_plain_chunked_kernel_matches_chunk_parallel_path():
     v = torch.randn(1, total, num_v_heads, head_dim, dtype=torch.bfloat16, device=dev) * 0.1
     g = -torch.rand(1, total, num_v_heads, dtype=torch.float32, device=dev) * 0.05
     beta = torch.rand(1, total, num_v_heads, dtype=torch.float32, device=dev)
-    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.long, device=dev)
+    cu = torch.tensor(
+        [0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.long, device=dev
+    )
     pool = torch.randn(8, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16, device=dev) * 0.01
     s1 = torch.tensor([1, 4, 6], dtype=torch.int32, device=dev)
     s2 = torch.tensor([2, 5, 7], dtype=torch.int32, device=dev)
@@ -230,16 +234,34 @@ def test_fold_tail_plain_chunked_kernel_matches_chunk_parallel_path():
     outs, pools = [], []
     for use_cp in (True, False):
         p = pool.clone()
-        out, _ = fi_cgdr(q, k, v, g, beta, initial_state=p, initial_state_indices=s1, inplace_indexed_state_update=True,
-                         output_final_state=False, cu_seqlens=cu, head_first=False, use_qk_l2norm_in_kernel=False,
-                         output_state_indices=s2, use_cp=use_cp)
+        out, _ = fi_cgdr(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=p,
+            initial_state_indices=s1,
+            inplace_indexed_state_update=True,
+            output_final_state=False,
+            cu_seqlens=cu,
+            head_first=False,
+            use_qk_l2norm_in_kernel=False,
+            output_state_indices=s2,
+            use_cp=use_cp,
+        )
         torch.cuda.synchronize()
-        outs.append(out.float()); pools.append(p)
+        outs.append(out.float())
+        pools.append(p)
     torch.testing.assert_close(outs[0], outs[1], atol=2e-2, rtol=2e-2)
     for slot in (2, 5, 7):
-        torch.testing.assert_close(pools[0][slot].float(), pools[1][slot].float(), atol=2e-2, rtol=2e-2)
-    for slot in (0, 1, 3, 4, 6):   # sources and untouched slots identical
-        assert torch.equal(pools[0][slot], pools[1][slot]) and torch.equal(pools[0][slot], pool[slot])
+        torch.testing.assert_close(
+            pools[0][slot].float(), pools[1][slot].float(), atol=2e-2, rtol=2e-2
+        )
+    for slot in (0, 1, 3, 4, 6):  # sources and untouched slots identical
+        assert torch.equal(pools[0][slot], pools[1][slot]) and torch.equal(
+            pools[0][slot], pool[slot]
+        )
 
 
 def _prefill_case(dev, lens, seed=11, num_q_heads=2, num_v_heads=8, head_dim=128, pool_slots=8):
@@ -250,8 +272,13 @@ def _prefill_case(dev, lens, seed=11, num_q_heads=2, num_v_heads=8, head_dim=128
     v = torch.randn(1, total, num_v_heads, head_dim, dtype=torch.bfloat16, device=dev) * 0.1
     g = -torch.rand(1, total, num_v_heads, dtype=torch.float32, device=dev) * 0.05
     beta = torch.rand(1, total, num_v_heads, dtype=torch.float32, device=dev)
-    cu = torch.tensor([0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.long, device=dev)
-    pool = torch.randn(pool_slots, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16, device=dev) * 0.01
+    cu = torch.tensor(
+        [0] + list(torch.tensor(lens).cumsum(0).tolist()), dtype=torch.long, device=dev
+    )
+    pool = (
+        torch.randn(pool_slots, num_v_heads, head_dim, head_dim, dtype=torch.bfloat16, device=dev)
+        * 0.01
+    )
     idx = torch.tensor([1 + 3 * i for i in range(len(lens))], dtype=torch.int32, device=dev)
     return q, k, v, g, beta, cu, pool, idx
 
@@ -285,19 +312,29 @@ def test_indexed_pool_io_matches_gather_scatter_path(monkeypatch):
     monkeypatch.setattr(fc, "_INDEXED_STATE_IO_MAX_SEQS", 8)
     dev = "cuda"
     q, k, v, g, beta, cu, pool, idx = _prefill_case(dev, [300, 64])
-    common = dict(inplace_indexed_state_update=True, output_final_state=False, cu_seqlens=cu, head_first=False,
-                  use_qk_l2norm_in_kernel=False, use_cp=False)
+    common = dict(
+        inplace_indexed_state_update=True,
+        output_final_state=False,
+        cu_seqlens=cu,
+        head_first=False,
+        use_qk_l2norm_in_kernel=False,
+        use_cp=False,
+    )
     spy = _FlashInferSpy(flashinfer)
     monkeypatch.setattr(flashinfer, "chunk_gated_delta_rule", spy)
 
     monkeypatch.setattr(fc, "_INDEXED_STATE_IO", False)
     p_ref = pool.clone()
-    out_ref, fs_ref = fc.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=p_ref, initial_state_indices=idx, **common)
+    out_ref, fs_ref = fc.chunk_gated_delta_rule(
+        q, k, v, g, beta, initial_state=p_ref, initial_state_indices=idx, **common
+    )
     assert fs_ref is None and "state_indices" not in spy.calls[-1]
 
     monkeypatch.setattr(fc, "_INDEXED_STATE_IO", True)
     p_new = pool.clone()
-    out_new, fs_new = fc.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=p_new, initial_state_indices=idx, **common)
+    out_new, fs_new = fc.chunk_gated_delta_rule(
+        q, k, v, g, beta, initial_state=p_new, initial_state_indices=idx, **common
+    )
     torch.cuda.synchronize()
     assert fs_new is None
     assert spy.calls[-1]["state_indices"] is idx and spy.calls[-1]["output_state"] is p_new
@@ -313,26 +350,63 @@ def test_indexed_pool_io_matches_gather_scatter_path(monkeypatch):
     many = [300, 64] + [1] * 30
     qm, km, vm, gm, bm, cum, poolm, idxm = _prefill_case(dev, many, seed=13, pool_slots=128)
     p_many = poolm.clone()
-    fc.chunk_gated_delta_rule(qm, km, vm, gm, bm, initial_state=p_many, initial_state_indices=idxm,
-                              **{**common, "cu_seqlens": cum})
+    fc.chunk_gated_delta_rule(
+        qm,
+        km,
+        vm,
+        gm,
+        bm,
+        initial_state=p_many,
+        initial_state_indices=idxm,
+        **{**common, "cu_seqlens": cum},
+    )
     assert "state_indices" not in spy.calls[-1]
     monkeypatch.setattr(fc, "_INDEXED_STATE_IO_MAX_SEQS", 64)
     p_many2 = poolm.clone()
-    fc.chunk_gated_delta_rule(qm, km, vm, gm, bm, initial_state=p_many2, initial_state_indices=idxm,
-                              **{**common, "cu_seqlens": cum})
+    fc.chunk_gated_delta_rule(
+        qm,
+        km,
+        vm,
+        gm,
+        bm,
+        initial_state=p_many2,
+        initial_state_indices=idxm,
+        **{**common, "cu_seqlens": cum},
+    )
     assert "state_indices" in spy.calls[-1]
     torch.cuda.synchronize()
     for slot in idxm.tolist():
-        torch.testing.assert_close(p_many2[slot].float(), p_many[slot].float(), atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(
+            p_many2[slot].float(), p_many[slot].float(), atol=2e-2, rtol=2e-2
+        )
     monkeypatch.setattr(fc, "_INDEXED_STATE_IO_MAX_SEQS", 8)
 
     # Not taken with the chunk-parallel heuristic left on, nor for the fold tails (read S1, write S2).
     p_cp = pool.clone()
-    fc.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=p_cp, initial_state_indices=idx, **{**common, "use_cp": "auto"})
+    fc.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=p_cp,
+        initial_state_indices=idx,
+        **{**common, "use_cp": "auto"},
+    )
     assert "state_indices" not in spy.calls[-1]
     p_tail = pool.clone()
     s2 = torch.tensor([2, 5], dtype=torch.int32, device=dev)
-    fc.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=p_tail, initial_state_indices=idx, output_state_indices=s2, **common)
+    fc.chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=p_tail,
+        initial_state_indices=idx,
+        output_state_indices=s2,
+        **common,
+    )
     assert "state_indices" not in spy.calls[-1]
 
 
@@ -345,27 +419,66 @@ def test_linear_gate_input_matches_log_gate_input():
     dev = "cuda"
     q, k, v, g, beta, cu, pool, idx = _prefill_case(dev, [130, 32, 7], seed=5)
     for use_cp in ("auto", False):
-        common = dict(inplace_indexed_state_update=True, output_final_state=False, cu_seqlens=cu, head_first=False,
-                      use_qk_l2norm_in_kernel=False, use_cp=use_cp)
+        common = dict(
+            inplace_indexed_state_update=True,
+            output_final_state=False,
+            cu_seqlens=cu,
+            head_first=False,
+            use_qk_l2norm_in_kernel=False,
+            use_cp=use_cp,
+        )
         p_log = pool.clone()
-        out_log, _ = fc.chunk_gated_delta_rule(q, k, v, g, beta, initial_state=p_log, initial_state_indices=idx, **common)
+        out_log, _ = fc.chunk_gated_delta_rule(
+            q, k, v, g, beta, initial_state=p_log, initial_state_indices=idx, **common
+        )
         p_lin = pool.clone()
-        out_lin, _ = fc.chunk_gated_delta_rule(q, k, v, torch.exp(g), beta, initial_state=p_lin, initial_state_indices=idx,
-                                               g_is_linear=True, **common)
+        out_lin, _ = fc.chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            torch.exp(g),
+            beta,
+            initial_state=p_lin,
+            initial_state_indices=idx,
+            g_is_linear=True,
+            **common,
+        )
         torch.cuda.synchronize()
         torch.testing.assert_close(out_lin.float(), out_log.float(), atol=1e-3, rtol=1e-3)
         for slot in idx.tolist():
-            torch.testing.assert_close(p_lin[slot].float(), p_log[slot].float(), atol=1e-3, rtol=1e-3)
+            torch.testing.assert_close(
+                p_lin[slot].float(), p_log[slot].float(), atol=1e-3, rtol=1e-3
+            )
     # a token-range slice of the [1, T, H] gate (the fold tails) is accepted as-is
     sl = slice(130, 162)
     p_a, p_b = pool.clone(), pool.clone()
     cu1 = torch.tensor([0, 32], dtype=torch.long, device=dev)
     one = idx[1:2]
-    out_a, _ = fc.chunk_gated_delta_rule(q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl], initial_state=p_a,
-                                         initial_state_indices=one, inplace_indexed_state_update=True, cu_seqlens=cu1, use_cp=False)
-    out_b, _ = fc.chunk_gated_delta_rule(q[:, sl], k[:, sl], v[:, sl], torch.exp(g)[:, sl], beta[:, sl], initial_state=p_b,
-                                         initial_state_indices=one, inplace_indexed_state_update=True, cu_seqlens=cu1, use_cp=False,
-                                         g_is_linear=True)
+    out_a, _ = fc.chunk_gated_delta_rule(
+        q[:, sl],
+        k[:, sl],
+        v[:, sl],
+        g[:, sl],
+        beta[:, sl],
+        initial_state=p_a,
+        initial_state_indices=one,
+        inplace_indexed_state_update=True,
+        cu_seqlens=cu1,
+        use_cp=False,
+    )
+    out_b, _ = fc.chunk_gated_delta_rule(
+        q[:, sl],
+        k[:, sl],
+        v[:, sl],
+        torch.exp(g)[:, sl],
+        beta[:, sl],
+        initial_state=p_b,
+        initial_state_indices=one,
+        inplace_indexed_state_update=True,
+        cu_seqlens=cu1,
+        use_cp=False,
+        g_is_linear=True,
+    )
     torch.cuda.synchronize()
     torch.testing.assert_close(out_b.float(), out_a.float(), atol=1e-3, rtol=1e-3)
 
@@ -373,6 +486,7 @@ def test_linear_gate_input_matches_log_gate_input():
 def test_metadata_stages_per_fold_tail_cu_seqlens():
     """prepare() stages ``[0, len_i]`` for every folded tail (3 ctx requests, two folded, 2 decodes)."""
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA (metadata buffers live on the device)")
 
@@ -386,9 +500,15 @@ def test_metadata_stages_per_fold_tail_cu_seqlens():
     md = Mamba2Metadata(max_batch_size=8, chunk_size=64)
     seq_lens = torch.tensor([60, 25, 70, 1, 1], dtype=torch.int)
     attn = SimpleNamespace(
-        seq_lens=seq_lens, seq_lens_cuda=seq_lens.cuda(), num_contexts=3, num_ctx_tokens=155,
-        kv_cache_manager=CacheManager(), request_ids=[100, 101, 102, 103, 104],
-        kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=torch.tensor([0, 0, 0, 9, 9], dtype=torch.int)),
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens.cuda(),
+        num_contexts=3,
+        num_ctx_tokens=155,
+        kv_cache_manager=CacheManager(),
+        request_ids=[100, 101, 102, 103, 104],
+        kv_cache_params=SimpleNamespace(
+            num_cached_tokens_per_seq=torch.tensor([0, 0, 0, 9, 9], dtype=torch.int)
+        ),
     )
     md.prepare(attn)
     torch.cuda.synchronize()
@@ -409,7 +529,10 @@ def test_extract_transpose_emits_fold_conv_tails(width, conv_toks):
     """The extract launch writes the ``width`` pre-fold-point tokens of every fold into tail[f, c, w],
     bit-exactly what fold_conv_tail gathers from the transposed buffer afterwards (fold points on
     and across the 32-token block boundary of the kernel)."""
-    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import extract_transpose_prefill_slice
+    from tensorrt_llm._torch.modules.mamba.fuse_elementwise_ops import (
+        extract_transpose_prefill_slice,
+    )
+
     dev = "cuda"
     torch.manual_seed(2)
     T, conv_dim = 140, 300
@@ -419,7 +542,9 @@ def test_extract_transpose_emits_fold_conv_tails(width, conv_toks):
     x_ref = extract_transpose_prefill_slice(src, T, 0, conv_dim)
     tail_ref = fold_conv_tail(x_ref, fold, width, fused=False)
     tail = torch.empty(len(conv_toks), conv_dim, width, dtype=torch.bfloat16, device=dev)
-    x_got = extract_transpose_prefill_slice(src, T, 0, conv_dim, tail=tail, conv_tok=fold.fold_conv_tok)
+    x_got = extract_transpose_prefill_slice(
+        src, T, 0, conv_dim, tail=tail, conv_tok=fold.fold_conv_tok
+    )
     torch.cuda.synchronize()
     assert torch.equal(x_got, x_ref)
     assert tail.shape == tail_ref.shape and torch.equal(tail, tail_ref)
@@ -430,6 +555,7 @@ def test_extract_transpose_emits_fold_conv_tails(width, conv_toks):
 def test_fold_seed_terminal_slots_matches_copy_and_commit(tail_dtype):
     """One launch = pool[S2] <- pool[S1] plus the conv-state commit (S2 <- chunk end, S1 <- tail)."""
     from tensorrt_llm._torch.modules.mamba.gdn_mixer import fold_seed_terminal_slots
+
     dev = "cuda"
     torch.manual_seed(9)
     pool0 = torch.randn(10, 8, 128, 128, dtype=torch.bfloat16, device=dev)
@@ -478,6 +604,12 @@ def test_fold_scan_tails_with_deferred_conv_commit_matches_separate_commit():
     fold_scan_tails(q, k, v, g, beta, pool_ref, fold, out_ref, fused=False)
     for fused in (True, False):
         pool_got, conv_got, out_got = pool0.clone(), conv0.clone(), out0.clone()
-        fold_scan_tails(q, k, v, g, beta, pool_got, fold, out_got, fused=fused, conv_commit=(conv_got, tail))
+        fold_scan_tails(
+            q, k, v, g, beta, pool_got, fold, out_got, fused=fused, conv_commit=(conv_got, tail)
+        )
         torch.cuda.synchronize()
-        assert torch.equal(pool_got, pool_ref) and torch.equal(out_got, out_ref) and torch.equal(conv_got, conv_ref), fused
+        assert (
+            torch.equal(pool_got, pool_ref)
+            and torch.equal(out_got, out_ref)
+            and torch.equal(conv_got, conv_ref)
+        ), fused

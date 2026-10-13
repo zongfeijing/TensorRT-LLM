@@ -8,6 +8,7 @@ recurrent kernel reads the snapshot slot and writes the terminal slot itself
 (split pool) from the raw conv rows and gate columns. Same tokens, same fp32
 recurrence: the terminal state and the tail outputs must agree with the chunked
 path to bf16 rounding, and the conv-state commit must be unchanged."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -26,11 +27,18 @@ H, HV, D = 2, 8, 128
 
 
 def _ready():
-    return torch.cuda.is_available() and is_sm_100f() and fsg.flashinfer_gdn_bf16_state_available(torch.bfloat16, D, D)
+    return (
+        torch.cuda.is_available()
+        and is_sm_100f()
+        and fsg.flashinfer_gdn_bf16_state_available(torch.bfloat16, D, D)
+    )
 
 
 def _fold(lens, tails, s1, s2, dev, width=3):
-    """Fake fold metadata: each request i covers packed rows [sum(lens[:i]), sum(lens[:i+1])), its tail = the last tails[i] rows."""
+    """Fake fold metadata.
+
+    Request i covers packed rows [sum(lens[:i]), sum(lens[:i+1])); its tail is the last tails[i] rows.
+    """
     starts = [sum(lens[:i]) for i in range(len(lens))]
     ranges = [(starts[i] + lens[i] - tails[i], tails[i]) for i in range(len(lens))]
     rows = [r for start, n in ranges for r in range(start, start + n)]
@@ -105,13 +113,23 @@ def test_recurrent_tail_readiness_gates(monkeypatch):
         m.setattr(gm, "_FOLD_TAIL_RECURRENT", True)
         assert gm._fold_tail_recurrent_ready(rec, pool, fold) == ready
         assert not gm._fold_tail_recurrent_ready(None, pool, fold)
-        assert not gm._fold_tail_recurrent_ready(rec, pool, SimpleNamespace(fold_count=gm._FOLD_TAIL_RECURRENT_MAX_FOLDS + 1))
-        assert not gm._fold_tail_recurrent_ready(rec, pool, SimpleNamespace(fold_count=2)), "two folds need aligned slot buffers"
-        misaligned = gm._FoldTailRecurrentInputs(conv_out, a[:, 1:], b, A_log, dt_bias, (H, D, HV, D))
+        assert not gm._fold_tail_recurrent_ready(
+            rec, pool, SimpleNamespace(fold_count=gm._FOLD_TAIL_RECURRENT_MAX_FOLDS + 1)
+        )
+        assert not gm._fold_tail_recurrent_ready(rec, pool, SimpleNamespace(fold_count=2)), (
+            "two folds need aligned slot buffers"
+        )
+        misaligned = gm._FoldTailRecurrentInputs(
+            conv_out, a[:, 1:], b, A_log, dt_bias, (H, D, HV, D)
+        )
         assert not gm._fold_tail_recurrent_ready(misaligned, pool, fold)
-        channel_major = gm._FoldTailRecurrentInputs(conv_out.t().contiguous().t(), a, b, A_log, dt_bias, (H, D, HV, D))
+        channel_major = gm._FoldTailRecurrentInputs(
+            conv_out.t().contiguous().t(), a, b, A_log, dt_bias, (H, D, HV, D)
+        )
         assert not gm._fold_tail_recurrent_ready(channel_major, pool, fold)
-        assert not gm._fold_tail_recurrent_ready(rec, pool.float(), fold), "fp32 pool: no bf16-state kernel"
+        assert not gm._fold_tail_recurrent_ready(rec, pool.float(), fold), (
+            "fp32 pool: no bf16-state kernel"
+        )
     with monkeypatch.context() as m:
         m.setattr(gm, "_FOLD_TAIL_RECURRENT", False)
         assert not gm._fold_tail_recurrent_ready(rec, pool, fold)
@@ -119,11 +137,22 @@ def test_recurrent_tail_readiness_gates(monkeypatch):
 
 def _make_mixer():
     config = Qwen3NextConfig(
-        hidden_size=256, intermediate_size=512, num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=2,
-        linear_num_key_heads=H, linear_num_value_heads=HV, linear_key_head_dim=D, linear_value_head_dim=D,
-        linear_conv_kernel_dim=4, vocab_size=1024, torch_dtype=torch.bfloat16,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        linear_num_key_heads=H,
+        linear_num_value_heads=HV,
+        linear_key_head_dim=D,
+        linear_value_head_dim=D,
+        linear_conv_kernel_dim=4,
+        vocab_size=1024,
+        torch_dtype=torch.bfloat16,
     )
-    mixer = Qwen3NextGatedDeltaNet(ModelConfig(pretrained_config=config), aux_stream=torch.cuda.Stream(), layer_idx=0).cuda()
+    mixer = Qwen3NextGatedDeltaNet(
+        ModelConfig(pretrained_config=config), aux_stream=torch.cuda.Stream(), layer_idx=0
+    ).cuda()
     torch.manual_seed(1)
     with torch.no_grad():
         for p in mixer.parameters():
@@ -145,7 +174,9 @@ class _CacheManager:
 
 
 @pytest.mark.skipif(not _ready(), reason="FlashInfer bf16-state GDN kernels (SM100/SM103)")
-@pytest.mark.parametrize("ctx_lens,folds,n_dec", [([96, 50], [(64, 7), None], 3), ([130, 100], [(96, 7), (64, 8)], 40)])
+@pytest.mark.parametrize(
+    "ctx_lens,folds,n_dec", [([96, 50], [(64, 7), None], 3), ([130, 100], [(96, 7), (64, 8)], 40)]
+)
 @torch.no_grad()
 def test_forward_core_recurrent_tail_matches_chunked_tail(monkeypatch, ctx_lens, folds, n_dec):
     dev = "cuda"
@@ -163,15 +194,24 @@ def test_forward_core_recurrent_tail_matches_chunked_tail(monkeypatch, ctx_lens,
 
     def run(recurrent_on):
         conv, ssm = conv0.clone(), ssm0.clone()
-        layer_cache = SimpleNamespace(conv=conv, temporal=ssm, intermediate_conv_window=None, intermediate_ssm=None)
+        layer_cache = SimpleNamespace(
+            conv=conv, temporal=ssm, intermediate_conv_window=None, intermediate_ssm=None
+        )
         manager = _CacheManager(slots, folds + [None] * n_dec)
         manager.mamba_layer_cache = lambda layer_idx: layer_cache
         manager.is_speculative = lambda: False
         md = Mamba2Metadata(max_batch_size=64, chunk_size=64)
         attn = SimpleNamespace(
-            seq_lens=seq_lens, seq_lens_cuda=seq_lens.cuda(), num_contexts=num_ctx, num_ctx_tokens=sum(ctx_lens),
-            num_tokens=total, kv_cache_manager=manager, request_ids=list(range(100, 100 + batch)),
-            kv_cache_params=SimpleNamespace(num_cached_tokens_per_seq=torch.tensor([0] * num_ctx + [9] * n_dec, dtype=torch.int)),
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=num_ctx,
+            num_ctx_tokens=sum(ctx_lens),
+            num_tokens=total,
+            kv_cache_manager=manager,
+            request_ids=list(range(100, 100 + batch)),
+            kv_cache_params=SimpleNamespace(
+                num_cached_tokens_per_seq=torch.tensor([0] * num_ctx + [9] * n_dec, dtype=torch.int)
+            ),
         )
         md.prepare(attn)
         out = torch.empty(1, total, HV, D, dtype=torch.bfloat16, device=dev)
@@ -186,11 +226,16 @@ def test_forward_core_recurrent_tail_matches_chunked_tail(monkeypatch, ctx_lens,
     out_got, conv_got, ssm_got = run(True)
     assert torch.equal(conv_got, conv_ref)
     s2 = [f[1] for f in folds if f is not None]
-    assert (ssm_ref[s2].float() - ssm0[s2].float()).abs().max() > 0.05, "the tails must have moved the terminal slots"
+    assert (ssm_ref[s2].float() - ssm0[s2].float()).abs().max() > 0.05, (
+        "the tails must have moved the terminal slots"
+    )
     torch.testing.assert_close(ssm_got.float(), ssm_ref.float(), atol=1e-2, rtol=2e-2)
     torch.testing.assert_close(out_got, out_ref, atol=1e-2, rtol=2e-2)
-    # the recurrent tail differs from the chunked one by bf16 rounding only: far closer than either is to the initial slot
-    assert (ssm_got[s2].float() - ssm_ref[s2].float()).abs().max() < 0.1 * (ssm_ref[s2].float() - ssm0[s2].float()).abs().max()
+    # the recurrent tail differs from the chunked one by bf16 rounding only: far closer than
+    # either is to the initial slot
+    assert (ssm_got[s2].float() - ssm_ref[s2].float()).abs().max() < 0.1 * (
+        ssm_ref[s2].float() - ssm0[s2].float()
+    ).abs().max()
 
 
 @pytest.mark.skipif(not _ready(), reason="FlashInfer bf16-state GDN kernels (SM100/SM103)")
@@ -217,7 +262,11 @@ def test_warmup_uses_the_real_pool_geometry(monkeypatch):
         mixer.warmup_fold_kernels(manager)
     torch.cuda.synchronize()
     expected_stride = tuple(int(s) for s in temporal.stride())
-    keys = [k for k in gd._compiled_kernels_mtp if k[0] == "mtp_bf16_dynB" and k[6] == slots and k[7] == expected_stride]
+    keys = [
+        k
+        for k in gd._compiled_kernels_mtp
+        if k[0] == "mtp_bf16_dynB" and k[6] == slots and k[7] == expected_stride
+    ]
     assert set(range(1, 33)) <= {k[1] for k in keys}, sorted(k[1] for k in keys)
     # only the warm-up slots (1, 2, 4, 5) were written
     touched = (backing != snapshot).view(slots, -1).any(dim=1).nonzero().flatten().tolist()
@@ -233,16 +282,32 @@ def test_post_conv_fused_conv_commit_matches_seed_commit():
     conv_dim = 2 * H * D + HV * D
     T, width = 300, 3
     conv_out, a, b, A_log, dt_bias = _inputs(T, dev)
-    x = torch.randn(T, conv_dim + 64, dtype=torch.bfloat16, device=dev)[:, :conv_dim]  # strided rows like the projection
+    x = torch.randn(T, conv_dim + 64, dtype=torch.bfloat16, device=dev)[
+        :, :conv_dim
+    ]  # strided rows like the projection
     fold = _fold([170, 130], [32, 9], [1, 2], [8, 9], dev)
     conv0 = torch.randn(16, conv_dim, width, dtype=torch.bfloat16, device=dev)
     pool = torch.zeros(16, HV, D, D, dtype=torch.bfloat16, device=dev)
-    ref = fused_gdn_post_conv(conv_out.t().contiguous(), None, a, b, A_log, dt_bias, H, D, HV, D, g_linear=True)
+    ref = fused_gdn_post_conv(
+        conv_out.t().contiguous(), None, a, b, A_log, dt_bias, H, D, HV, D, g_linear=True
+    )
     conv_ref = conv0.clone()
-    gm.fold_seed_terminal_slots(pool, fold, conv_ref, gm._ConvTailFromInput(x, fold.fold_conv_tok), copy_ssm=False)
+    gm.fold_seed_terminal_slots(
+        pool, fold, conv_ref, gm._ConvTailFromInput(x, fold.fold_conv_tok), copy_ssm=False
+    )
     conv_got = conv0.clone()
     got = fused_gdn_post_conv(
-        conv_out.t().contiguous(), None, a, b, A_log, dt_bias, H, D, HV, D, g_linear=True,
+        conv_out.t().contiguous(),
+        None,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        H,
+        D,
+        HV,
+        D,
+        g_linear=True,
         fold_conv=(x, conv_got, fold.fold_s1, fold.fold_s2, fold.fold_conv_tok),
     )
     torch.cuda.synchronize()

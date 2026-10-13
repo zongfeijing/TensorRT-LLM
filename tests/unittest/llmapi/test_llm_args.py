@@ -1466,6 +1466,7 @@ def test_KvCacheConfig_deprecated_mamba_interval_survives_revalidation():
         KvCacheConfig(mamba_state_cache_interval=64,
                       mamba_state_config={"periodic_snapshot_interval": 128})
 
+
 @pytest.mark.cpu_only
 def test_KvCacheConfig_warns_when_disabling_periodic_conversation_snapshots(
         monkeypatch):

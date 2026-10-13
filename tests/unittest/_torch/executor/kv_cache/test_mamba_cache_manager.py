@@ -100,6 +100,7 @@ def _two_chunk_save_last_schedule(monkeypatch):
     # (the default) has its own tests (test_fold_save_last_*).
     monkeypatch.setenv("TLLM_MAMBA_FOLD_SAVE_LAST", "0")
 
+
 def test_advance_replay_state_uses_checkpoint_predicate_and_skips_dummies():
     metadata = ReplayStateUpdateMetadata(
         prev_num_accepted_tokens=torch.tensor([11, 12, 13], dtype=torch.int32),
@@ -3744,8 +3745,7 @@ def test_v2_kda_replay_resets_context_slots():
 
     # The base reset needs a fully built manager (host state indices, batch
     # size, ...); this test only covers the V2 override on top of it.
-    with patch.object(MambaHybridCacheManager,
-                      "_reset_context_mamba_slots") as base_reset:
+    with patch.object(MambaHybridCacheManager, "_reset_context_mamba_slots") as base_reset:
         mgr._reset_context_mamba_slots(num_contexts=1)
 
     base_reset.assert_called_once_with(1)
@@ -4899,20 +4899,17 @@ def _fake_hybrid_for_final_state(raw_ids, slots, primary=7):
 
 def test_final_state_index_resolves_end_of_prompt_block_after_fold_table_reset():
     """prompt_len 90 -> tokens 0..89 -> last token in block 2 -> its slot."""
-    fake, calls = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
-                                               slots={12: 300},
-                                               primary=200)  # S1 = stale
-    assert CppMambaHybridCacheManager.get_final_state_index(
-        fake, 42, prompt_len=90) == 300
-    assert calls == [("indices", (42, )), ("slots", (12, ))]
+    fake, calls = _fake_hybrid_for_final_state(
+        raw_ids=[10, 11, 12], slots={12: 300}, primary=200
+    )  # S1 = stale
+    assert CppMambaHybridCacheManager.get_final_state_index(fake, 42, prompt_len=90) == 300
+    assert calls == [("indices", (42,)), ("slots", (12,))]
 
 
 def test_final_state_index_block_aligned_prompt_uses_last_full_block():
     """prompt_len 96 -> last token 95 -> block 2 (not block 3)."""
-    fake, _ = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12],
-                                           slots={12: 301})
-    assert CppMambaHybridCacheManager.get_final_state_index(
-        fake, 42, prompt_len=96) == 301
+    fake, _ = _fake_hybrid_for_final_state(raw_ids=[10, 11, 12], slots={12: 301})
+    assert CppMambaHybridCacheManager.get_final_state_index(fake, 42, prompt_len=96) == 301
 
 
 def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_requests():
@@ -4926,11 +4923,17 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_req
         enable_block_reuse=True,
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=64),
     )
-    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64, save_last_snapshot=True)
+    mgr.linear_attention_metadata = SimpleNamespace(
+        states_snapshot_interval=64, save_last_snapshot=True
+    )
     mgr.tokens_per_block = 32
     mgr.enable_block_reuse = True
-    ctx = SimpleNamespace(prompt_len=150, expect_snapshot_points=[], state=LlmRequestState.CONTEXT_INIT)
-    gen_new = SimpleNamespace(prompt_len=128, expect_snapshot_points=[], state=LlmRequestState.GENERATION_IN_PROGRESS)
+    ctx = SimpleNamespace(
+        prompt_len=150, expect_snapshot_points=[], state=LlmRequestState.CONTEXT_INIT
+    )
+    gen_new = SimpleNamespace(
+        prompt_len=128, expect_snapshot_points=[], state=LlmRequestState.GENERATION_IN_PROGRESS
+    )
     gen_done = SimpleNamespace(
         prompt_len=128,
         expect_snapshot_points=[1, 2, 3],
@@ -4940,7 +4943,9 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_skips_prepared_generation_req
     mgr.prepare_expect_snapshot_points([ctx, gen_new, gen_done])
     assert ctx.expect_snapshot_points == [64, 128] and ctx.py_snapshot_points_ready
     assert gen_new.expect_snapshot_points == [64, 96, 128] and gen_new.py_snapshot_points_ready
-    assert gen_done.expect_snapshot_points == [1, 2, 3], "prepared generation-phase request untouched"
+    assert gen_done.expect_snapshot_points == [1, 2, 3], (
+        "prepared generation-phase request untouched"
+    )
     # a context-phase request is recomputed every pass, marker or not
     ctx.expect_snapshot_points = [999]
     mgr.prepare_expect_snapshot_points([ctx])
