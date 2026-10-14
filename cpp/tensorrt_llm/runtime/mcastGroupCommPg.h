@@ -19,6 +19,7 @@
 #include "tensorrt_llm/runtime/mcastGroupComm.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
 
+#include <c10/core/impl/LocalDispatchKeySet.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 
 #include <exception>
@@ -44,6 +45,12 @@ namespace tensorrt_llm::runtime
 //! comes back holding a meta tensor and is then rejected with MetaInitException. Going straight to
 //! the backend keeps this host-only setup path out of the tensor dispatcher entirely; the Python
 //! side does the same in _mnnvl_workspace_barrier.
+//!
+//! Bypassing the dispatcher is not enough on its own: Gloo snapshots the calling thread's local
+//! state -- dispatch keys and the TorchDispatchMode stack included -- into every work item and
+//! re-installs it on its worker thread, where the collective makes its own allocations (allgather's
+//! flat output). Under MetaInitMode those come back as meta tensors and Gloo copies through a null
+//! pointer. Every collective therefore also excludes the Python dispatch keys while it is issued.
 //!
 //! This header pulls in torch headers and must only be included from translation units that link
 //! against torch (the nanobind bindings and thop).
@@ -77,6 +84,7 @@ public:
 
     void bcast(void* buf, size_t bytes, int root) override
     {
+        c10::impl::ExcludeDispatchKeyGuard const noPythonModes(pythonModeKeys());
         c10d::BroadcastOptions options;
         options.rootRank = root;
         // Broadcasts in place, so the caller's buffer holds the result.
@@ -86,6 +94,7 @@ public:
 
     void barrier() override
     {
+        c10::impl::ExcludeDispatchKeyGuard const noPythonModes(pythonModeKeys());
         PGCHECK_THROW(mPg->getBackend(c10::DeviceType::CPU)->barrier());
     }
 
@@ -126,6 +135,7 @@ private:
     //! Gathers straight into the caller's buffer.
     void doAllgather(void const* sendBuf, void* recvBuf, size_t bytes) const
     {
+        c10::impl::ExcludeDispatchKeyGuard const noPythonModes(pythonModeKeys());
         auto const count = static_cast<int64_t>(bytes);
         auto input = hostView(const_cast<void*>(sendBuf), count);
         auto output = hostView(recvBuf, count * mPg->getSize());
@@ -144,6 +154,12 @@ private:
         {
             return false;
         }
+    }
+
+    //! The keys through which a Python TorchDispatchMode (e.g. MetaInitMode) intercepts operators.
+    static c10::DispatchKeySet pythonModeKeys()
+    {
+        return c10::DispatchKeySet({c10::DispatchKey::Python, c10::DispatchKey::PythonTLSSnapshot});
     }
 
     static at::Tensor hostView(void* data, int64_t bytes)
