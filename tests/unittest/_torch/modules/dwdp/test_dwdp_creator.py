@@ -534,6 +534,51 @@ def _logged_by(log: list[tuple], action) -> list[tuple]:
     return log[start:]
 
 
+def test_without_kv_cache_estimation_the_only_executor_gets_the_standalone_manager(monkeypatch):
+    """The first executor is the final one: it primes the manager and exits it at shutdown.
+
+    Dense DWDP is set up once, before ``build_managers`` sizes the final KV cache, so the KV
+    cache gets the memory dense DWDP frees.
+    """
+    run = _create_final_executor(monkeypatch, "standalone", estimating=False)
+
+    (executor,) = [entry[1] for entry in run.log if entry[0] == "executor"]
+    model = executor["model_engine"].model
+    assert _calls(run.log) == [
+        ("DenseDwdpManager", DenseMode.STANDALONE, run.mapping),
+        ("__enter__",),
+        ("setup", model),
+        ("build_managers", False),
+        ("executor", None, run.manager),
+        ("start_worker",),
+    ]
+
+
+def test_with_kv_cache_estimation_only_the_final_executor_gets_the_standalone_manager(monkeypatch):
+    """The estimation executor gets None: its shutdown must not exit the manager.
+
+    Dense DWDP is set up once, before the estimation run, which then measures the memory it
+    frees.
+    """
+    run = _create_final_executor(monkeypatch, "standalone", estimating=True)
+
+    executors = [entry[1] for entry in run.log if entry[0] == "executor"]
+    model = executors[0]["model_engine"].model
+    assert _calls(run.log) == [
+        ("DenseDwdpManager", DenseMode.STANDALONE, run.mapping),
+        ("__enter__",),
+        ("build_managers", True),
+        ("setup", model),
+        ("executor", None, None),
+        ("configure_kv_cache_capacity",),
+        ("shutdown",),
+        ("teardown_managers",),
+        ("build_managers", False),
+        ("executor", None, run.manager),
+        ("start_worker",),
+    ]
+
+
 #: What ``PyExecutor._prime_dwdp`` enqueues through the ``DwdpManager`` before a forward: the
 #: experts of the first two MoE layers, each after the layer's dense weights when dense DWDP is
 #: attached.
@@ -575,16 +620,19 @@ def test_without_kv_cache_estimation_the_only_executor_gets_the_dwdp_manager(
 
     Without the manager, nothing would prime the first two MoE layers' experts before a forward
     (with expert DWDP alone, those layers would read what the previous forward left in the
-    slots), and nothing would release DWDP or unregister the managers.
+    slots), and nothing would release DWDP or unregister the managers.  With dense DWDP attached,
+    the manager is set up before ``build_managers`` sizes the final KV cache, so the KV cache gets
+    the memory dense DWDP frees; with expert DWDP alone, after it, as before.
     """
     run = _create_final_executor(monkeypatch, mode, estimating=False, is_generation=is_generation)
 
     (executor,) = [entry[1] for entry in run.log if entry[0] == "executor"]
+    setup = [("DwdpManager.setup", executor["model_engine"].model)]
+    kv_cache = [("build_managers", False)] if is_generation else []
     assert _calls(run.log) == [
         ("DwdpManager",),
         ("DwdpManager.__enter__",),
-        *([("build_managers", False)] if is_generation else []),
-        ("DwdpManager.setup", executor["model_engine"].model),
+        *(setup + kv_cache if mode == "attached" else kv_cache + setup),
         ("executor", run.manager, None),
         ("start_worker",),
     ]
