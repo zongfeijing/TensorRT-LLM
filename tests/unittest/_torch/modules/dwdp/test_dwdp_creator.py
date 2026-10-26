@@ -191,12 +191,16 @@ class _ExpertWeights:
 
 
 class _DenseRuntime:
-    """The runtime attached dense DWDP commits; logs each dense prefetch ``L`` and the release."""
+    """The runtime attached dense DWDP commits; logs each dense prefetch ``L`` and the release.
+
+    It has no slot rings, so ``DwdpManager.setup`` reserves no storage for the expert setup.
+    """
 
     def __init__(self, log: list[tuple]) -> None:
         self.log = log
         self.primed = False
         self.forward_open = False
+        self.slots: dict = {}
 
     def prefetch(self, layer: int) -> None:
         self.log.append(("L", layer))

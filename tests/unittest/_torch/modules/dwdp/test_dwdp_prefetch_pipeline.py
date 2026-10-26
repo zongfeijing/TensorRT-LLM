@@ -17,10 +17,13 @@
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
+
+pytestmark = pytest.mark.cpu_only
 
 
 class TestDWDPPrefetchPipeline:
@@ -103,3 +106,56 @@ class TestDWDPPrefetchPipeline:
 
         self.events[2].record.assert_called_once_with(self.compute_stream)
         self.events[3].record.assert_not_called()
+
+    def test_a_given_copy_stream_is_used_and_none_is_created(self, monkeypatch):
+        """With ``copy_stream`` given, the manager makes no stream and copies on the given one."""
+        monkeypatch.delenv("TRTLLM_DWDP_PREFETCH_GATHER", raising=False)
+        given = MagicMock(name="given_copy_stream", device=torch.device("cuda", 0))
+        events = [MagicMock(name=f"event_{index}") for index in range(4)]
+        with (
+            patch(
+                "tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.Stream"
+            ) as new_stream,
+            patch(
+                "tensorrt_llm._torch.modules.dwdp.weight_manager.torch.cuda.Event",
+                side_effect=events,
+            ),
+        ):
+            manager = DWDPWeightManager(
+                weight_buffer=self.weight_buffer,
+                peer_views={},
+                peer_ranges=[(0, 2), (2, 4)],
+                moe_layer_indices=[3, 5, 7],
+                weight_names=["gate_up_proj", "down_proj"],
+                dwdp_rank=0,
+                dwdp_size=2,
+                copy_stream=given,
+            )
+        try:
+            new_stream.assert_not_called()
+            assert manager.copy_stream is given
+            self.weight_buffer.get_remote_slices.return_value = []
+
+            manager.prefetch_layer(5)
+
+            # Slot 1: wait for its consume event, record its prefetch event, both on ``given``.
+            given.wait_event.assert_called_once_with(events[3])
+            events[1].record.assert_called_once_with(given)
+        finally:
+            manager._released = True
+
+    def test_a_copy_stream_on_another_device_is_refused(self):
+        other = MagicMock(name="other_copy_stream", device=torch.device("cuda", 1))
+        with pytest.raises(
+            ValueError, match="copy_stream is on cuda:1, the weight buffer on cuda:0"
+        ):
+            DWDPWeightManager(
+                weight_buffer=self.weight_buffer,
+                peer_views={},
+                peer_ranges=[(0, 2), (2, 4)],
+                moe_layer_indices=[3, 5, 7],
+                weight_names=["gate_up_proj", "down_proj"],
+                dwdp_rank=0,
+                dwdp_size=2,
+                copy_stream=other,
+            )

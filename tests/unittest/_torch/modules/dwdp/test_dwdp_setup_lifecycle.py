@@ -19,9 +19,19 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.modules.dwdp import setup as dwdp_setup_module
+from tensorrt_llm._torch.modules.dwdp.dense.types import (
+    RING_DEPTH,
+    ROW_ALIGN,
+    SegmentKind,
+    SlotSpec,
+    allocate_slot_ring,
+)
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _model():
@@ -79,7 +89,7 @@ def _setup_mocks(stack: ExitStack):
     return transport, weight_buffer, weight_manager
 
 
-def _run_setup():
+def _run_setup(**kwargs):
     return dwdp_setup_module.setup_dwdp(
         model=_model(),
         mapping=_mapping(),
@@ -88,6 +98,7 @@ def _run_setup():
         layer_indices=[3],
         num_experts_per_worker=2,
         num_prefetch_experts=2,
+        **kwargs,
     )
 
 
@@ -152,3 +163,37 @@ def test_backend_fixup_failure_releases_owned_manager():
 
     assert weight_manager._transport is transport
     weight_manager.release.assert_called_once_with()
+
+
+def test_an_expert_weight_in_a_dense_slot_is_refused_before_the_transport():
+    """A weight dense DWDP repointed into a slot: the transport would free the slot under it.
+
+    ``DwdpManager.setup`` reserves the committed runtime's slots; ``setup_dwdp`` refuses any
+    collected weight that is a view of one, before the transport takes over (and frees) it.
+    """
+    spec = SlotSpec(SegmentKind.MOE, RING_DEPTH[SegmentKind.MOE], ROW_ALIGN, 2)
+    slots = allocate_slot_ring(spec, "cpu")
+    reserved = frozenset(slot.storage.untyped_storage().data_ptr() for slot in slots)
+    slot = slots[1]
+    # A row of the slot, as repointing views it.
+    moved = slot.storage[slot.pad + ROW_ALIGN : slot.pad + 2 * ROW_ALIGN]
+    params = {
+        (3, "w3_w1_weight"): moved,
+        (3, "w2_weight"): torch.zeros(ROW_ALIGN, dtype=torch.uint8),
+        (5, "w3_w1_weight"): torch.zeros(ROW_ALIGN, dtype=torch.uint8),
+    }
+    for reserved_storages, refused in ((reserved, True), (frozenset({1}), False)):
+        with ExitStack() as stack:
+            _setup_mocks(stack)
+            dwdp_setup_module.collect_moe_params.return_value = (params, ["w3_w1_weight"])
+            if refused:
+                with pytest.raises(
+                    RuntimeError,
+                    match=r"Expert weights in reserved storage, which the transport would free: "
+                    r"layers\.3\.w3_w1_weight\. They are views of the committed dense DWDP slots",
+                ):
+                    _run_setup(reserved_storages=reserved_storages)
+                dwdp_setup_module.DWDPTransport.create.assert_not_called()
+            else:
+                _run_setup(reserved_storages=reserved_storages)
+                dwdp_setup_module.DWDPTransport.create.assert_called_once()

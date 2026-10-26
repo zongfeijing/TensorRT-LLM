@@ -114,10 +114,11 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         contention_opt: bool = False,
+        copy_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
-        Creates a dedicated copy stream and pre-allocates all CUDA events for
+        Takes or creates the copy stream and pre-allocates all CUDA events for
         the double-buffer protocol. Both consume_events are recorded immediately
         so the first prefetch does not stall waiting for a never-recorded event.
 
@@ -144,9 +145,14 @@ class DWDPWeightManager:
                 to reduce single-NVLink-link contention.  Plans are cached
                 per layer since peer ``data_ptr()`` and destination
                 ``data_ptr()`` are stable after initialization.
+            copy_stream: The stream every prefetch copy runs on; a new stream
+                on the buffer's device if None.  With attached dense DWDP,
+                ``DwdpManager.setup`` passes the stream the dense copies
+                already run on.
 
         Raises:
-            ValueError: If dwdp_rank is out of range or dwdp_size is invalid.
+            ValueError: If dwdp_rank is out of range, dwdp_size is invalid, or
+                copy_stream is on another device than the weight buffer.
         """
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
@@ -171,7 +177,15 @@ class DWDPWeightManager:
         # Dedicated CUDA stream for P2P copy operations.
         # Using a separate stream allows copy/compute overlap.
         device = torch.device("cuda", weight_buffer.device_id)
-        self._copy_stream = torch.cuda.Stream(device=device)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=device)
+        elif copy_stream.device != device:
+            raise ValueError(
+                f"copy_stream is on {copy_stream.device}, the weight buffer on {device}"
+            )
+        # Attached dense DWDP, set up before this manager exists, already runs on a given
+        # stream: one copy stream, one FIFO, for the dense and the expert copies.
+        self._copy_stream = copy_stream
 
         # Double-buffer events: one per buffer slot (0 and 1).
         # prefetch_events[i]: recorded on copy_stream after P2P copy into slot i.

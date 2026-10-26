@@ -648,8 +648,8 @@ def _set_up_dense(
 ) -> _DenseRun:
     """Dense DWDP setup on one rank of a loopback group, as the variant's owner runs it.
 
-    With expert DWDP, ``setup_dense_dwdp`` as ``DwdpManager.setup`` calls it: a weight manager
-    stand-in supplies the copy stream and the variant's transfer mode.  Standalone,
+    With expert DWDP, ``setup_dense_dwdp`` as ``DwdpManager.setup`` calls it: a stand-in for its
+    attached transfer supplies the copy stream and the variant's transfer mode.  Standalone,
     ``DenseDwdpManager.setup`` of ``manager`` (a new standalone manager of the variant's rank if
     None) over the loopback group, with a ``StandaloneTransfer`` of the variant's mode whose copy
     stream setup must create once, in P2.  Either way the launcher is the production one for the

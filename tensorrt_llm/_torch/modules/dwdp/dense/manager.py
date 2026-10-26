@@ -20,12 +20,13 @@ The model's dense hooks reach dense DWDP only through the manager that
 does not depend on ``DwdpManager``.
 
 * Attached (``DenseMode.ATTACHED``, with expert DWDP).  ``DwdpManager`` creates and registers the
-  manager, runs ``setup_dense_dwdp`` over the DWDP group with the expert weight manager as the
-  transfer, and hands the committed runtime over with :meth:`DenseDwdpManager.attach`, together
-  with the expert weight manager.  Priming then interleaves the dense and the expert copies on
-  the shared copy stream, ``L(first), E(first), L(second), E(second)``, and H0 also re-records
-  the expert consume events after an aborted forward.  ``DwdpManager.cleanup`` releases dense
-  before the expert teardown; this manager never releases the weight manager.
+  manager, runs ``setup_dense_dwdp`` over the DWDP group before the expert DWDP setup allocates its
+  prefetch ring, on a transfer whose copy stream the expert weight manager then adopts, and hands
+  the committed runtime over with :meth:`DenseDwdpManager.attach`, together with the expert
+  weight manager.  Priming then interleaves the dense and the expert copies on the shared copy
+  stream, ``L(first), E(first), L(second), E(second)``, and H0 also re-records the expert consume
+  events after an aborted forward.  ``DwdpManager.cleanup`` releases dense before the expert
+  teardown; this manager never releases the weight manager.
 * Standalone (``DenseMode.STANDALONE``, an attention-DP instance with ``tp_size > 1`` and no
   expert DWDP).  The executor creator creates and registers the manager before the model is
   built and calls :meth:`DenseDwdpManager.setup` once the weights are loaded.  Setup runs over an
