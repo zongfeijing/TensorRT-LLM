@@ -1174,6 +1174,8 @@ class DenseDWDP:
             self._join()
         elif self._state is not ForwardState.IDLE:
             self.recover()
+        # Prime before the entry barrier: only the first forward after commit gets here, and its
+        # copies must wait for the consume events commit recorded after filling the slots.
         if self._prime_policy is PrimePolicy.WRAP and not self._primed:
             self._prime()
             self._join()

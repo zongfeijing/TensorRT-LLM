@@ -578,7 +578,8 @@ class FakeMemInfo:
 
     Before setup the allocator caches ``spec.cached_bytes`` of free blocks, which the device
     counts as used; the first ``empty_cache`` returns them.  An ``empty_cache`` after the moved
-    originals died also returns ``FREED_BYTES``: the moved bytes net of the store and the slots.
+    originals died also returns ``spec.freed_bytes``, by default ``FREED_BYTES``: the moved bytes
+    net of the store and the slots.
     """
 
     def __init__(self, rank):
@@ -593,7 +594,7 @@ class FakeMemInfo:
         if rank.empty_cache_states:
             free += rank.spec.cached_bytes
         if any(state.dead_paths for state in rank.empty_cache_states):
-            free += FREED_BYTES
+            free += rank.spec.freed_bytes
         return free, TOTAL_BYTES
 
 
@@ -933,6 +934,7 @@ class RankSpec:
     moe_layers: tuple[int, ...] | None = COVERED
     free_bytes: int = PLENTY_FREE_BYTES
     cached_bytes: int = 0
+    freed_bytes: int = FREED_BYTES
     fail: str | None = None
     interrupt: str | None = None
     corrupt: Corruption | None = None
@@ -1497,3 +1499,25 @@ def test_a_drafter_may_share_lm_head_but_nothing_under_the_dense_roots(
         rf"collective #1 .*DenseLayoutError: .*{re.escape(path)}\b.*draft_model\.shared"
     )
     group.assert_restored()
+
+
+#: A standalone toy whose moved bytes exceed its store (one 2 MiB handle) and its slots, so that
+#: dense DWDP frees memory, as on a real model.
+LONG_KINDS = ("dense",) + ("kda",) * 63
+
+
+@pytest.mark.parametrize(
+    "protocol, freed_bytes, warns",
+    [(CLOSED, FREED_BYTES, False), (CLOSED, 0, True), (LEGACY, 0, False)],
+    ids=["closed-returned", "closed-kept-by-the-allocator", "legacy-kept-by-the-allocator"],
+)
+def test_a_closed_commit_warns_when_the_device_does_not_get_the_freed_memory_back(
+    make_group, protocol, freed_bytes, warns
+):
+    """Under ``CLOSED`` the commit warns, and only then, when the device got back less than half
+    of the moved bytes net of the store and the slots: the KV cache of a generation server, sized
+    from the free memory, would not grow.  The ``LEGACY`` setup stays as it was."""
+    group = make_group(specs_for(2, kinds=LONG_KINDS, moe_layers=None, freed_bytes=freed_bytes))
+    group.run(protocol=protocol, prime=WRAP if protocol is CLOSED else ENTRY)
+    group.committed()
+    assert [bool(group.messages(rank, "warning")) for rank in group.ranks] == [warns] * 2

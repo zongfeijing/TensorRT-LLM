@@ -314,7 +314,8 @@ def setup_dense_dwdp(
     P6 (no collective, host only): ``DenseBindings.commit`` (drop originals, release check),
     ``torch.cuda.empty_cache()``, ``DenseDWDP.commit`` with ``config.slot_fill_byte``, set
     ``_dense_dwdp_active`` on the model and its decoder, log the commit line with the moved,
-    store, slot and freed bytes and the leak count.
+    store, slot and freed bytes and the leak count; under ``CLOSED``, without leaks, warn when
+    the device got back less than half of the moved bytes net of the store and the slots.
 
     Every phase's local work catches ``Exception`` into ``ok=False``; ``BaseException`` propagates.
     Abandoning releases everything this rank allocated: the bindings are rolled back, then the
@@ -708,14 +709,25 @@ class _DenseSetup:
         # The runtime owns the bindings, the slots, the store and the launcher from here on.
         self._bindings = self._runtime = self._store = self._slots = self._launcher = None
         self._mark_active()
+        freed = free_after - self._free_before
         logger.info(
             f"{LOG_PREFIX} committed: moved={_gb(layout.moved_bytes)}GB "
             f"store={_gb(layout.store_bytes)}GB slots={_gb(layout.slot_bytes)}GB "
-            f"freed(mem_get_info)={_gb(free_after - self._free_before)}GB "
+            f"freed(mem_get_info)={_gb(freed)}GB "
             f"freed(memory_allocated)={_gb(self._allocated_before - allocated_after)}GB "
             f"leaks={len(leaks)} layers={len(layout.layers)} segments={_segment_names(layout)} "
             f"setup={time.monotonic() - self._started:.1f}s"
         )
+        # A generation server sizes its KV cache from the free device memory after setup.
+        net = layout.moved_bytes - layout.store_bytes - layout.slot_bytes
+        if self._protocol is DenseProtocol.CLOSED and not leaks and 0 < net and freed * 2 < net:
+            logger.warning(
+                f"{LOG_PREFIX} the device got back {_gb(freed)}GB of the {_gb(net)}GB that dense "
+                f"DWDP frees net of its store and slots: the CUDA caching allocator keeps the "
+                f"segments that still hold live tensors, so a KV cache sized from free memory "
+                f"does not grow; run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, so "
+                f"that the freed memory returns to the device"
+            )
         return runtime
 
     # ------------------------------------------------------------------
