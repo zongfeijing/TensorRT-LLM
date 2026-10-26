@@ -98,6 +98,17 @@ protocol. `ConfigurableMoE` owns wait/bind/record placement so those calls
 happen once per layer rather than once per scheduler chunk. Schedulers must not
 perform DWDP lifecycle calls.
 
+Dense DWDP (`TRTLLM_DWDP_DENSE`, which row-shards the replicated dense weights
+of the MoE decoder layers the same way) is owned by `DwdpManager` and the
+model's decoder-layer hooks, which enqueue each layer's dense weights on the
+same copy stream ahead of its experts; with it on, the model's forward entry
+(`DwdpManager.ensure_primed`) also primes the first two MoE layers, each
+layer's experts right after its dense weights, for every forward the executor
+loop did not prime (warmup, KV-cache estimation, the forward after an aborted
+one), `prefetch_first_layers` skips when they are already primed or the
+previous forward aborted, and `ConfigurableMoE` is unaware of dense DWDP and
+keeps the expert wait/bind/record protocol above unchanged.
+
 The composite mapping exposes the full expert table through the backend's
 ordinary weight attributes, so DWDP returns `None` from
 `_create_comm_strategy_auto` and continues through the `EXTERNAL_COMM`

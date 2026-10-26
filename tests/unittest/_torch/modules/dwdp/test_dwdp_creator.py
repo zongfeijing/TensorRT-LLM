@@ -12,15 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyExecutor construction ownership tests for DWDP."""
+"""PyExecutor construction tests for DWDP: manager ownership and the dense DWDP launch gate."""
 
+import os
+import re
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.modules.dwdp import vmm
+from tensorrt_llm._torch.modules.dwdp.dense.config import DENSE_ENV
+from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager, set_global_dwdp_manager
+from tensorrt_llm.llmapi.llm_args import DwdpConfig, TorchLlmArgs
+from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
+
+_HANDLE_TYPE = vmm.cuda.CUmemAllocationHandleType
 
 
 @contextmanager
@@ -74,3 +85,58 @@ def test_create_py_executor_leaves_a_pre_existing_dwdp_manager_alone():
 
         existing.__exit__.assert_not_called()
         assert get_global_dwdp_manager() is existing
+
+
+# ----------------------------------------------------------------------
+# Dense DWDP launch gate
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_dense_switches(monkeypatch):
+    """Start every test without ``TRTLLM_DWDP_DENSE*`` variables; tests set the ones they need."""
+    for name in [name for name in os.environ if name.startswith(DENSE_ENV)]:
+        monkeypatch.delenv(name)
+
+
+@pytest.fixture
+def fabric_host(monkeypatch):
+    """Make this host share FABRIC handles, whatever its architecture."""
+    monkeypatch.setattr(vmm, "peer_handle_type", lambda: _HANDLE_TYPE.CU_MEM_HANDLE_TYPE_FABRIC)
+
+
+def _dense_launch(**overrides) -> TorchLlmArgs:
+    """A dense DWDP context-worker launch, with ``overrides`` applied without validation."""
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        cuda_graph_config=None,
+        disable_overlap_scheduler=True,
+        dwdp_config=DwdpConfig(
+            dwdp_size=16, num_groups=1, num_experts_per_worker=56, num_prefetch_experts=56
+        ),
+    )
+    return args.model_copy(update=overrides)
+
+
+def _mapping(tp_size: int = 1, pp_size: int = 1, cp_size: int = 1) -> Mapping:
+    return Mapping(
+        world_size=tp_size * pp_size * cp_size,
+        rank=0,
+        tp_size=tp_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+    )
+
+
+def test_dense_gate_accepts_a_dense_dwdp_context_worker(fabric_host):
+    validate_dense_gate(_dense_launch(), _mapping())
+
+
+@pytest.mark.parametrize(
+    "dwdp_config, actual",
+    [(None, "dwdp_config is not set"), (DwdpConfig(dwdp_size=1), "dwdp_size=1")],
+)
+def test_dense_gate_requires_a_dwdp_group(fabric_host, dwdp_config, actual):
+    with pytest.raises(ValueError, match=re.escape(f"dwdp_size > 1, but {actual}")):
+        validate_dense_gate(_dense_launch(dwdp_config=dwdp_config), _mapping())
