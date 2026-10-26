@@ -25,8 +25,8 @@ and returns the mode the launch runs dense DWDP in:
 It checks, in order: the switches; the mode (a launch that fits neither is rejected with a
 message naming both); ``TRTLLM_DWDP_DENSE_COPY`` (standalone: it must be valid; attached: any
 value is ignored with one warning); the requirements both modes share; and, standalone only, the
-MPI backend and, for ``gather``, the gather op, after which it warns that the gather is
-experimental.
+MPI backend and, for ``gather``, the gather op, after which it warns once with the settings the
+gather was validated with.
 
 Every test starts without ``TRTLLM_DWDP_DENSE*`` variables, with MPI on, FABRIC peer handles and
 a registered gather op; a test changes only what it checks.
@@ -44,7 +44,16 @@ from tensorrt_llm._torch.modules.dwdp.dense import gate
 from tensorrt_llm._torch.modules.dwdp.dense.config import DENSE_COPY_ENV, DENSE_ENV
 from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
-from tensorrt_llm.llmapi.llm_args import DwdpConfig, TorchLlmArgs
+from tensorrt_llm._torch.peft.lora.config import LoraConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    DwdpConfig,
+    MTPDecodingConfig,
+    PrefillCudaGraphBackend,
+    SleepConfig,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -135,6 +144,69 @@ class _Violation(NamedTuple):
     """What the host lacks: ``fabric`` peer handles, ``mpi``, the ``gather_op``."""
 
 
+#: The attached requirements other than the DWDP group size, which has a test of its own.
+_ATTACHED_MODE = [
+    _Violation("tp_size", "this launch has dwdp_config with tp_size=2", mapping={"tp_size": 2}),
+    _Violation(
+        "overlap_scheduler",
+        "this launch has dwdp_config with disable_overlap_scheduler=False",
+        args={"disable_overlap_scheduler": False},
+    ),
+]
+
+#: The requirements of both modes, in the order the gate checks them.
+_COMMON = [
+    _Violation(
+        "cuda_graph_config",
+        "requires cuda_graph_config=None, but cuda_graph_config is set",
+        args={"cuda_graph_config": CudaGraphConfig()},
+    ),
+    _Violation(
+        "torch_compile_config",
+        "requires torch_compile_config=None, but torch_compile_config is set",
+        args={"torch_compile_config": TorchCompileConfig()},
+    ),
+    _Violation(
+        "prefill_cuda_graph_backend",
+        "requires prefill_cuda_graph_backend='disabled', but prefill_cuda_graph_backend=",
+        args={"prefill_cuda_graph_backend": PrefillCudaGraphBackend.BREAKABLE},
+    ),
+    _Violation(
+        "sleep_config",
+        "requires sleep_config=None, but sleep_config is set",
+        args={"sleep_config": SleepConfig()},
+    ),
+    _Violation(
+        "lora_config",
+        "requires lora_config=None, but lora_config is set",
+        args={"lora_config": LoraConfig()},
+    ),
+    _Violation(
+        "speculative_config",
+        "requires speculative_config=None, but speculative_config is set",
+        args={"speculative_config": MTPDecodingConfig(max_draft_len=1)},
+    ),
+    _Violation(
+        "enable_locality_domains",
+        "requires enable_locality_domains=False, but enable_locality_domains=True",
+        args={"enable_locality_domains": True},
+    ),
+    _Violation("pp_size", "requires pp_size=1, but pp_size=2", mapping={"pp_size": 2}),
+    _Violation("cp_size", "requires cp_size=1, but cp_size=2", mapping={"cp_size": 2}),
+    _Violation(
+        "peer_handle_type",
+        "requires FABRIC peer handles (CU_MEM_HANDLE_TYPE_FABRIC), but this host shares "
+        "CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR handles",
+        lacks=frozenset({"fabric"}),
+    ),
+]
+
+_CASES = [(ATTACHED, violation) for violation in _ATTACHED_MODE] + [
+    (mode, violation) for mode in MODES for violation in _COMMON
+]
+_CASE_IDS = [f"{mode.value}-{violation.name}" for mode, violation in _CASES]
+
+
 def _check(monkeypatch, mode: DenseMode, violation: _Violation | None = None) -> DenseMode:
     """Run the gate on the accepted launch of ``mode`` changed by ``violation``."""
     violation = violation or _Violation("none", "")
@@ -176,6 +248,15 @@ def test_dense_gate_requires_a_dwdp_group(monkeypatch, dwdp_config, mapping, act
     violation = _Violation("group", "", args={"dwdp_config": dwdp_config}, mapping=mapping)
     with pytest.raises(ValueError, match=re.escape(f"but this launch has {actual}.")):
         _check(monkeypatch, ATTACHED, violation)
+
+
+@pytest.mark.parametrize("mode, violation", _CASES, ids=_CASE_IDS)
+def test_dense_gate_names_the_violated_requirement(monkeypatch, mode, violation):
+    with pytest.raises(ValueError, match=re.escape(violation.message)) as error:
+        _check(monkeypatch, mode, violation)
+    message = str(error.value)
+    assert message.startswith(f"Dense DWDP ({DENSE_ENV}) ")
+    assert message.endswith(REJECTION_END)
 
 
 @pytest.mark.parametrize("value", ["bogus", "batch", "per-slice", "copy_engine"])

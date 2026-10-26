@@ -34,9 +34,11 @@
   forward); default 0.
 * ``TRTLLM_DWDP_DENSE_COPY`` -- the transfer of standalone dense DWDP, on the dense manager's own
   copy stream: ``batched`` (default; one ``cudaMemcpyBatchAsync`` per layer on the copy engines),
-  ``per_slice`` or ``gather`` (the SM fabric gather; experimental standalone: it holds SMs next to
-  the MoE all-to-all).  The gate rejects an invalid value standalone.  With expert DWDP the dense
-  copies follow the expert transfer, and the gate warns that any value, valid or not, is ignored.
+  ``per_slice`` or ``gather`` (the SM fabric gather, which holds SMs next to the MoE all-to-all;
+  validated on Rubin with ``TRTLLM_DWDP_GATHER_KERNEL=tma`` and
+  ``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``).  The gate rejects an invalid value standalone.  With
+  expert DWDP the dense copies follow the expert transfer, and the gate warns that any value,
+  valid or not, is ignored.
 
 Booleans accept ``1/true/yes/on`` and ``0/false/no/off`` (any case); unset or empty means the
 default.  A flag that defaults to off is on only for an explicit true value; any other value logs

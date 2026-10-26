@@ -83,7 +83,7 @@ def validate_dense_gate(llm_args: TorchLlmArgs, mapping: Mapping) -> DenseMode:
     5. Standalone only: the MPI backend (``TLLM_DISABLE_MPI`` unset), since the dense group is an
        MPI sub-communicator over the attention-DP group; and with ``TRTLLM_DWDP_DENSE_COPY=gather``
        a registered ``trtllm::dwdp_fabric_gather``.  A standalone gather launch that passes logs
-       one warning: the gather is experimental without expert DWDP.
+       one warning, which names the settings the gather was validated with.
 
     Args:
         llm_args: The launch configuration.
@@ -173,9 +173,11 @@ def _check_standalone(copy_mode: CopyMode) -> None:
             "this build does not register it",
         )
     logger.warning(
-        f"{LOG_PREFIX} {DENSE_COPY_ENV}=gather is experimental without expert DWDP: the gather "
-        f"kernel holds SMs next to the MoE all-to-all, a combination not validated yet; batched, "
-        f"the default, runs on the copy engines"
+        f"{LOG_PREFIX} {DENSE_COPY_ENV}=gather without expert DWDP: the gather kernel holds SMs "
+        f"next to the MoE all-to-all. It was validated on a Rubin DEP16 context server with "
+        f"TRTLLM_DWDP_GATHER_KERNEL=tma and TLLM_ROUTING_DISABLE_COOP_LAUNCH=1, the latter of "
+        f"which the setup applies unless it is set: cooperative routing waits for the SMs the "
+        f"gather holds"
     )
 
 
