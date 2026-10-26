@@ -97,8 +97,12 @@ constexpr int CONSUMER_GROUPS = 2;         // two 128-thread consumer groups
 constexpr int CONSUMER_THREADS_PER_GROUP = CONSUMER_THREADS / CONSUMER_GROUPS;
 constexpr int FIRST_USER_NAMED_BARRIER = 8;
 
+// The token term is formed in 64 bits. The candidate term, source * block_stride_r, is formed in CandidateStride: it
+// reaches (N - 2) * T * H elements, so invokeAttnResPersistentFusedFwd passes the stride as int only where that product
+// fits in int, and as long long otherwise (from T = 42800 at N = 9).
+template <typename CandidateStride>
 __device__ __forceinline__ bf16_t const* residual_addr(bf16_t const* block_res, bf16_t const* layer_res, int source,
-    int N, int token, int block_stride_m, int block_stride_r, int H)
+    int N, int token, int block_stride_m, CandidateStride block_stride_r, int H)
 {
     if (source < N - 1)
     {
@@ -308,19 +312,19 @@ __device__ __forceinline__ void cp_async_bulk(void* smem_dst, void const* gmem_s
 }
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, int B = 1, bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
-__global__ void __launch_bounds__(BLK, 1)
-    attn_res_fwd_persistent_fused_kernel(bf16_t const* __restrict__ block_res, bf16_t const* __restrict__ layer_res,
-        // Diverges from the source copy, which folded the residual add in place on
-        // layer_res. TensorRT-LLM's attn_res_add_rmsnorm_fwd returns the updated
-        // prefix sum as a new tensor. Note that recovering the in-place form by
-        // passing layer_res here is NOT valid: both pointers are __restrict__, so
-        // the compiler may assume the read and the store do not overlap. That the
-        // consumed value comes from the TMA'd shared-memory copy rather than a
-        // reload of layer_res removes one hazard, not the no-alias contract.
-        bf16_t* __restrict__ updated_layer_res, bf16_t const* __restrict__ delta, bf16_t const* __restrict__ res_w,
-        bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output, int T, int block_stride_m, int block_stride_r,
-        float rms_eps, bf16_t const* __restrict__ output_norm_weight, float output_norm_eps)
+    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false, typename CandidateStride = int>
+__global__ void __launch_bounds__(BLK, 1) attn_res_fwd_persistent_fused_kernel(bf16_t const* __restrict__ block_res,
+    bf16_t const* __restrict__ layer_res,
+    // Diverges from the source copy, which folded the residual add in place on
+    // layer_res. TensorRT-LLM's attn_res_add_rmsnorm_fwd returns the updated
+    // prefix sum as a new tensor. Note that recovering the in-place form by
+    // passing layer_res here is NOT valid: both pointers are __restrict__, so
+    // the compiler may assume the read and the store do not overlap. That the
+    // consumed value comes from the TMA'd shared-memory copy rather than a
+    // reload of layer_res removes one hazard, not the no-alias contract.
+    bf16_t* __restrict__ updated_layer_res, bf16_t const* __restrict__ delta, bf16_t const* __restrict__ res_w,
+    bf16_t const* __restrict__ rms_w, bf16_t* __restrict__ output, int T, int block_stride_m,
+    CandidateStride block_stride_r, float rms_eps, bf16_t const* __restrict__ output_norm_weight, float output_norm_eps)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1100
     constexpr float LOG2_E = 1.4426950408889634f;
@@ -1038,18 +1042,18 @@ __global__ void __launch_bounds__(BLK, 1)
 }
 
 template <int H, int N, int NC = N_CHUNK_DEFAULT, bool RELEASE_TMEM = false, bool HAS_DELTA = false,
-    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false>
+    bool HAS_OUTPUT_NORM = false, bool OUTPUT_NORM_IN_SMEM = false, typename CandidateStride = int>
 static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residual, bf16_t* updated_layer_residual,
     bf16_t const* delta, bf16_t const* res_weight, bf16_t const* rms_weight, bf16_t* output, int T, float rms_eps,
     int num_sm, cudaStream_t stream, bf16_t const* output_norm_weight = nullptr, float output_norm_eps = 0.f,
-    int block_stride_m = 0, int block_stride_r = 0)
+    int block_stride_m = 0, CandidateStride block_stride_r = 0)
 {
     constexpr size_t smem_size
         = ((size_t) CHUNK_DEPTH * (NC + (HAS_DELTA ? 1 : 0)) * H * sizeof(bf16_t)
               + (OUTPUT_NORM_IN_SMEM ? (size_t) H * sizeof(bf16_t) : 0) + sizeof(FwdSmemPlan<NC>) + 15)
         & ~size_t(15);
     auto kernel = &attn_res_fwd_persistent_fused_kernel<H, N, NC, 1, RELEASE_TMEM, HAS_DELTA, HAS_OUTPUT_NORM,
-        OUTPUT_NORM_IN_SMEM>;
+        OUTPUT_NORM_IN_SMEM, CandidateStride>;
     // Diverges from the source copy, which used a plain `static bool attrs_set`:
     // that is neither thread-safe nor per-device, so on a multi-GPU process the
     // first caller can leave every other device without the opt-in and the launch
@@ -1071,6 +1075,10 @@ static void launch_fwd(bf16_t const* block_residual, bf16_t const* layer_residua
         }
     }
     int grid = RELEASE_TMEM ? num_sm * 2 : num_sm;
+    // The token index is int in both stride forms: each CTA steps it by the grid size until it is no longer below T,
+    // so its largest value is T - 1 + grid.
+    TLLM_CHECK_WITH_INFO(static_cast<long long>(T) - 1 + grid <= std::numeric_limits<int>::max(),
+        "attn_res persistent fused: T=%d overflows the kernel's int token index with a grid of %d CTAs", T, grid);
     cudaLaunchConfig_t config{};
     config.gridDim = grid;
     config.blockDim = BLK;
@@ -1139,22 +1147,18 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
     // candidate step is T * H. The source copy carried a token-major bank and
     // therefore takes both strides as arguments; passing ours keeps the kernel
     // body unchanged.
+    //
+    // residual_addr scales the candidate step by sources up to N - 2. Where the
+    // step and that largest offset both fit in int, the kernel takes the step
+    // as int, otherwise as long long. Both forms compute the same addresses;
+    // every shape that fit in int before keeps the int code it ran, and only
+    // the shapes that overflowed take the long long form. launch_fwd checks
+    // the bound on T that applies to both.
     int const T = params.seqLen;
     int const block_stride_m = 7168;
     long long const block_stride_r = static_cast<long long>(T) * 7168;
-    TLLM_CHECK_WITH_INFO(block_stride_r <= std::numeric_limits<int>::max(),
-        "attn_res persistent fused: candidate stride %lld overflows the kernel's int stride", block_stride_r);
-    // One candidate step is not the largest address the kernel forms.
-    // ``residual_addr`` widens the token term but evaluates
-    // ``source * block_stride_r`` in int arithmetic, and ``source`` reaches
-    // ``numCandidates - 2`` (the ``source < N - 1`` branch). With N == 9 that
-    // product overflows from T == 42801 upward and the load leaves
-    // blockResidual. Persistent topology accepts any token count, so nothing
-    // upstream bounds T.
-    long long const max_candidate_offset = block_stride_r * (params.numCandidates - 2);
-    TLLM_CHECK_WITH_INFO(max_candidate_offset <= std::numeric_limits<int>::max(),
-        "attn_res persistent fused: candidate offset %lld (T=%d, N=%d) overflows the kernel's int stride",
-        max_candidate_offset, T, params.numCandidates);
+    bool const int_candidate_stride = block_stride_r <= std::numeric_limits<int>::max()
+        && block_stride_r * (params.numCandidates - 2) <= std::numeric_limits<int>::max();
 
     bool const has_delta = params.layerResidualAdd != nullptr;
     auto launch = [&](auto nsrc_tok, auto nc_tok, auto release_tmem_tok)
@@ -1165,10 +1169,22 @@ void invokeAttnResPersistentFusedFwd(AttnResFwdParams const& params, cudaStream_
         auto go = [&](auto has_delta_tok)
         {
             constexpr bool HAS_DELTA = decltype(has_delta_tok)::value;
-            launch_fwd<7168, NSRC, NC, RELEASE_TMEM, HAS_DELTA, /*HAS_OUTPUT_NORM=*/true,
-                /*OUTPUT_NORM_IN_SMEM=*/true>(params.blockResidual, params.layerResidual, params.updatedLayerResidual,
-                params.layerResidualAdd, params.resWeight, params.rmsWeight, params.output, T, params.rmsEps, num_sm,
-                stream, params.outputRmsWeight, params.outputRmsEps, block_stride_m, static_cast<int>(block_stride_r));
+            auto launch_with_stride = [&](auto candidate_stride)
+            {
+                launch_fwd<7168, NSRC, NC, RELEASE_TMEM, HAS_DELTA, /*HAS_OUTPUT_NORM=*/true,
+                    /*OUTPUT_NORM_IN_SMEM=*/true, decltype(candidate_stride)>(params.blockResidual,
+                    params.layerResidual, params.updatedLayerResidual, params.layerResidualAdd, params.resWeight,
+                    params.rmsWeight, params.output, T, params.rmsEps, num_sm, stream, params.outputRmsWeight,
+                    params.outputRmsEps, block_stride_m, candidate_stride);
+            };
+            if (int_candidate_stride)
+            {
+                launch_with_stride(static_cast<int>(block_stride_r));
+            }
+            else
+            {
+                launch_with_stride(block_stride_r);
+            }
         };
         if (has_delta)
         {
