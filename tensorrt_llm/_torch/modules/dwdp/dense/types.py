@@ -27,6 +27,8 @@ This module holds what more than one part of the implementation reads or writes:
 * the per-(layer, segment) row layout, the store offsets and chunks (:class:`DenseLayout`),
 * slot specifications and slot buffers,
 * copy descriptors and per-layer copy plans,
+* the forward protocols of the runtime and the static copy schedule of the closed one
+  (:func:`closed_schedule`),
 * the CUDA seams the runtime calls, with their torch implementation (:class:`TorchCudaOps`),
 * alignment constants, checksums and exceptions.
 
@@ -43,7 +45,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 import torch
 from torch import nn
@@ -973,6 +975,130 @@ class LayerCopyPlan:
 LayerLauncher = Callable[[int], None]
 
 # ---------------------------------------------------------------------------
+# Forward protocols and the closed schedule
+# ---------------------------------------------------------------------------
+
+
+class DenseProtocol(str, enum.Enum):
+    """How the runtime orders a forward's copies and reads against those of other forwards.
+
+    The dense manager picks one per process: ``CLOSED`` for standalone dense DWDP with a
+    ``cuda_graph_config`` (graph mode), ``LEGACY`` otherwise.
+    """
+
+    LEGACY = "legacy"
+    """Eager forwards on one stream; the dense manager primes the first two layers at H0 and
+    recovers an aborted forward with a WAR barrier there."""
+
+    CLOSED = "closed"
+    """Every forward, eager, captured or replayed, starts and ends in the boundary state B, between
+    ``DenseDWDP.begin_forward`` (H0) and ``DenseDWDP.end_forward`` (H4), so a CUDA graph replay
+    needs no host work."""
+
+
+class PrimePolicy(str, enum.Enum):
+    """Where the closed protocol gathers the first two covered layers.
+
+    The values are the strings ``TRTLLM_DWDP_DENSE_PRIME`` uses.
+    """
+
+    WRAP = "wrap"
+    """In the previous forward, at H3 of its last covered layers, overlapping its tail."""
+
+    ENTRY = "entry"
+    """In the forward itself, at H0."""
+
+
+class ForwardState(str, enum.Enum):
+    """Where the closed protocol stands between and inside forwards."""
+
+    IDLE = "idle"
+    """Between forwards, in the boundary state B."""
+
+    OPEN = "open"
+    """From H0 to H3 of the last covered layer."""
+
+    TAIL = "tail"
+    """From H3 of the last covered layer to H4: final norm, LM head, speculative worker."""
+
+    BROKEN = "broken"
+    """A capture aborted, or recovering an aborted forward failed; the next eager forward or
+    ``DenseDWDP.recover`` returns to B."""
+
+
+#: The hook of a closed-schedule gather (see :class:`ScheduleEntry`).
+ScheduleHook = Literal["H0", "H2", "H3"]
+
+
+@dataclass(frozen=True)
+class ScheduleEntry:
+    """One gather of the closed schedule: ``hook`` of ``trigger_layer`` gathers ``target_layer``.
+
+    Attributes:
+        hook: ``"H0"`` (forward entry, ``ENTRY`` priming), ``"H2"`` (after the attention call) or
+            ``"H3"`` (after the MoE block, ``WRAP`` priming of the next forward).
+        trigger_layer: The covered layer whose hook gathers; None for ``"H0"``.
+        target_layer: The covered layer gathered into its slots.
+    """
+
+    hook: ScheduleHook
+    trigger_layer: int | None
+    target_layer: int
+
+
+def closed_schedule(
+    layers: Sequence[int], segments: Sequence[SegmentKind], prime: PrimePolicy
+) -> tuple[ScheduleEntry, ...]:
+    """The gathers of one closed-protocol forward, in copy-stream (deadline) order.
+
+    With ``n`` covered layers at positions ``0 .. n-1``: ``ENTRY`` gathers positions 0 and 1 at
+    H0; H2 of position ``p`` gathers position ``p + 2`` while it exists, as in the legacy protocol;
+    ``WRAP`` gathers the next forward's positions 0 and 1 at H3 of the last position that reads
+    their slots in an enabled segment, position 1 no earlier than position 0.  Every covered layer
+    is gathered once per forward.  For Kimi-K3 (layers 1..92) the wrap gathers ``L(1)`` at H3(91)
+    and ``L(2)`` at H3(92), into the slots ``L(91)`` and ``L(92)`` held; with three layers both at
+    H3 of the third, as the first one's attention slot then holds ``L(3)``; with two layers each
+    at its own H3.  The schedule depends on nothing else, neither batch size, graph nor draft
+    length.
+
+    Args:
+        layers: Covered layers, ascending.
+        segments: Enabled segment kinds.
+        prime: Priming policy.
+
+    Raises:
+        ValueError: ``layers`` is empty, ``segments`` lacks ``ATTN``, or a segment or ``prime`` is
+            not a valid value.
+    """
+    covered = tuple(layers)
+    kinds = tuple(SegmentKind(kind) for kind in segments)
+    if not covered or SegmentKind.ATTN not in kinds:
+        raise ValueError(
+            f"the closed schedule needs covered layers and the attention segment, got "
+            f"{len(covered)} layers and segments {[kind.value for kind in kinds]}"
+        )
+    prime = PrimePolicy(prime)
+    count = len(covered)
+    entries = []
+    if prime is PrimePolicy.ENTRY:
+        entries.extend(ScheduleEntry("H0", None, layer) for layer in covered[:2])
+    entries.extend(
+        ScheduleEntry("H2", covered[position], covered[position + 2])
+        for position in range(count - 2)
+    )
+    if prime is PrimePolicy.WRAP:
+        trigger = 0
+        for target in range(min(2, count)):
+            for kind in kinds:
+                depth = RING_DEPTH[kind]
+                slot = target % depth
+                # The last position that reads the target's slot of this segment.
+                trigger = max(trigger, slot + (count - 1 - slot) // depth * depth)
+            entries.append(ScheduleEntry("H3", covered[trigger], covered[target]))
+    return tuple(entries)
+
+
+# ---------------------------------------------------------------------------
 # CUDA seams of the runtime
 # ---------------------------------------------------------------------------
 
@@ -990,6 +1116,10 @@ class StreamLike(Protocol):
 
     def wait_event(self, event: EventLike) -> None:
         """Make future work on this stream wait for the event's most recent record."""
+        ...
+
+    def wait_stream(self, stream: StreamLike) -> None:
+        """Make future work on this stream wait for the work enqueued on ``stream`` so far."""
         ...
 
 

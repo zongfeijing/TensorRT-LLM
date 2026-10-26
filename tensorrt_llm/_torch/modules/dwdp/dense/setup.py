@@ -14,7 +14,7 @@
 # limitations under the License.
 """Dense DWDP setup: phases P1-P6 over five fixed collectives.
 
-Setup runs once per context worker, after the model is fully loaded and post-processed: from
+Setup runs once per worker, after the model is fully loaded and post-processed: from
 ``DwdpManager.setup`` before the expert DWDP setup (with expert DWDP, so the commit returns the
 replicated dense weights to the driver before the expert prefetch ring is allocated), or from
 ``manager.DenseDwdpManager.setup`` (standalone, over the attention-DP group).  Each phase's local
@@ -26,7 +26,7 @@ the same verdict from the same gathered payloads.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 import torch
@@ -46,10 +46,12 @@ from .types import (
     Checksum,
     DenseLayout,
     DenseLayoutError,
+    DenseProtocol,
     DenseSetupError,
     DeviceOps,
     LayerCopyPlan,
     LayerLauncher,
+    PrimePolicy,
     SegmentKind,
     SlotBuffer,
     StreamLike,
@@ -60,6 +62,11 @@ from .watchdog import SlotWatchdog
 
 #: Free device memory P1 requires on top of the store and the slots.
 SETUP_HEADROOM_BYTES = 2 << 30
+
+#: The class attribute a decoder layer sets to True to declare that its forward keeps the dense
+#: DWDP aux-stream contract: every read of a covered weight on an aux stream forks after H1 and
+#: joins the compute stream before H2 (attention) or H3 (MoE-dense).
+MULTI_STREAM_SAFE_ATTR = "DENSE_DWDP_MULTI_STREAM_SAFE"
 
 #: The phase each collective concludes, by collective number.
 _COLLECTIVES = {
@@ -266,6 +273,8 @@ def setup_dense_dwdp(
     device: torch.device | None = None,
     launcher_factory: LauncherFactory | None = None,
     mem_get_info: MemGetInfo | None = None,
+    protocol: DenseProtocol = DenseProtocol.LEGACY,
+    prime: PrimePolicy = PrimePolicy.ENTRY,
 ) -> DenseDWDP | None:
     """Shard, verify and repoint the dense weights of ``model``.
 
@@ -273,19 +282,24 @@ def setup_dense_dwdp(
 
     1. P1: read the config, ``layout.collect_dense_layout`` over the decoder layers with the
        ``dense_dwdp_attr_allow`` / ``dense_dwdp_exclude`` tables the layers carry, check that the
-       covered layers are ``moe_layers`` (if given) and that ``free >= store + slots +
-       SETUP_HEADROOM_BYTES`` (``free`` read after ``torch.cuda.empty_cache()``), then
-       ``layout.compute_checksums``; no copies.  A rank that did not ask for dense DWDP does none
-       of this.  Data ``(requested, required, digest, checksums, store_bytes, slot_bytes,
-       free_bytes, strict)``.  No rank requested: return None and make no further collective.
-       Some did: every rank raises a configuration error, whatever ``required`` says.  All ok
-       with equal digests, ``strict`` and checksums: continue; else abandon.  The checksums catch
-       a dense tensor that has the same shape on every rank but other bytes, e.g. a
-       tensor-parallel shard.
+       covered layers are ``moe_layers`` (if given), under the ``CLOSED`` protocol audit the whole
+       ``model``, its draft model included, for modules, parameters and buffers under the dense
+       roots that it also reaches from outside them (``_check_root_sharing``), check that
+       ``free >= store + slots + SETUP_HEADROOM_BYTES`` (``free`` read after
+       ``torch.cuda.empty_cache()``), then ``layout.compute_checksums``; no copies.  A rank that
+       did not ask for dense DWDP does none of this.  Data ``(requested, required, digest,
+       checksums, store_bytes, slot_bytes, free_bytes, strict)``.  No rank requested: return None
+       and make no further collective.  Some did: every rank raises a configuration error,
+       whatever ``required`` says.  All ok with equal digests, ``strict`` and checksums:
+       continue; else abandon.  The checksums catch a dense tensor that has the same shape on
+       every rank but other bytes, e.g. a tensor-parallel shard.
     2. P2: allocate the store and the slots, write this rank's rows, ``synchronize``, construct
        the runtime on ``transfer.copy_stream`` (the first read of it; it records the consume
        events; with ``config.slot_watchdog`` it gets the slot checksum watchdog over the P1
-       checksums), export.  Data: the exported handles.
+       checksums, with its device assert if ``config.slot_watchdog_assert``) with ``protocol``,
+       ``prime`` and ``multi_stream_ok``, which is True when the class of every covered decoder
+       layer sets :data:`MULTI_STREAM_SAFE_ATTR` to True, then export.  Data: the exported
+       handles.
     3. P3: import and map the peers, build the plans and, with the copy stream current, the
        launcher; install it, ``synchronize``.  Doubles as the barrier after every write and
        mapping.
@@ -335,6 +349,9 @@ def setup_dense_dwdp(
             use_batched=transfer.use_batched_prefetch), device=device)``.
         mem_get_info: ``(free, total)`` device memory; ``torch.cuda.mem_get_info(device_id)`` if
             None.
+        protocol: The runtime's forward protocol: ``CLOSED`` for standalone dense DWDP with CUDA
+            graphs, ``LEGACY`` (the default) otherwise.
+        prime: The runtime's priming policy; ``ENTRY`` (the default) under ``LEGACY``.
 
     Returns:
         The committed runtime, or None when dense DWDP is off on every rank or was abandoned
@@ -366,6 +383,8 @@ def setup_dense_dwdp(
         ops=TorchCudaOps(device_id) if ops is None else ops,
         launcher_factory=_copy_launcher if launcher_factory is None else launcher_factory,
         mem_get_info=_device_mem_get_info(device_id) if mem_get_info is None else mem_get_info,
+        protocol=protocol,
+        prime=prime,
     )
     return run.run()
 
@@ -396,6 +415,8 @@ class _DenseSetup:
         ops: DeviceOps,
         launcher_factory: LauncherFactory,
         mem_get_info: MemGetInfo,
+        protocol: DenseProtocol,
+        prime: PrimePolicy,
     ) -> None:
         self._model = model
         self._transfer = transfer
@@ -411,6 +432,8 @@ class _DenseSetup:
         self._ops = ops
         self._launcher_factory = launcher_factory
         self._mem_get_info = mem_get_info
+        self._protocol = protocol
+        self._prime = prime
         self._started = time.monotonic()
         # Decided from collective #1; raising is the safe default until then.
         self._required = True
@@ -444,7 +467,7 @@ class _DenseSetup:
             off = [rank for rank, item in enumerate(data) if not item.requested]
             raise DenseSetupError(
                 f"TRTLLM_DWDP_DENSE differs across the DWDP group: on for {_ranks(on)}, off for "
-                f"{_ranks(off)}; set it the same on every context worker of the group"
+                f"{_ranks(off)}; set it the same on every worker of the group"
             )
         self._required = any(item.required for item in data)
         reason = _failures(reports) or _disagreement(self._layout, data)
@@ -515,7 +538,7 @@ class _DenseSetup:
     # ------------------------------------------------------------------
 
     def _collect(self) -> PhaseReport:
-        """P1, no copies: switches, collection, coverage, memory precheck, checksums."""
+        """P1, no copies: switches, collection, coverage, sharing, memory precheck, checksums."""
         if not self._requested:
             return PhaseReport(True, data=_NOT_REQUESTED)
         required = True if self._config is None else self._config.required
@@ -547,6 +570,8 @@ class _DenseSetup:
             )
             if self._moe_layers is not None:
                 _check_coverage(layout, self._moe_layers)
+            if self._protocol is DenseProtocol.CLOSED:
+                _check_root_sharing(self._model, self._decoder, layout)
             _check_free_memory(layout, free_bytes)
             compute_checksums(layout)
             data = _CollectData(
@@ -582,7 +607,9 @@ class _DenseSetup:
             self._ops.synchronize()
             watchdog = None
             if self._config.slot_watchdog:
-                watchdog = SlotWatchdog.from_layout(layout, self._device)
+                watchdog = SlotWatchdog.from_layout(
+                    layout, self._device, device_assert=self._config.slot_watchdog_assert
+                )
             # The first read of the copy stream, which the transfer may create here: a failure
             # is this rank's P2 report.
             self._runtime = DenseDWDP(
@@ -594,6 +621,9 @@ class _DenseSetup:
                 strict=self._config.strict,
                 store=store,
                 watchdog=watchdog,
+                protocol=self._protocol,
+                prime=self._prime,
+                multi_stream_ok=_multi_stream_safe(self._decoder, layout.layers),
             )
             payload = store.export()
         except Exception as exc:  # a local failure must reach collective #2, never skip it
@@ -826,6 +856,98 @@ def _check_coverage(layout: DenseLayout, moe_layers: Sequence[int]) -> None:
             f"{len(expected)}; they must be the same layers: only dense "
             f"{dense_only[:_MAX_LISTED]}, only expert {expert_only[:_MAX_LISTED]}"
         )
+
+
+def _check_root_sharing(model: nn.Module, decoder: nn.Module, layout: DenseLayout) -> None:
+    """P1 sharing audit: nothing under the dense roots is reachable from outside them.
+
+    Repointing keeps every ``nn.Parameter`` object and points its ``data`` at a slot, which the
+    model may read only inside the read window of the slot's layer.  A module, ``Parameter`` or
+    buffer under the roots of a covered layer that ``model`` also reaches another way, e.g. from
+    a drafter, an MTP head or another module of some layer, would be read outside that window,
+    at whatever layer the slot holds then; the release check at commit cannot see it, since the
+    moved storage dies as it should.  The walk is ``named_modules``, ``named_parameters`` and
+    ``named_buffers`` of the whole ``model`` with ``remove_duplicate=False``, so every path to an
+    object counts, and a path is inside when it runs through a covered root where the decoder
+    layer registers it.  A path through the root of another covered ``(layer, segment)`` counts
+    as inside too: the collector keeps every storage it meets under two of them replicated.  The
+    verdict depends only on the model code, so it is the same on every rank.  Only the ``CLOSED``
+    protocol runs it: graph mode is where a drafter runs next to the target model, and the
+    ``LEGACY`` setup stays as it was.
+
+    Raises:
+        DenseLayoutError: Something under the roots is reachable from outside them (named with
+            both paths; of a shared module, only the module); or the decoder is not a submodule
+            of ``model``.
+    """
+    decoder_path = next((path for path, module in model.named_modules() if module is decoder), None)
+    if decoder_path is None:
+        raise DenseLayoutError(
+            f"the decoder ({type(decoder).__name__}) is not a submodule of "
+            f"{type(model).__name__}, so the sharing audit cannot locate the dense roots"
+        )
+    root_paths: set[str] = set()
+    covered: dict[int, str] = {}
+    for layer in layout.layers:
+        decoder_layer = decoder.layers[layer]
+        for kind in layout.segment_kinds:
+            for name, root in decoder_layer.dense_dwdp_roots(kind.value):
+                root_path = _join_path(decoder_path, f"layers.{layer}", name)
+                root_paths.add(root_path)
+                for _, path, item in _reachable(root, root_path):
+                    covered.setdefault(id(item), path)
+    findings: list[str] = []
+    shared_modules: set[str] = set()
+    for kind, path, item in _reachable(model, ""):
+        home = covered.get(id(item))
+        if home is None or _under(path, root_paths) or _under(path, shared_modules):
+            continue
+        if kind == "module":
+            shared_modules.add(path)
+        findings.append(f"{kind} {home} is also {path}")
+    if findings:
+        raise DenseLayoutError(
+            f"{len(findings)} modules, parameters or buffers under the dense roots are also "
+            f"reachable from outside them, where they would be read outside their layer's read "
+            f"window once their weights move (e.g. a drafter sharing them with the target "
+            f"model): {_listing(findings)}"
+        )
+
+
+def _multi_stream_safe(decoder: nn.Module, layers: Sequence[int]) -> bool:
+    """Whether the class of every covered decoder layer sets :data:`MULTI_STREAM_SAFE_ATTR` True.
+
+    Under the ``CLOSED`` protocol the runtime refuses a forward with multi-stream execution on
+    unless it is.
+    """
+    return all(
+        getattr(type(decoder.layers[layer]), MULTI_STREAM_SAFE_ATTR, False) is True
+        for layer in layers
+    )
+
+
+def _reachable(module: nn.Module, prefix: str) -> Iterator[tuple[str, str, object]]:
+    """``(kind, path, object)`` for every path from ``module`` to a module, parameter or buffer."""
+    for path, item in module.named_modules(prefix=prefix, remove_duplicate=False):
+        yield "module", path, item
+    for path, item in module.named_parameters(prefix=prefix, remove_duplicate=False):
+        yield "parameter", path, item
+    for path, item in module.named_buffers(prefix=prefix, remove_duplicate=False):
+        yield "buffer", path, item
+
+
+def _under(path: str, prefixes: Collection[str]) -> bool:
+    """Whether ``path`` is one of the module paths ``prefixes`` or lies below one of them."""
+    current = ""
+    for part in path.split("."):
+        current = f"{current}.{part}" if current else part
+        if current in prefixes:
+            return True
+    return False
+
+
+def _join_path(*parts: str) -> str:
+    return ".".join(part for part in parts if part)
 
 
 def _check_free_memory(layout: DenseLayout, free_bytes: int) -> None:

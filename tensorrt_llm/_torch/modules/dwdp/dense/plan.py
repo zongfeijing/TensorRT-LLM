@@ -385,24 +385,139 @@ def _load_cudart() -> ModuleType:
     return cudart
 
 
+def _batched_copy_attributes(cudart: ModuleType) -> object:
+    """The ``cudaMemcpyAttributes`` of every batched dense copy: source access in stream order."""
+    attrs = cudart.cudaMemcpyAttributes()
+    attrs.srcAccessOrder = cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+    return attrs
+
+
 def _memcpy_batch(
     cudart: ModuleType,
     attrs: list[object],
     device: torch.device,
-    layer: int,
+    layer: int | None,
     copies: BatchedCopies,
 ) -> None:
-    """One ``cudaMemcpyBatchAsync`` of ``copies`` on the current stream of ``device``."""
+    """One ``cudaMemcpyBatchAsync`` of ``copies`` on the current stream of ``device``.
+
+    ``layer`` names the copy in the error: a covered layer, or None for the capture probe.
+    """
     dst_ptrs, src_ptrs, sizes = copies
     stream = torch.cuda.current_stream(device)
     (err,) = cudart.cudaMemcpyBatchAsync(
         dst_ptrs, src_ptrs, sizes, len(dst_ptrs), attrs, [0], 1, stream.cuda_stream
     )
     if err != cudart.cudaError_t.cudaSuccess:
+        what = "the capture probe" if layer is None else f"the dense DWDP copy of layer {layer}"
         raise RuntimeError(
-            f"cudaMemcpyBatchAsync failed for the dense DWDP copy of layer {layer} "
-            f"({len(dst_ptrs)} copies): {err}"
+            f"cudaMemcpyBatchAsync failed for {what} ({len(dst_ptrs)} copies): {err}"
         )
+
+
+#: The capture probe's batched copy: this many pieces of this many bytes.
+_PROBE_PIECES = 4
+_PROBE_PIECE_BYTES = 64 * 1024
+
+
+def batched_copy_capture_error(device: torch.device | None = None) -> str | None:
+    """Why ``cudaMemcpyBatchAsync`` cannot run inside a CUDA graph on this host; None if it can.
+
+    In graph mode the batched dense copies (``CopyMode.BATCHED``) are captured into every decode
+    CUDA graph, and whether a stream capture records ``cudaMemcpyBatchAsync`` depends on the CUDA
+    driver.  The probe captures one small batched copy, issued as :class:`DenseCopyLauncher`
+    issues it, into a throwaway graph on a side stream, replays it, and compares the copied
+    bytes.  The gate runs it for a graph-mode ``TRTLLM_DWDP_DENSE_COPY=batched`` launch, so that a
+    driver that cannot capture it fails the launch before the model is built, not in the first
+    CUDA graph capture.  Whatever the copy, the capture or the replay raises is reported, and the
+    capture ends in any case.
+
+    Args:
+        device: The CUDA device; the current one if None.
+
+    Returns:
+        None when the capture and its replay copy the bytes; otherwise what failed, with the CUDA
+        driver and runtime versions.
+    """
+    try:
+        cudart = _load_cudart()
+    except ImportError as exc:
+        return f"cuda.bindings.runtime is not available ({exc})"
+    if device is None or torch.device(device).index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+    error = None
+    with torch.cuda.device(device):
+        nbytes = _PROBE_PIECES * _PROBE_PIECE_BYTES
+        src = torch.randint(0, 256, (nbytes,), dtype=torch.uint8, device=device)
+        dst = torch.zeros_like(src)
+        offsets = [piece * _PROBE_PIECE_BYTES for piece in range(_PROBE_PIECES)]
+        copies = (
+            [dst.data_ptr() + offset for offset in offsets],
+            [src.data_ptr() + offset for offset in offsets],
+            [_PROBE_PIECE_BYTES] * _PROBE_PIECES,
+        )
+        stream = torch.cuda.Stream(device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            graph.capture_begin(capture_error_mode="thread_local")
+            try:
+                _memcpy_batch(cudart, [_batched_copy_attributes(cudart)], device, None, copies)
+            except Exception as exc:  # e.g. a binding that does not match: batched cannot run
+                error = f"cudaMemcpyBatchAsync failed in a CUDA graph capture: {exc}"
+            finally:
+                # Ended whatever the copy raised, so that no capture stays open.
+                try:
+                    graph.capture_end()
+                except Exception as exc:
+                    error = error or f"a CUDA graph capture of cudaMemcpyBatchAsync failed: {exc}"
+            if error is None:
+                try:
+                    graph.replay()
+                    stream.synchronize()
+                    if not torch.equal(dst, src):
+                        error = "a replayed cudaMemcpyBatchAsync capture did not copy its bytes"
+                except Exception as exc:
+                    error = f"the replay of a captured cudaMemcpyBatchAsync failed: {exc}"
+        try:
+            graph.reset()
+        except Exception:  # cleanup of a throwaway graph; the probe's verdict stands
+            pass
+    if error is None:
+        return None
+    return f"{error} ({_cuda_versions(cudart)})"
+
+
+def _cuda_versions(cudart: ModuleType) -> str:
+    """The CUDA driver and runtime versions, and the NVIDIA driver's when NVML reports it."""
+
+    def version(query: Callable[[], tuple]) -> str:
+        try:
+            err, value = query()
+        except Exception:  # a version for an error message; never the error itself
+            return "unknown"
+        if err != cudart.cudaError_t.cudaSuccess:
+            return "unknown"
+        return f"{value // 1000}.{value % 1000 // 10}"
+
+    versions = (
+        f"CUDA driver {version(cudart.cudaDriverGetVersion)}, "
+        f"CUDA runtime {version(cudart.cudaRuntimeGetVersion)}"
+    )
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        try:
+            driver = pynvml.nvmlSystemGetDriverVersion()
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception:  # NVML is optional here
+        return versions
+    if isinstance(driver, bytes):
+        driver = driver.decode()
+    return f"{versions}, NVIDIA driver {driver}"
 
 
 def _descriptor_views(
@@ -504,8 +619,7 @@ class DenseCopyLauncher:
                 raise DenseSetupError(
                     f"the batched dense copy needs cuda.bindings.runtime: {exc}"
                 ) from exc
-            attrs = cudart.cudaMemcpyAttributes()
-            attrs.srcAccessOrder = cudart.cudaMemcpySrcAccessOrder.cudaMemcpySrcAccessOrderStream
+            attrs = _batched_copy_attributes(cudart)
 
             def prepare(plan: LayerCopyPlan) -> Callable[[], None]:
                 return functools.partial(

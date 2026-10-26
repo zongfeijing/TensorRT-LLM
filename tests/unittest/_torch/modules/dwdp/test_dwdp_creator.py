@@ -14,18 +14,26 @@
 # limitations under the License.
 """PyExecutor construction tests for DWDP: manager ownership and the dense DWDP mode.
 
-The dense DWDP gate's own rules and texts are tested in ``test_dense_gate.py``.
+Also the standalone dense DWDP launch: graph mode and the SM reserve MegaMoE is built with.  The
+dense DWDP gate's own rules and texts are tested in ``test_dense_gate.py``.
 """
 
+import contextlib
 import os
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tensorrt_llm._torch.cute_dsl_utils import sm_reserve
 from tensorrt_llm._torch.distributed import MPIDist
-from tensorrt_llm._torch.modules.dwdp.dense.config import DENSE_ENV
+from tensorrt_llm._torch.modules.dwdp.dense.config import (
+    DENSE_COPY_ENV,
+    DENSE_ENV,
+    DENSE_REQUIRED_ENV,
+)
 from tensorrt_llm._torch.modules.dwdp.dense.manager import (
     get_global_dense_dwdp_manager,
     set_global_dense_dwdp_manager,
@@ -39,7 +47,7 @@ from tensorrt_llm._torch.pyexecutor.dwdp import (
 )
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
-from tensorrt_llm.llmapi.llm_args import DwdpConfig
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, DwdpConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -214,13 +222,19 @@ class _DenseRuntime:
 
 
 def _final_executor_llm_args(
-    dwdp_config: DwdpConfig | None = None, *, disable_overlap_scheduler: bool = True
+    dwdp_config: DwdpConfig | None = None,
+    *,
+    disable_overlap_scheduler: bool = True,
+    moe_backend: str = "AUTO",
+    cuda_graph_config: CudaGraphConfig | None = None,
 ) -> SimpleNamespace:
     """The ``llm_args`` fields ``_create_py_executor_impl`` reads to its end.
 
     Args:
         dwdp_config: The expert DWDP configuration; None runs without expert DWDP.
         disable_overlap_scheduler: Whether the overlap scheduler is off.
+        moe_backend: ``moe_config.backend``.
+        cuda_graph_config: The decode CUDA graphs; None runs without them.
     """
     kv_cache_config = SimpleNamespace(
         enable_block_reuse=True,
@@ -260,7 +274,8 @@ def _final_executor_llm_args(
             calibration_file_path=None,
             calibration_layer_indices=None,
         ),
-        cuda_graph_config=None,
+        moe_config=SimpleNamespace(backend=moe_backend),
+        cuda_graph_config=cuda_graph_config,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),
     )
@@ -356,6 +371,9 @@ def _create_final_executor(
     disable_overlap_scheduler: bool = True,
     start_worker_error: Exception | None = None,
     log: list[tuple] | None = None,
+    moe_backend: str = "AUTO",
+    cuda_graph_config: CudaGraphConfig | None = None,
+    on_model_build: Callable[[], None] | None = None,
 ) -> _Creation:
     """Run ``create_py_executor`` to its end with DWDP in ``mode``.
 
@@ -371,6 +389,9 @@ def _create_final_executor(
         start_worker_error: What the final executor's ``start_worker`` raises; None: it starts.
         log: The call log to fill; a new one if None.  A test whose creation raises passes its
             own, to read it afterwards.
+        moe_backend: ``moe_config.backend``.
+        cuda_graph_config: The decode CUDA graphs; None runs without them.
+        on_model_build: Called when the stand-in ``PyTorchModelEngine`` builds the model.
     """
     log = [] if log is None else log
     managers = []
@@ -378,8 +399,9 @@ def _create_final_executor(
     class StandaloneManager:
         """Stands in for ``DenseDwdpManager``; ``setup`` would need a group and a GPU."""
 
-        def __init__(self, mode, *, mapping=None):
+        def __init__(self, mode, *, mapping=None, graph_mode=False):
             log.append(("DenseDwdpManager", mode, mapping))
+            self.graph_mode = graph_mode
             managers.append(self)
 
         def __enter__(self):
@@ -495,20 +517,25 @@ def _create_final_executor(
     )
     # PyExecutor.shutdown synchronizes the device when CUDA is available.
     monkeypatch.setattr(py_executor_creator.torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(
-        py_executor_creator,
-        "PyTorchModelEngine",
-        lambda **kwargs: _DummyModelEngine(
+
+    def model_engine(**kwargs):
+        if on_model_build is not None:
+            on_model_build()
+        return _DummyModelEngine(
             attn_runtime_features=kwargs["attn_runtime_features"], is_generation=is_generation
-        ),
-    )
+        )
+
+    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", model_engine)
     monkeypatch.setattr(
         py_executor_creator, "create_py_executor_instance", create_py_executor_instance
     )
 
     executor = py_executor_creator.create_py_executor(
         llm_args=_final_executor_llm_args(
-            dwdp_config, disable_overlap_scheduler=disable_overlap_scheduler
+            dwdp_config,
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            moe_backend=moe_backend,
+            cuda_graph_config=cuda_graph_config,
         ),
         checkpoint_dir=None,
     )
@@ -659,3 +686,100 @@ def test_with_kv_cache_estimation_only_the_final_executor_gets_the_dwdp_manager(
         ("start_worker",),
     ]
     _check_the_final_executor_drives_the_dwdp_manager(run, mode)
+
+
+# ----------------------------------------------------------------------
+# Standalone dense DWDP: graph mode and the SM reserve MegaMoE is built with
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cuda_graph_config", [None, CudaGraphConfig()], ids=["eager", "graphs"])
+def test_the_standalone_manager_runs_in_graph_mode_only_with_cuda_graph_config(
+    monkeypatch, cuda_graph_config
+):
+    run = _create_final_executor(
+        monkeypatch, "standalone", estimating=False, cuda_graph_config=cuda_graph_config
+    )
+
+    assert run.manager.graph_mode is (cuda_graph_config is not None)
+
+
+@pytest.fixture
+def megamoe_reserves(monkeypatch) -> list[int]:
+    """The SM reserves MegaMoE is built with; ``megamoe_occupancy_sm_reserve`` returns the first.
+
+    A test appends ``sm_reserve()`` when the stand-in model engine builds the model, as MegaMoE's
+    first occupancy query records it.  The gather's variables start unset and are restored after
+    the test, whatever the creator sets.
+    """
+    for name in (
+        "TRTLLM_CUTEDSL_SM_RESERVE",
+        "TRTLLM_CUTEDSL_DENSE_GEMM_SCHEDULER",
+        "TRTLLM_DWDP_GATHER_BLOCKS",
+        "TLLM_ROUTING_DISABLE_COOP_LAUNCH",
+    ):
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    reserves = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op.megamoe_occupancy_sm_reserve",
+        lambda: reserves[0] if reserves else None,
+    )
+    return reserves
+
+
+@pytest.mark.parametrize(
+    "backend, copy, explicit, built_with",
+    [
+        ("MEGAMOE_CUTEDSL", "gather", None, 30),
+        ("MEGAMOE_CUTEDSL", "gather", "46", 46),
+        ("MEGAMOE_CUTEDSL", "batched", None, 0),
+        ("CUTEDSL", "gather", None, 0),
+    ],
+    ids=["megamoe_gather", "explicit_reserve", "batched", "cutedsl_moe"],
+)
+def test_only_megamoe_with_the_gather_is_built_with_the_gather_reserve(
+    monkeypatch, megamoe_reserves, backend, copy, explicit, built_with
+):
+    """MegaMoE keeps the occupancy of its first query, so the reserve is set before the model.
+
+    A reserve the launch sets wins.  Any other launch keeps the reserve where standalone setup
+    sets it, after the weights load.
+    """
+    monkeypatch.setenv(DENSE_COPY_ENV, copy)
+    if explicit is not None:
+        monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", explicit)
+
+    _create_final_executor(
+        monkeypatch,
+        "standalone",
+        estimating=False,
+        moe_backend=backend,
+        on_model_build=lambda: megamoe_reserves.append(sm_reserve()),
+    )
+
+    assert megamoe_reserves == [built_with]
+
+
+@pytest.mark.parametrize("required", [True, False], ids=["required", "not_required"])
+def test_megamoe_built_without_the_gather_reserve_fails_a_launch_that_requires_dense_dwdp(
+    monkeypatch, megamoe_reserves, required
+):
+    """As when MegaMoE queried its occupancy before the creator set the reserve; else logged."""
+    monkeypatch.setenv(DENSE_COPY_ENV, "gather")
+    monkeypatch.setenv(DENSE_REQUIRED_ENV, "1" if required else "0")
+    megamoe_reserves.append(0)
+    error = MagicMock()
+    monkeypatch.setattr(py_executor_creator.logger, "error", error)
+    expectation = (
+        pytest.raises(RuntimeError, match="TRTLLM_CUTEDSL_SM_RESERVE")
+        if required
+        else contextlib.nullcontext()
+    )
+
+    with expectation:
+        _create_final_executor(
+            monkeypatch, "standalone", estimating=False, moe_backend="MEGAMOE_CUTEDSL"
+        )
+
+    assert error.called is not required

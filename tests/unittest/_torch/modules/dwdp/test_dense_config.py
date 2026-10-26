@@ -19,6 +19,10 @@
   default-off flags stay off and ``TRTLLM_DWDP_DENSE_REQUIRED`` fails safe (stays on).
 * ``TRTLLM_DWDP_DENSE_SEGMENTS`` is a comma-separated, case-insensitive list that must include
   ``attn``; an invalid list raises.
+* ``TRTLLM_DWDP_DENSE_PRIME`` is read as set; ``DenseConfig.prime_policy`` parses it in any case,
+  defaults to ``wrap`` and raises on any other value, while reading the switches never does.
+* Each ``TRTLLM_DWDP_DENSE_DEBUG`` level adds to the one below: NaN slots, the slot watchdog, and
+  at 3 the watchdog's device assert.
 
 The switch tests pass an ``environ`` dict and do not touch
 the process environment.
@@ -28,11 +32,14 @@ import pytest
 
 from tensorrt_llm._torch.modules.dwdp.dense import config as dense_config
 from tensorrt_llm._torch.modules.dwdp.dense.config import (
+    DENSE_DEBUG_ENV,
+    DENSE_PRIME_ENV,
     DENSE_REQUIRED_ENV,
     DENSE_SEGMENTS_ENV,
     DenseConfig,
     parse_segments,
 )
+from tensorrt_llm._torch.modules.dwdp.dense.types import DEBUG_FILL_BYTE, PrimePolicy
 
 pytestmark = pytest.mark.cpu_only
 JUNK_VALUES = ["2", "enable", "y", "onn", "-1"]
@@ -81,3 +88,40 @@ def test_an_invalid_segment_list_raises(value):
         DenseConfig.from_env(_env(DENSE_SEGMENTS_ENV, value))
     with pytest.raises(ValueError, match="must list attn"):
         parse_segments(value)
+
+
+@pytest.mark.parametrize(
+    "value, policy",
+    [
+        (None, PrimePolicy.WRAP),
+        (" ", PrimePolicy.WRAP),
+        ("wrap", PrimePolicy.WRAP),
+        (" Entry ", PrimePolicy.ENTRY),
+        ("bogus", None),
+        ("wrap,entry", None),
+    ],
+)
+def test_prime_defaults_to_wrap_and_only_its_parse_rejects_junk(warnings, value, policy):
+    config = DenseConfig.from_env(_env(DENSE_PRIME_ENV, value))
+    assert warnings == []
+    if policy is None:
+        with pytest.raises(ValueError, match=f"{DENSE_PRIME_ENV}={value!r}"):
+            config.prime_policy()
+    else:
+        assert config.prime_policy() is policy
+
+
+@pytest.mark.parametrize(
+    "level, fill_byte, watchdog, device_assert",
+    [
+        ("0", 0, False, False),
+        ("1", DEBUG_FILL_BYTE, False, False),
+        ("2", DEBUG_FILL_BYTE, True, False),
+        ("3", DEBUG_FILL_BYTE, True, True),
+    ],
+)
+def test_each_debug_level_adds_to_the_one_below(level, fill_byte, watchdog, device_assert):
+    config = DenseConfig.from_env({DENSE_DEBUG_ENV: level})
+    assert config.slot_fill_byte == fill_byte
+    assert config.slot_watchdog is watchdog
+    assert config.slot_watchdog_assert is device_assert

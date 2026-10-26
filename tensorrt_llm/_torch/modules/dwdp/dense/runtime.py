@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dense DWDP runtime: slot rings, events and the per-layer hooks.
+"""Dense DWDP runtime: slot rings, events, the per-layer hooks and the forward protocols.
 
 Per covered layer ``l`` (``s_A`` and ``s_D`` are its slots in the attention and MoE-dense rings):
 
@@ -37,12 +37,34 @@ E(l+1), L(l+2), E(l+2), L(l+3) ...``, or the dense manager's own stream standalo
 release the runtime never synchronizes the host; every dependency is a stream wait on an event.
 The one exception is the slot watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2``
 (``watchdog.SlotWatchdog``), whose counters H3 of the last covered layer reads once per forward.
+
+That is the legacy protocol (``types.DenseProtocol.LEGACY``), which runs with expert DWDP and
+standalone without CUDA graphs: eager forwards on one stream.  Standalone with a
+``cuda_graph_config`` (graph mode) runs the closed protocol (``CLOSED``), under which every forward,
+eager, captured into a CUDA graph or replayed, starts and ends in the boundary state B, so a replay
+needs no host work and graphs, eager forwards and aborted forwards can follow each other in any
+order on the execution stream:
+
+* B: every copy enqueued so far is joined into the execution stream, every slot read enqueued so
+  far precedes every later copy, and with ``WRAP`` priming the slots of ``L(1)`` and ``L(2)`` hold
+  them.
+* H0 is :meth:`DenseDWDP.begin_forward`, at the causal LM's forward entry.  Its entry barrier
+  records consume events on the current stream, so the forward's first copies wait for every read
+  enqueued before it, replays included.  A capture first installs a fresh event set, so every wait
+  in the capture binds to a record made in it, and forks the copy stream into the capture.
+* H1-H3 run as above, but every copy is an entry of ``types.closed_schedule``: with ``ENTRY``
+  priming H0 gathers ``L(1), L(2)``, with ``WRAP`` H3 of the last layers gathers them for the next
+  forward, overlapping the LM head, the speculative worker and sampling.  H3 reads no watchdog.
+* H4 is :meth:`DenseDWDP.end_forward`, at the causal LM's forward exit: the current stream joins
+  the copy stream, and a capture restores the eager event set, which a capture never records.  An
+  eager forward that raised recovers there before its exception propagates.
 """
 
 from __future__ import annotations
 
 import enum
 import operator
+import traceback
 from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -54,14 +76,20 @@ from .types import (
     LOG_PREFIX,
     RING_DEPTH,
     SEGMENT_ORDER,
+    DenseProtocol,
     DenseProtocolError,
     DeviceOps,
     EventLike,
+    ForwardState,
     LayerLauncher,
+    PrimePolicy,
+    ScheduleEntry,
+    ScheduleHook,
     SegmentKind,
     SlotBuffer,
     StreamLike,
     TorchCudaOps,
+    closed_schedule,
     ring_slot,
 )
 
@@ -72,6 +100,9 @@ if TYPE_CHECKING:
 
 #: One slot: ``(segment, index in the segment's ring)``.
 _SlotKey = tuple[SegmentKind, int]
+
+#: The events of one segment kind's ring, per segment kind.
+_RingEvents = dict[SegmentKind, tuple[EventLike, ...]]
 
 
 class _Phase(enum.Enum):
@@ -125,18 +156,29 @@ class DenseDWDP:
 
     Lifecycle: constructed in setup P2 (records every consume event once on the current stream),
     :meth:`set_launcher` in P3, :meth:`fetch_blocking` in P4 and P5, :meth:`commit` in P6.  The
-    hooks, :meth:`prefetch`, :meth:`mark_primed` and :meth:`war_barrier` are valid only after
-    :meth:`commit`; :meth:`set_launcher` and :meth:`fetch_blocking` only before it.
+    hooks, :meth:`prefetch`, :meth:`mark_primed`, :meth:`war_barrier`, :meth:`begin_forward`,
+    :meth:`end_forward` and :meth:`recover` are valid only after :meth:`commit`;
+    :meth:`set_launcher` and :meth:`fetch_blocking` only before it.
     :meth:`release` is valid at any time; after it, every call named above raises
     :class:`~.types.DenseProtocolError`, while the introspection properties and methods keep
-    reporting the last state (:attr:`slots` is empty).  The forward needs eager execution on one
-    stream: H0 and H1 refuse a CUDA graph capture and multi-stream execution
-    (:meth:`require_eager`) before they record or enqueue anything.
+    reporting the last state (:attr:`slots` is empty).  Under the legacy protocol the forward
+    needs eager execution on one stream: H0 and H1 refuse a CUDA graph capture and multi-stream
+    execution (:meth:`require_eager`) before they record or enqueue anything.
+
+    Under the closed protocol (see the module docstring) a forward runs from
+    :meth:`begin_forward` to :meth:`end_forward`; :attr:`forward_state` is ``IDLE`` between
+    forwards, ``OPEN`` up to H3 of the last layer and ``TAIL`` up to H4, and H1-H3 raise outside
+    ``OPEN``.  The copies are exactly the closed schedule: the hooks take their gathers from it,
+    the runtime primes and recovers itself, so :meth:`prefetch`, :meth:`mark_primed` and
+    :meth:`war_barrier` raise, and inside a capture a demand fetch or fence fallback raises
+    whatever ``strict`` says, so a capture can only bake the schedule into a graph.
 
     With a ``watchdog`` (``TRTLLM_DWDP_DENSE_DEBUG=2``), H1 also enqueues on the compute stream a
     check of each slot it waited for against the layer's P1 checksum; H3 of the last layer reads the
     mismatch counters, which synchronizes the host once per forward, and logs every
-    ``(layer, segment)`` whose slot held other bytes (``strict``: raises).
+    ``(layer, segment)`` whose slot held other bytes (``strict``: raises).  Under the closed
+    protocol :meth:`poll_watchdog` reads them instead, after the forward, and with the watchdog's
+    ``device_assert`` (``DEBUG=3``) H4 enqueues a device assert that none mismatched.
 
     Args:
         layers: Covered layers, ascending; with expert DWDP the same list as the expert DWDP MoE
@@ -154,11 +196,19 @@ class DenseDWDP:
             constructor returns.
         watchdog: Slot checksum watchdog over the same layers and segments; owned and released by
             the runtime once the constructor returns.  None (the default) checks nothing.
+        protocol: The forward protocol; ``CLOSED`` only for standalone dense DWDP in graph mode.
+        prime: Closed protocol only: where the first two covered layers are gathered
+            (``TRTLLM_DWDP_DENSE_PRIME``).
+        multi_stream_ok: Closed protocol only: every covered layer declares that each read of its
+            dense weights on an auxiliary stream forks after H1 and joins the compute stream
+            before H2 (attention) or H3 (MoE-dense).  Without it, H0 refuses multi-stream
+            execution.
 
     Raises:
         ValueError: Empty, unsorted, duplicate or negative ``layers``; non-canonical
             ``segments``; rings that do not match the enabled segments, or a ring of the wrong
-            depth or order; no ``copy_stream``; a ``watchdog`` of other layers or segments.
+            depth or order; no ``copy_stream``; a ``watchdog`` of other layers or segments; an
+            unknown ``protocol`` or ``prime``.
     """
 
     def __init__(
@@ -172,6 +222,9 @@ class DenseDWDP:
         strict: bool = False,
         store: DenseShardStore | None = None,
         watchdog: SlotWatchdog | None = None,
+        protocol: DenseProtocol = DenseProtocol.LEGACY,
+        prime: PrimePolicy = PrimePolicy.ENTRY,
+        multi_stream_ok: bool = False,
     ) -> None:
         covered = _covered_layers(layers)
         kinds = _segment_kinds(segments)
@@ -184,6 +237,8 @@ class DenseDWDP:
                 f"{[kind.value for kind in watchdog.segments]}, the runtime {list(covered)} and "
                 f"{[kind.value for kind in kinds]}"
             )
+        protocol = DenseProtocol(protocol)
+        prime = PrimePolicy(prime)
 
         self._ops: DeviceOps = TorchCudaOps() if ops is None else ops
         self._layers = covered
@@ -197,10 +252,10 @@ class DenseDWDP:
         self._copy_stream = copy_stream
         self._strict = bool(strict)
         self._slots: dict[SegmentKind, tuple[SlotBuffer, ...]] = rings
-        self._ready: dict[SegmentKind, tuple[EventLike, ...]] = {
+        self._ready: _RingEvents = {
             kind: tuple(self._ops.new_event() for _ in rings[kind]) for kind in kinds
         }
-        self._consume: dict[SegmentKind, tuple[EventLike, ...]] = {
+        self._consume: _RingEvents = {
             kind: tuple(self._ops.new_event() for _ in rings[kind]) for kind in kinds
         }
         self._fence: EventLike = self._ops.new_event()
@@ -221,13 +276,34 @@ class DenseDWDP:
         self._bindings: DenseBindings | None = None
         self._store = store
         self._watchdog = watchdog
+        self._protocol = protocol
+        self._prime_policy = prime
+        self._multi_stream_ok = bool(multi_stream_ok)
+        self._schedule: tuple[ScheduleEntry, ...] = ()
+        # Closed protocol: the layers each ``(hook, trigger layer)`` gathers, in schedule order.
+        self._gathers: dict[tuple[ScheduleHook, int | None], tuple[int, ...]] = {}
+        if protocol is DenseProtocol.CLOSED:
+            self._schedule = closed_schedule(covered, kinds, prime)
+            for entry in self._schedule:
+                key = (entry.hook, entry.trigger_layer)
+                self._gathers[key] = self._gathers.get(key, ()) + (entry.target_layer,)
+        self._state = ForwardState.IDLE
+        # The eager event set while a capture's own set is installed, else None.
+        self._eager_events: tuple[_RingEvents, _RingEvents, EventLike] | None = None
+        self._capturing = False
+        self._forked = False
+        self._captures = 0
+        self._recoveries = 0
+        self._eager_forwards = 0
         self._record_consume_events()
         # Set last: ``__del__`` releases nothing of an object whose constructor raised.
         self._phase = _Phase.SETUP
+        priming = f" with {prime.value} priming" if protocol is DenseProtocol.CLOSED else ""
         logger.debug(
             f"{LOG_PREFIX} runtime: {len(covered)} layers {covered[0]}..{covered[-1]}, "
             f"segments {','.join(kind.value for kind in kinds)}, strict={int(self._strict)}, "
-            f"slot watchdog {'on' if watchdog is not None else 'off'}"
+            f"slot watchdog {'on' if watchdog is not None else 'off'}, {protocol.value} "
+            f"protocol{priming}"
         )
 
     # ------------------------------------------------------------------
@@ -260,6 +336,41 @@ class DenseDWDP:
         return self._forward_open
 
     @property
+    def protocol(self) -> DenseProtocol:
+        """The forward protocol."""
+        return self._protocol
+
+    @property
+    def prime_policy(self) -> PrimePolicy:
+        """Where the closed protocol gathers the first two covered layers; unused when legacy."""
+        return self._prime_policy
+
+    @property
+    def forward_state(self) -> ForwardState:
+        """Where the closed protocol stands.
+
+        Under the legacy protocol ``OPEN`` while :attr:`forward_open`, else ``IDLE``.
+        """
+        if self._protocol is DenseProtocol.LEGACY:
+            return ForwardState.OPEN if self._forward_open else ForwardState.IDLE
+        return self._state
+
+    @property
+    def captures(self) -> int:
+        """Forwards captured into a CUDA graph so far (closed protocol); replays count nothing."""
+        return self._captures
+
+    @property
+    def recoveries(self) -> int:
+        """Times :meth:`recover` ran so far (closed protocol); 0 after warmup in a healthy run."""
+        return self._recoveries
+
+    @property
+    def eager_forwards(self) -> int:
+        """Eager forwards begun so far (closed protocol): warmup, autotuning, fallback steps."""
+        return self._eager_forwards
+
+    @property
     def demand_fetches(self) -> int:
         """Fenced demand fetches at H1 so far; 0 after warmup in a healthy run."""
         return self._demand_fetches
@@ -271,15 +382,18 @@ class DenseDWDP:
 
     @property
     def watchdog_checks(self) -> int:
-        """Slot checks the watchdog enqueued at H1 so far; 0 without a watchdog."""
+        """Slot checks the watchdog enqueued at H1 so far; 0 without a watchdog.
+
+        Counted on the host, so a check that a CUDA graph replays counts once, at its capture.
+        """
         return 0 if self._watchdog is None else self._watchdog.checks
 
     @property
     def watchdog_mismatches(self) -> int:
         """Slot checks that found other bytes than their layer's, as of the watchdog's latest read.
 
-        The counters are read at H3 of the last covered layer and at :meth:`release`; 0 without a
-        watchdog.
+        The counters are read at H3 of the last covered layer (legacy protocol), by
+        :meth:`poll_watchdog` (closed protocol) and at :meth:`release`; 0 without a watchdog.
         """
         return 0 if self._watchdog is None else self._watchdog.mismatches
 
@@ -368,7 +482,8 @@ class DenseDWDP:
         event on the current stream -> ``primed`` and ``forward_open`` False.  The fill is
         enqueued on the current stream before the consume records, so the first copy into any
         slot waits for it.  Takes ownership of ``bindings``, which :meth:`release` detaches (None
-        when nothing is repointed, as in unit tests).
+        when nothing is repointed, as in unit tests).  Under the closed protocol with ``WRAP``
+        priming the first eager forward primes, so a capture must come after one.
 
         Raises:
             DenseProtocolError: No launcher, or called twice.
@@ -402,14 +517,16 @@ class DenseDWDP:
     def require_eager(self, hook: str) -> None:
         """Raise unless the current stream runs eagerly with multi-stream execution off.
 
-        The hooks keep host-side slot state and order the copies and the weight reads with
-        events they record in every forward.  Inside a CUDA graph capture those records and
-        copies would go into the graph instead of running, and the host state would describe
-        work that never ran; with multi-stream execution, reads would run on streams that no
-        event covers.  H0 (``DenseDwdpManager.ensure_primed``) calls this before it records or
-        enqueues anything, and H1 (:meth:`wait_layer`) before it waits: a refused hook records,
-        enqueues and changes nothing, so the next eager forward finds the state the refused hook
-        found.  Valid in every phase.
+        Legacy protocol only; the closed protocol captures the hooks on purpose and checks
+        multi-stream execution at :meth:`begin_forward`.  The legacy hooks keep host-side slot
+        state and order the copies and the weight reads with events they record in every
+        forward.  Inside a CUDA graph capture those records and copies would go into the graph
+        instead of running, and the host state would describe work that never ran; with
+        multi-stream execution, reads would run on streams that no event covers.  H0
+        (``DenseDwdpManager.ensure_primed``) calls this before it records or enqueues anything,
+        and H1 (:meth:`wait_layer`) before it waits: a refused hook records, enqueues and changes
+        nothing, so the next eager forward finds the state the refused hook found.  Valid in
+        every phase.
 
         Args:
             hook: The refused call, for the error message.
@@ -433,16 +550,17 @@ class DenseDWDP:
         """H1, before the layer's first statement: make compute wait for ``L(layer)``.
 
         Raises :class:`~.types.DenseProtocolError` if the current stream is capturing a CUDA graph
-        or ``ops.do_multi_stream()`` is on (:meth:`require_eager`).  If any enabled segment's
-        slot is not tagged ``layer`` (not primed, aborted forward, protocol bug), one fenced
-        demand fetch of ``L(layer)`` runs first and ``demand_fetches`` grows by one (``strict``:
-        raises instead, before anything is enqueued); a warning is logged at the 1st, 2nd, 4th,
-        8th, ... demand fetch.  Then compute waits every enabled segment's ``ready`` event, which
-        opens the read windows of the slots' holders (``opened`` True, ``consumed`` False until
-        H2 and H3; a holder that an earlier forward already read gets a new window).  For the
-        first layer it sets ``primed`` False and ``forward_open`` True.  Wrapped in the NVTX
-        range ``dwdp.dense.wait/L{layer}``.  With a watchdog, the check of every slot it waited
-        for is then enqueued on the current stream, inside the read windows, in the NVTX range
+        or ``ops.do_multi_stream()`` is on (:meth:`require_eager`; closed protocol: if no forward
+        is ``OPEN`` instead).  If any enabled segment's slot is not tagged ``layer`` (not primed,
+        aborted forward, protocol bug), one fenced demand fetch of ``L(layer)`` runs first and
+        ``demand_fetches`` grows by one (``strict`` or inside a capture: raises instead, before
+        anything is enqueued); a warning is logged at the 1st, 2nd, 4th, 8th, ... demand fetch.
+        Then compute waits every enabled segment's ``ready`` event, which opens the read windows
+        of the slots' holders (``opened`` True, ``consumed`` False until H2 and H3; a holder that
+        an earlier forward already read gets a new window).  For the first layer it sets
+        ``primed`` False and ``forward_open`` True.  Wrapped in the NVTX range
+        ``dwdp.dense.wait/L{layer}``.  With a watchdog, the check of every slot it waited for is
+        then enqueued on the current stream, inside the read windows, in the NVTX range
         ``dwdp.dense.watchdog/L{layer}``.
 
         Raises:
@@ -450,7 +568,10 @@ class DenseDWDP:
         """
         self._require_armed("wait_layer")
         position = self._position(layer)
-        self.require_eager(f"wait_layer(L{layer})")
+        if self._protocol is DenseProtocol.CLOSED:
+            self._require_open(f"wait_layer(L{layer})")
+        else:
+            self.require_eager(f"wait_layer(L{layer})")
         targets = self._targets[position]
         with self._ops.nvtx_range(f"dwdp.dense.wait/L{layer}"):
             stale = [(kind, slot) for kind, slot in targets if self._tag[kind][slot] != layer]
@@ -477,19 +598,25 @@ class DenseDWDP:
         Closes the read window that H1 opened for ``A(layer)``: records ``consume[ATTN][s]`` on
         the current stream and marks the slot consumed.  Then, if a covered layer two positions
         ahead exists, :meth:`prefetch`-es it, so the copy stream's wait binds to the record just
-        made.
+        made (closed protocol: the gathers the closed schedule gives this hook, the same ones).
 
         Raises:
             DenseProtocolError: The attention slot is not tagged ``layer``, or its read window is
                 not open because :meth:`wait_layer` (H1) did not open it since ``L(layer)`` was
                 enqueued or this hook already closed it (always a protocol bug, regardless of
                 ``strict``; raised before anything is recorded); before :meth:`commit`; an
-                uncovered layer.
+                uncovered layer; closed protocol: no forward is ``OPEN``.
         """
         self._require_armed("attention_done")
         position = self._position(layer)
+        closed = self._protocol is DenseProtocol.CLOSED
+        if closed:
+            self._require_open(f"attention_done(L{layer})")
         slot = ring_slot(SegmentKind.ATTN, position)
         self._close_window(SegmentKind.ATTN, slot, layer, "attention_done")
+        if closed:
+            self._gather("H2", layer)
+            return
         ahead = position + 2
         if ahead < len(self._layers):
             self._prefetch(self._layers[ahead], fence=False)
@@ -504,24 +631,40 @@ class DenseDWDP:
         an error naming every ``(layer, segment)`` whose slot held other bytes at H1 since the
         previous read.
 
+        Closed protocol: then the gathers the closed schedule gives this hook (``WRAP``: the next
+        forward's first layers, at the last layers); for the last layer ``forward_open`` False,
+        with ``WRAP`` ``primed`` True, and the state ``TAIL``.  It reads no watchdog counters.
+
         Raises:
             DenseProtocolError: The MoE-dense slot is not tagged ``layer``, or its read window is
                 not open (as for :meth:`attention_done`); before :meth:`commit`; an uncovered
                 layer; ``strict`` and the watchdog found mismatches (raised once the forward is
-                closed).
+                closed); closed protocol: no forward is ``OPEN``.
         """
         self._require_armed("layer_done")
         position = self._position(layer)
+        closed = self._protocol is DenseProtocol.CLOSED
+        if closed:
+            self._require_open(f"layer_done(L{layer})")
         if self._has_moe:
             slot = ring_slot(SegmentKind.MOE, position)
             self._close_window(SegmentKind.MOE, slot, layer, "layer_done")
-        if position == len(self._layers) - 1:
+        last = position == len(self._layers) - 1
+        if closed:
+            self._gather("H3", layer)
+            if last:
+                self._forward_open = False
+                if self._prime_policy is PrimePolicy.WRAP:
+                    self._mark_primed()
+                self._state = ForwardState.TAIL
+            return
+        if last:
             self._forward_open = False
             if self._watchdog is not None:
                 self._report_watchdog(self._watchdog.poll(), strict=self._strict)
 
     # ------------------------------------------------------------------
-    # Priming and recovery (driven by the dense manager)
+    # Legacy priming and recovery (driven by the dense manager)
     # ------------------------------------------------------------------
 
     def prefetch(self, layer: int) -> None:
@@ -537,37 +680,26 @@ class DenseDWDP:
         hold layers that nobody has read and are refilled without one.
 
         Raises:
-            DenseProtocolError: Before :meth:`commit`; an uncovered layer; ``strict`` and a target
-                slot's holder has an open read window.
+            DenseProtocolError: Before :meth:`commit`; the closed protocol, whose copies are the
+                closed schedule's only; an uncovered layer; ``strict`` and a target slot's holder
+                has an open read window.
         """
         self._require_armed("prefetch")
+        self._require_legacy("prefetch")
         self._prefetch(layer, fence=False)
 
     def mark_primed(self) -> None:
         """Record that the dense manager enqueued the first two layers (and their experts).
 
         Raises:
-            DenseProtocolError: Before :meth:`commit`; a forward is open (run
-                :meth:`war_barrier` first); the slots of the first two covered layers are not
-                tagged with them, i.e. :meth:`prefetch` did not enqueue them or a forward has
-                consumed them since.
+            DenseProtocolError: Before :meth:`commit`; the closed protocol, which primes itself;
+                a forward is open (run :meth:`war_barrier` first); the slots of the first two
+                covered layers are not tagged with them, i.e. :meth:`prefetch` did not enqueue
+                them or a forward has consumed them since.
         """
         self._require_armed("mark_primed")
-        if self._forward_open:
-            raise DenseProtocolError(
-                "mark_primed while a forward is open; war_barrier must run before re-priming"
-            )
-        missing = [
-            f"L({layer}) {kind.value}[{slot}] holds {self._holder(kind, slot)}"
-            for position, layer in enumerate(self._layers[:2])
-            for kind, slot in self._targets[position]
-            if self._tag[kind][slot] != layer
-        ]
-        if missing:
-            raise DenseProtocolError(
-                f"mark_primed but the first layers are not enqueued: {'; '.join(missing)}"
-            )
-        self._primed = True
+        self._require_legacy("mark_primed")
+        self._mark_primed()
 
     def war_barrier(self) -> None:
         """Recover after a forward aborted between H1 of the first and H3 of the last layer.
@@ -580,14 +712,178 @@ class DenseDWDP:
         re-records the two expert consume events alongside.
 
         Raises:
-            DenseProtocolError: Before :meth:`commit`.
+            DenseProtocolError: Before :meth:`commit`; the closed protocol, whose recovery is
+                :meth:`recover`.
         """
         self._require_armed("war_barrier")
+        self._require_legacy("war_barrier")
         self._record_consume_events()
         self._reset_slot_state()
         self._primed = False
         self._forward_open = False
         logger.info(f"{LOG_PREFIX} WAR barrier after an aborted forward; slots reset")
+
+    # ------------------------------------------------------------------
+    # Closed protocol (driven by DenseDwdpManager.forward_scope and its replay guard)
+    # ------------------------------------------------------------------
+
+    def begin_forward(self) -> None:
+        """H0 of the closed protocol, at the causal LM's forward entry.
+
+        Refuses multi-stream execution (``ops.do_multi_stream()``) without ``multi_stream_ok``.
+        Then, if the current stream is capturing a CUDA graph: refuses unless in the boundary
+        state B (``IDLE``, and ``primed`` exactly under ``WRAP``); saves the eager event set and
+        installs a new one from ``ops.new_event()``; records each of its consume and ready events
+        on the capture stream (entry barrier), so that every wait of the capture binds to a record
+        made in it; records a fork event there and makes the copy stream wait for it, which joins
+        the copy stream to the capture.  Eagerly: joins the copy stream if the previous forward
+        missed H4 (``TAIL``) and recovers (:meth:`recover`) if it ended in any state but
+        ``IDLE``; under ``WRAP`` primes and joins if not primed (only the first forward after
+        commit); records every consume event on the current stream (entry barrier), so that the
+        forward's first copies follow every read enqueued before it, those of replays included.
+        Finally, under ``ENTRY``, gathers ``L(first)`` and ``L(second)``; the state is ``OPEN``.
+        Refusals record nothing; any other failure leaves the state ``BROKEN`` (a capture's own
+        event set uninstalled).
+
+        Raises:
+            DenseProtocolError: The legacy protocol; before :meth:`commit` or after
+                :meth:`release`; multi-stream execution without ``multi_stream_ok``; a capture
+                outside the boundary state B.
+        """
+        self._require_closed("begin_forward")
+        if self._ops.do_multi_stream() and not self._multi_stream_ok:
+            raise DenseProtocolError(
+                "begin_forward with multi-stream execution on, but the covered layers do not "
+                "declare that their auxiliary-stream reads of dense weights join the compute "
+                "stream inside the read windows (DENSE_DWDP_MULTI_STREAM_SAFE)"
+            )
+        capturing = self._ops.is_current_stream_capturing()
+        if capturing:
+            self._require_boundary()
+        try:
+            if capturing:
+                self._begin_capture()
+            else:
+                self._begin_eager()
+            if self._prime_policy is PrimePolicy.ENTRY:
+                self._gather("H0", None)
+        except BaseException:
+            if self._capturing:
+                self._abort_capture()
+            else:
+                self._state = ForwardState.BROKEN
+            raise
+        self._state = ForwardState.OPEN
+
+    def end_forward(self, ok: bool) -> None:
+        """H4 of the closed protocol, at the causal LM's forward exit, after the speculative worker.
+
+        ``ok``: the current stream waits for the copy stream (join), so every copy of the forward,
+        the next forward's ``WRAP`` gathers included, precedes later work on it; with the
+        watchdog's ``device_assert`` (``DEBUG=3``) a device assert that no slot check mismatched
+        follows; a capture then restores the eager event set and counts in :attr:`captures`.  The
+        state is ``IDLE``: B again.
+
+        Not ``ok`` (the forward raised): inside a capture, host only: best-effort join, so that the
+        capture can end and report the forward's error, the eager event set restored, the state
+        ``BROKEN``.  Eagerly, :meth:`recover` runs in place unless the forward never began; if it
+        fails too, its error is logged and the state is ``BROKEN``, so the caller's exception
+        propagates and the next forward, or the replay guard, recovers again.
+
+        Raises:
+            DenseProtocolError: The legacy protocol; before :meth:`commit` or after
+                :meth:`release`; ``ok`` before H3 of the last covered layer (the forward is
+                aborted as for not ``ok`` first).
+        """
+        self._require_closed("end_forward")
+        if not ok:
+            self._abort_forward()
+            return
+        if self._state is not ForwardState.TAIL:
+            state = self._state
+            self._abort_forward()
+            raise DenseProtocolError(
+                f"end_forward in forward state {state.value}: H3 of the last covered layer "
+                f"L{self._layers[-1]} did not run since begin_forward"
+            )
+        try:
+            self._join()
+            watchdog = self._watchdog
+            if watchdog is not None and watchdog.device_assert:
+                watchdog.assert_clean_async()
+        except BaseException:
+            self._abort_forward()
+            raise
+        if self._capturing:
+            self._restore_eager_events()
+            self._captures += 1
+            if self._captures == 1:
+                logger.info(
+                    f"{LOG_PREFIX} dense schedule captured in-graph: {len(self._schedule)} "
+                    f"layer copies, {self._prime_policy.value} priming"
+                )
+        self._state = ForwardState.IDLE
+
+    def recover(self) -> None:
+        """Return to the boundary state B on the current stream, eagerly (closed protocol).
+
+        For an eager forward that aborted, a capture that aborted (``BROKEN``) or a state the
+        replay guard finds wrong.  Records every consume event of the eager event set on the
+        current stream (WAR barrier: later copies follow every read enqueued so far); every tag
+        ``EMPTY_TAG``, no read window open, ``primed`` and ``forward_open`` False; under ``WRAP``
+        gathers ``L(first)`` and ``L(second)``, behind any copy a dead forward left on the copy
+        stream, and marks them primed; then the current stream joins the copy stream.  The state
+        is ``BROKEN`` until it succeeds, then ``IDLE``.
+
+        Raises:
+            DenseProtocolError: The legacy protocol; before :meth:`commit` or after
+                :meth:`release`; the current stream is capturing a CUDA graph.
+        """
+        self._require_closed("recover")
+        if self._ops.is_current_stream_capturing():
+            raise DenseProtocolError(
+                "recover() while the current stream is capturing a CUDA graph; dense DWDP "
+                "recovers eagerly on the execution stream"
+            )
+        if self._eager_events is not None:
+            self._restore_eager_events()
+        self._recoveries += 1
+        self._state = ForwardState.BROKEN
+        self._record_consume_events()
+        self._reset_slot_state()
+        self._primed = False
+        self._forward_open = False
+        if self._prime_policy is PrimePolicy.WRAP:
+            self._prime()
+        self._join()
+        self._state = ForwardState.IDLE
+        _warn_sparsely(
+            f"recovered from an aborted forward: WAR barrier, slots reset, copy stream joined "
+            f"(recovery #{self._recoveries})",
+            self._recoveries,
+        )
+
+    def poll_watchdog(self) -> list[Finding]:
+        """Read the slot watchdog's counters and report new mismatches; a no-op while capturing.
+
+        The closed protocol's per-forward read, after the forward (the legacy protocol reads at H3
+        of the last layer).  Synchronizes the host with the current stream and logs an error
+        naming every ``(layer, segment)`` whose slot held other bytes at H1 since the previous
+        read; the device counters include the checks of replayed CUDA graphs.
+
+        Returns:
+            ``(layer, segment, mismatches)`` per pair whose counter grew; [] without a watchdog or
+            while the current stream is capturing a CUDA graph.
+
+        Raises:
+            DenseProtocolError: ``strict`` and new mismatches.
+        """
+        watchdog = self._watchdog
+        if watchdog is None or self._ops.is_current_stream_capturing():
+            return []
+        findings = watchdog.poll()
+        self._report_watchdog(findings, strict=self._strict)
+        return findings
 
     def _prefetch(self, layer: int, *, fence: bool) -> None:
         """Enqueue ``L(layer)``: the one place that launches a copy under the event protocol.
@@ -721,6 +1017,40 @@ class DenseDWDP:
             raise DenseProtocolError(f"dense DWDP {action} called before commit")
         raise DenseProtocolError(f"dense DWDP {action} called after release")
 
+    def _require_closed(self, action: str) -> None:
+        self._require_armed(action)
+        if self._protocol is not DenseProtocol.CLOSED:
+            raise DenseProtocolError(
+                f"dense DWDP {action} belongs to the closed protocol; this runtime runs the "
+                f"legacy one"
+            )
+
+    def _require_legacy(self, action: str) -> None:
+        if self._protocol is not DenseProtocol.LEGACY:
+            raise DenseProtocolError(
+                f"dense DWDP {action} belongs to the legacy protocol; under the closed one every "
+                f"copy is an entry of the closed schedule, and begin_forward and recover prime"
+            )
+
+    def _require_open(self, action: str) -> None:
+        if self._state is not ForwardState.OPEN:
+            raise DenseProtocolError(
+                f"{action} in forward state {self._state.value}; under the closed protocol the "
+                f"layer hooks run between begin_forward (H0) and H3 of the last covered layer"
+            )
+
+    def _require_boundary(self) -> None:
+        """Refuse a capture unless the host is in the boundary state B."""
+        wrap = self._prime_policy is PrimePolicy.WRAP
+        if self._state is not ForwardState.IDLE or self._primed is not wrap:
+            raise DenseProtocolError(
+                f"begin_forward: a CUDA graph capture must start in the boundary state B "
+                f"({ForwardState.IDLE.value}, {'' if wrap else 'not '}primed with "
+                f"{self._prime_policy.value} priming), but the forward state is "
+                f"{self._state.value} and primed={self._primed}; an eager forward must precede "
+                f"the capture"
+            )
+
     def _phase_text(self) -> str:
         return "commit" if self._phase is _Phase.ARMED else "release"
 
@@ -802,14 +1132,123 @@ class DenseDWDP:
             self._opened[kind][:] = [False] * depth
             self._consumed[kind][:] = [True] * depth
 
+    def _mark_primed(self) -> None:
+        if self._forward_open:
+            raise DenseProtocolError(
+                "mark_primed while a forward is open; war_barrier must run before re-priming"
+            )
+        missing = [
+            f"L({layer}) {kind.value}[{slot}] holds {self._holder(kind, slot)}"
+            for position, layer in enumerate(self._layers[:2])
+            for kind, slot in self._targets[position]
+            if self._tag[kind][slot] != layer
+        ]
+        if missing:
+            raise DenseProtocolError(
+                f"mark_primed but the first layers are not enqueued: {'; '.join(missing)}"
+            )
+        self._primed = True
+
+    def _gather(self, hook: ScheduleHook, trigger: int | None) -> None:
+        """Enqueue the gathers the closed schedule gives ``hook`` of ``trigger``, in its order."""
+        for layer in self._gathers.get((hook, trigger), ()):
+            self._prefetch(layer, fence=False)
+
+    def _prime(self) -> None:
+        """Gather ``L(first)`` and ``L(second)`` between forwards and mark them primed."""
+        for layer in self._layers[:2]:
+            self._prefetch(layer, fence=False)
+        self._mark_primed()
+
+    def _join(self) -> None:
+        """Make the current stream wait for every copy enqueued so far."""
+        self._ops.current_stream().wait_stream(self._copy_stream)
+
+    def _begin_eager(self) -> None:
+        """H0 of an eager forward, up to the entry barrier; see :meth:`begin_forward`."""
+        if self._state is ForwardState.TAIL:
+            logger.warning(
+                f"{LOG_PREFIX} begin_forward after a forward that missed end_forward (H4); "
+                f"joining its copies"
+            )
+            self._join()
+        elif self._state is not ForwardState.IDLE:
+            self.recover()
+        if self._prime_policy is PrimePolicy.WRAP and not self._primed:
+            self._prime()
+            self._join()
+        self._record_consume_events()
+        self._eager_forwards += 1
+
+    def _begin_capture(self) -> None:
+        """H0 of a captured forward, up to the fork; see :meth:`begin_forward`."""
+        self._eager_events = (self._ready, self._consume, self._fence)
+        self._capturing = True
+        self._ready = self._new_ring_events()
+        self._consume = self._new_ring_events()
+        self._fence = self._ops.new_event()
+        current = self._ops.current_stream()
+        for kind in self._segments:
+            for event in (*self._consume[kind], *self._ready[kind]):
+                event.record(current)
+        fork = self._ops.new_event()
+        fork.record(current)
+        self._copy_stream.wait_event(fork)
+        self._forked = True
+
+    def _new_ring_events(self) -> _RingEvents:
+        return {
+            kind: tuple(self._ops.new_event() for _ in range(RING_DEPTH[kind]))
+            for kind in self._segments
+        }
+
+    def _restore_eager_events(self) -> None:
+        """Drop a capture's event set and reinstall the eager one."""
+        self._ready, self._consume, self._fence = self._eager_events
+        self._eager_events = None
+        self._capturing = False
+        self._forked = False
+
+    def _abort_forward(self) -> None:
+        """Close a forward that raised: host only inside a capture, else :meth:`recover`."""
+        if self._capturing or self._ops.is_current_stream_capturing():
+            self._abort_capture()
+        elif self._state is not ForwardState.IDLE:
+            try:
+                self.recover()
+            except Exception:  # the forward's own error propagates; the next forward recovers
+                self._state = ForwardState.BROKEN
+                logger.error(
+                    f"{LOG_PREFIX} recovering from an aborted forward failed; the next forward "
+                    f"or replay recovers again\n{traceback.format_exc()}"
+                )
+
+    def _abort_capture(self) -> None:
+        """End an aborted capture on the host: best-effort join, eager event set back, BROKEN."""
+        if self._forked:
+            try:
+                self._join()
+            except Exception as exc:  # the capture's own error is what the caller must see
+                logger.warning(
+                    f"{LOG_PREFIX} joining the copy stream of an aborted capture: {exc!r}"
+                )
+        if self._eager_events is not None:
+            self._restore_eager_events()
+        self._state = ForwardState.BROKEN
+
+    def _refusal(self, what: str) -> str:
+        if self._capturing:
+            return f"a CUDA graph capture forbids {what}, whatever TRTLLM_DWDP_DENSE_STRICT says"
+        return f"TRTLLM_DWDP_DENSE_STRICT forbids {what}"
+
     def _demand_fetch(self, layer: int, stale: Sequence[_SlotKey]) -> None:
         held = ", ".join(
             f"{kind.value}[{slot}] holds {self._holder(kind, slot)}" for kind, slot in stale
         )
-        if self._strict:
+        if self._strict or self._capturing:
             raise DenseProtocolError(
                 f"wait_layer(L{layer}): {held}; L({layer}) was not enqueued ahead and "
-                f"TRTLLM_DWDP_DENSE_STRICT forbids demand fetches"
+                f"{self._refusal('demand fetches')}"
             )
         self._demand_fetches += 1
         _warn_sparsely(
@@ -823,10 +1262,10 @@ class DenseDWDP:
         held = ", ".join(
             f"{kind.value}[{slot}] holds {self._holder(kind, slot)}" for kind, slot in reading
         )
-        if self._strict:
+        if self._strict or self._capturing:
             raise DenseProtocolError(
                 f"prefetch(L{layer}): {held}, whose read window opened at H1 and has no consume "
-                f"record; TRTLLM_DWDP_DENSE_STRICT forbids the fence fallback"
+                f"record; {self._refusal('the fence fallback')}"
             )
         self._war_fences += 1
         _warn_sparsely(

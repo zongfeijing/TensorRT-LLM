@@ -35,15 +35,28 @@ does not depend on ``DwdpManager``.
   ``TRTLLM_DWDP_DENSE_COPY``.  Priming enqueues ``L(first), L(second)``.  The final executor
   exits the manager at shutdown.
 
+Both modes run the ``LEGACY`` protocol (``types.DenseProtocol``): every forward runs eagerly, and
+priming happens before it.  Standalone with CUDA graphs (``graph_mode``, e.g. a generation
+server) runs the ``CLOSED`` protocol instead, in which every forward, eager, captured or
+replayed, starts and ends in the same boundary state, so a graph replays with no host work.  The
+model then runs its whole forward, the target model, ``lm_head`` and the spec worker, inside
+:meth:`DenseDwdpManager.forward_scope`, whose entry is H0 (``DenseDWDP.begin_forward``) and exit
+H4 (``DenseDWDP.end_forward``).  The CUDA graph runner calls :meth:`DenseDwdpManager.before_replay`
+before every graph replay, through the pre-replay hook that the model registers with
+:meth:`DenseDwdpManager.register_replay_guard`; it recovers a runtime left off the boundary state.
+The executor calls :meth:`DenseDwdpManager.after_forward` after every forward step, which polls
+the slot watchdog and reports the runtime's counters.
+
 The module imports no executor or model code.
 """
 
 from __future__ import annotations
 
+import contextlib
 import traceback
 import weakref
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Protocol
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import torch
 from torch import nn
@@ -64,7 +77,16 @@ from .setup import (
     refuse_dense_dwdp_without_roots,
     setup_dense_dwdp,
 )
-from .types import LOG_PREFIX, CopyMode, DenseMode, StreamLike
+from .types import (
+    LOG_PREFIX,
+    CopyMode,
+    DenseMode,
+    DenseProtocol,
+    DenseProtocolError,
+    ForwardState,
+    PrimePolicy,
+    StreamLike,
+)
 
 if TYPE_CHECKING:
     from mpi4py import MPI
@@ -97,6 +119,14 @@ def set_global_dense_dwdp_manager(manager: DenseDwdpManager | None) -> None:
 def get_global_dense_dwdp_manager() -> DenseDwdpManager | None:
     """The registered dense DWDP manager, or None; the model's hooks capture it when built."""
     return _global_dense_dwdp_manager
+
+
+class PreReplayHookRunner(Protocol):
+    """The ``CUDAGraphRunner`` call :meth:`DenseDwdpManager.register_replay_guard` makes."""
+
+    def register_pre_replay_hook(self, hook: Callable[..., None]) -> None:
+        """Run ``hook(key, num_tokens, static_tensors, current_inputs)`` before every replay."""
+        ...
 
 
 class ExpertPrefetcher(Protocol):
@@ -214,13 +244,17 @@ class DenseDwdpManager:
             attaches the runtime) or ``DenseMode.STANDALONE`` (:meth:`setup` sets it up).
         mapping: Standalone only, and required there: the instance's mapping, with
             ``enable_attention_dp`` and ``tp_size > 1``; the dense group is its tp group.
+        graph_mode: Standalone only: the instance runs CUDA graphs (``cuda_graph_config``), so
+            :meth:`setup` commits the runtime with the ``CLOSED`` protocol.
 
     Raises:
         ValueError: A standalone manager without such a mapping, or an attached one with a
-            mapping.
+            mapping or ``graph_mode``.
     """
 
-    def __init__(self, mode: DenseMode, *, mapping: Mapping | None = None) -> None:
+    def __init__(
+        self, mode: DenseMode, *, mapping: Mapping | None = None, graph_mode: bool = False
+    ) -> None:
         mode = DenseMode(mode)
         if mode is DenseMode.STANDALONE:
             if mapping is None or not mapping.enable_attention_dp or mapping.tp_size <= 1:
@@ -234,8 +268,14 @@ class DenseDwdpManager:
                 "an attached DenseDwdpManager takes no mapping: with expert DWDP, DwdpManager "
                 f"sets dense DWDP up over the DWDP group; got {_describe_mapping(mapping)}"
             )
+        elif graph_mode:
+            raise ValueError(
+                "an attached DenseDwdpManager has no graph mode: with expert DWDP, dense DWDP "
+                "runs without CUDA graphs"
+            )
         self._mode = mode
         self._mapping = mapping
+        self._graph_mode = bool(graph_mode)
         # The committed runtime; None before attach() or setup() commits one, when dense DWDP
         # is off or was abandoned, and after cleanup().
         self._dense: DenseDWDP | None = None
@@ -244,6 +284,16 @@ class DenseDwdpManager:
         # Standalone only: the model setup() committed the runtime for.
         self._model_ref: weakref.ReferenceType[nn.Module] | None = None
         self._closed = False
+        # CLOSED only: whether forward_scope() is open, i.e. H0 ran and H4 has not.
+        self._scope_open = False
+        # Standalone, from setup()'s switches: after_forward() polls the slot watchdog
+        # (TRTLLM_DWDP_DENSE_DEBUG >= 2).
+        self._poll_watchdog = False
+        # CLOSED only: forward steps after_forward() saw, the counters it saw last, how often
+        # they changed.
+        self._forwards = 0
+        self._counters = _Counters()
+        self._counter_changes = 0
 
     # ------------------------------------------------------------------
     # Global registration
@@ -273,6 +323,15 @@ class DenseDwdpManager:
     def mode(self) -> DenseMode:
         """Attached (with expert DWDP) or standalone."""
         return self._mode
+
+    @property
+    def graph_mode(self) -> bool:
+        """Whether the instance runs CUDA graphs; then setup commits the ``CLOSED`` protocol.
+
+        In graph mode the model runs its forward inside :meth:`forward_scope`, and
+        :meth:`prefetch_first_layers` does nothing.
+        """
+        return self._graph_mode
 
     @property
     def dense(self) -> DenseDWDP | None:
@@ -338,14 +397,17 @@ class DenseDwdpManager:
            zero-size tensors.
         4. A model without dense roots: ``refuse_dense_dwdp_without_roots`` (it raises unless
            ``TRTLLM_DWDP_DENSE_REQUIRED`` is off), then None, with no group and no collective.
-        5. The switches (``config``, or ``DenseConfig.from_env()``) and the device.
+        5. The switches (``config``, or ``DenseConfig.from_env()``) and the device.  The
+           protocol: in :attr:`graph_mode` ``CLOSED`` with ``config.prime_policy()``, else
+           ``LEGACY`` with ``ENTRY`` priming, whatever ``TRTLLM_DWDP_DENSE_PRIME`` says.
         6. The transfer (``transfer``, or :meth:`StandaloneTransfer.on_device` with
            ``config.standalone_copy_mode()``; no stream yet).
         7. One INFO line, so that ranks waiting for a peer in the next step show where they wait.
         8. The group: ``comm``, which the caller owns, or a new :func:`standalone_group`, the
            first collective of setup.
-        9. ``setup_dense_dwdp`` as rank ``mapping.tp_rank`` of ``mapping.tp_size``, without an
-           expert layer list.  A committed runtime is stored at once; with a gather transfer,
+        9. ``setup_dense_dwdp`` as rank ``mapping.tp_rank`` of ``mapping.tp_size`` with that
+           protocol, without an expert layer list.  A committed runtime is stored at once,
+           together with the switches :meth:`after_forward` reads; with a gather transfer,
            ``fabric_gather.apply_compute_side_defaults()`` follows, still before any GEMM is
            tuned.  A setup that commits nothing leaves the process environment as it was.
         10. A group this call created is freed, whatever happened; a failing ``Free`` is logged,
@@ -375,8 +437,8 @@ class DenseDwdpManager:
             RuntimeError: An attached manager; called after :meth:`cleanup`; a runtime is
                 committed for another model; or the model's dense weights were already moved.
                 Each is raised before any work.
-            ValueError: ``TRTLLM_DWDP_DENSE_SEGMENTS`` or ``TRTLLM_DWDP_DENSE_COPY`` is invalid
-                (the gate rejects both earlier).
+            ValueError: ``TRTLLM_DWDP_DENSE_SEGMENTS``, ``TRTLLM_DWDP_DENSE_COPY`` or, in graph
+                mode, ``TRTLLM_DWDP_DENSE_PRIME`` is invalid (the gate rejects them earlier).
             DenseSetupError: Setup failed or was abandoned with ``TRTLLM_DWDP_DENSE_REQUIRED``
                 on, or the model has no dense roots and it is on; raised after the group is
                 freed.
@@ -408,6 +470,11 @@ class DenseDwdpManager:
             config = DenseConfig.from_env()
         if device_id is None:
             device_id = torch.cuda.current_device()
+        if self._graph_mode:
+            protocol, prime = DenseProtocol.CLOSED, config.prime_policy()
+            graph_note = f"; CUDA graph mode: {protocol.value} protocol, {prime.value} priming"
+        else:
+            protocol, prime, graph_note = DenseProtocol.LEGACY, PrimePolicy.ENTRY, ""
         if transfer is None:
             transfer = StandaloneTransfer.on_device(config.standalone_copy_mode(), device_id)
         mapping = self._mapping
@@ -416,7 +483,7 @@ class DenseDwdpManager:
         )
         logger.info(
             f"{LOG_PREFIX} standalone setup: rank {mapping.tp_rank} of the {mapping.tp_size}-rank "
-            f"attention-DP group, {copy_mode.value} copies on the dense copy stream"
+            f"attention-DP group, {copy_mode.value} copies on the dense copy stream{graph_note}"
         )
         group = None
         if comm is None:
@@ -433,12 +500,15 @@ class DenseDwdpManager:
                 config=config,
                 store_factory=store_factory,
                 launcher_factory=launcher_factory,
+                protocol=protocol,
+                prime=prime,
             )
             if dense is not None:
                 # Stored before the group is freed: whatever Free does, the manager owns the
                 # runtime, so cleanup() (or the creator's rollback) releases it.
                 self._dense = dense
                 self._model_ref = weakref.ref(model)
+                self._poll_watchdog = config.slot_watchdog
                 if transfer.use_gather:
                     fabric_gather.apply_compute_side_defaults()
         finally:
@@ -458,35 +528,48 @@ class DenseDwdpManager:
         runtime, when the slots are already primed, or when a forward is still open: the
         previous forward aborted, and the model's :meth:`ensure_primed` recovers on the execution
         stream.  No read window is open while no forward is, so the stream this runs on needs no
-        fence.
+        fence.  Also a no-op in :attr:`graph_mode`: a ``CLOSED`` forward primes itself.
         """
         dense = self._dense
-        if dense is None or dense.forward_open or dense.primed:
+        if self._graph_mode or dense is None or dense.forward_open or dense.primed:
             return
         self._prime_all()
 
     def ensure_primed(self) -> None:
         """Model-side priming (H0): called at the model's forward entry while ``dense`` is set.
 
-        Runs on the execution stream, so it also covers the forwards the executor loop does not
-        prime: warmup, autotuning, KV-cache estimation and every forward of the overlap loop.  It
-        refuses a CUDA graph capture and multi-stream execution (``DenseDWDP.require_eager``)
-        before it records or enqueues anything, so a refused forward leaves the runtime as it
-        found it.  Then, if the previous forward aborted between its first and last covered
-        layer, it records a WAR barrier on this stream (every dense consume event; attached, then
-        the consume events of both expert slots), so the next copies wait for every read the
-        aborted forward enqueued.  Then it primes unless already primed.
+        ``LEGACY``: runs on the execution stream, so it also covers the forwards the executor
+        loop does not prime: warmup, autotuning, KV-cache estimation and every forward of the
+        overlap loop.  It refuses a CUDA graph capture and multi-stream execution
+        (``DenseDWDP.require_eager``) before it records or enqueues anything, so a refused
+        forward leaves the runtime as it found it.  Then, if the previous forward aborted between
+        its first and last covered layer, it records a WAR barrier on this stream (every dense
+        consume event; attached, then the consume events of both expert slots), so the next
+        copies wait for every read the aborted forward enqueued.  Then it primes unless already
+        primed.
+
+        ``CLOSED``: the entry of :meth:`forward_scope` (``DenseDWDP.begin_forward``) has already
+        readied the forward, so it only checks that the scope is open.
 
         Raises:
             RuntimeError: Dense DWDP is not active.
-            DenseProtocolError: The current stream is capturing a CUDA graph, or multi-stream
-                execution is on.
+            DenseProtocolError: ``LEGACY``: the current stream is capturing a CUDA graph, or
+                multi-stream execution is on.  ``CLOSED``: no forward scope is open, i.e. the
+                decoder model runs outside the forward that opens it.
         """
         dense = self._dense
         if dense is None:
             raise RuntimeError(
                 "DenseDwdpManager.ensure_primed() needs an active dense DWDP runtime"
             )
+        if self._graph_mode:
+            if not self._scope_open:
+                raise DenseProtocolError(
+                    f"{H0_HOOK} outside DenseDwdpManager.forward_scope: under the CLOSED protocol "
+                    f"the causal LM runs its decoder model, lm_head and spec worker inside the "
+                    f"scope, so the decoder model must not run on its own"
+                )
+            return
         dense.require_eager(H0_HOOK)
         if dense.forward_open:
             dense.war_barrier()
@@ -522,6 +605,140 @@ class DenseDwdpManager:
         dense.mark_primed()
 
     # ------------------------------------------------------------------
+    # CLOSED forwards (graph mode): H0 and H4, the replay guard, the step hook
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def forward_scope(self) -> Iterator[None]:
+        """H0 and H4 of a ``CLOSED`` forward, around the causal LM's whole forward.
+
+        The model runs its decoder model, ``lm_head`` and spec worker inside the scope, in eager
+        forwards, warmups and CUDA graph captures alike.  The scope calls
+        ``DenseDWDP.begin_forward()`` on entry and ``DenseDWDP.end_forward(ok)`` on exit, ``ok``
+        False when the body raised: the runtime then recovers (eager) or restores its host state
+        (capture), and the body's exception propagates as it is, also when ``end_forward`` fails
+        too (that failure is logged).  ``end_forward`` runs only once ``begin_forward`` has
+        returned.  Without a runtime, or outside graph mode (``LEGACY``: attached, or standalone
+        without CUDA graphs), the scope does nothing.
+
+        Raises:
+            DenseProtocolError: A scope is already open: forwards do not nest.  Otherwise what
+                ``begin_forward`` and ``end_forward(True)`` raise.
+        """
+        dense = self._closed_runtime()
+        if dense is None:
+            yield
+            return
+        if self._scope_open:
+            raise DenseProtocolError(
+                "DenseDwdpManager.forward_scope inside an open forward scope: a forward of the "
+                "CLOSED protocol does not nest in another"
+            )
+        dense.begin_forward()
+        self._scope_open = True
+        try:
+            yield
+        except BaseException:
+            self._scope_open = False
+            _end_aborted_forward(dense)
+            raise
+        self._scope_open = False
+        dense.end_forward(True)
+
+    def register_replay_guard(self, runner: PreReplayHookRunner) -> bool:
+        """Register :meth:`before_replay` as a pre-replay hook of a CUDA graph runner.
+
+        ``CUDAGraphRunner.replay`` runs its pre-replay hooks right before every graph replay, once
+        the static inputs are filled, on the stream the graph replays on.  The model registers the
+        guard from its ``register_cuda_graph_pre_replay_hooks``, which the decoder runner calls
+        when it creates its CUDA graph runner (Kimi-K3: ``KimiLinearForCausalLM``); a model with
+        pre-replay hooks of its own registers the guard first, so that they run from the boundary
+        state.  The hook looks :meth:`before_replay` up at every replay and ignores the hook
+        arguments.
+
+        Args:
+            runner: The CUDA graph runner whose replays the guard precedes.
+
+        Returns:
+            Whether a hook was registered: only in :attr:`graph_mode`, the one mode whose forwards
+            run in CUDA graphs.
+        """
+        if not self._graph_mode:
+            return False
+        runner.register_pre_replay_hook(self._replay_hook)
+        return True
+
+    def _replay_hook(self, *_hook_args: object) -> None:
+        """The pre-replay hook :meth:`register_replay_guard` registers."""
+        self.before_replay()
+
+    def before_replay(self) -> None:
+        """Replay guard: runs right before every CUDA graph replay (:meth:`register_replay_guard`).
+
+        A graph replays a ``CLOSED`` forward captured from the boundary state, so it may start
+        only from that state, ``forward_state`` IDLE.  Any other state (a recovery failed and
+        left the runtime BROKEN, or a forward did not end) is logged as an error, and
+        ``DenseDWDP.recover()`` runs on the current stream, the one the replay runs on, before
+        the replay.  One host check otherwise; nothing without a runtime or under ``LEGACY``.
+
+        Raises:
+            Whatever ``recover()`` raises; the graph must not replay then.
+        """
+        dense = self._closed_runtime()
+        if dense is None:
+            return
+        state = dense.forward_state
+        if state is ForwardState.IDLE:
+            return
+        logger.error(
+            f"{LOG_PREFIX} a CUDA graph is about to replay with the dense runtime {state.value}, "
+            f"not at a forward boundary; recovering before the replay"
+        )
+        dense.recover()
+
+    def after_forward(self) -> None:
+        """Executor hook after every forward step, a graph replay or an eager forward.
+
+        ``PyExecutor._forward_step`` calls it once the current stream waits for the execution
+        stream.  ``CLOSED`` only; a no-op otherwise:
+
+        * It logs the runtime's counters (captures, eager forwards, recoveries, demand fetches,
+          fence fallbacks) at the 1st, 2nd, 4th, 8th, ... step whose counters changed since the
+          previous step; :meth:`cleanup` logs them once more.
+        * With the slot watchdog (``TRTLLM_DWDP_DENSE_DEBUG >= 2``) it polls it
+          (``DenseDWDP.poll_watchdog``), a host synchronization once per step, which reports the
+          slots that held other bytes than their layer's since the previous poll.  A replay runs
+          the slot checks its capture enqueued, so the host-side check count does not grow with
+          replays.
+
+        Warmup forwards, and every forward of the executor that estimates the KV cache (it gets no
+        dense manager), are not steps: their counter changes and watchdog findings show at the
+        first step after them.
+
+        Raises:
+            DenseProtocolError: ``TRTLLM_DWDP_DENSE_STRICT`` and the watchdog found mismatches.
+        """
+        dense = self._closed_runtime()
+        if dense is None:
+            return
+        self._forwards += 1
+        counters = _Counters.of(dense)
+        if counters != self._counters:
+            self._counters = counters
+            self._counter_changes += 1
+            if self._counter_changes & (self._counter_changes - 1) == 0:
+                logger.info(f"{LOG_PREFIX} {self._describe_counters()}")
+        if self._poll_watchdog:
+            dense.poll_watchdog()
+
+    def _closed_runtime(self) -> DenseDWDP | None:
+        """The committed runtime if it runs the ``CLOSED`` protocol, i.e. in graph mode."""
+        return self._dense if self._graph_mode else None
+
+    def _describe_counters(self) -> str:
+        return f"counters after {self._forwards} forward steps: {self._counters.describe()}"
+
+    # ------------------------------------------------------------------
     # Teardown
     # ------------------------------------------------------------------
 
@@ -530,16 +747,55 @@ class DenseDwdpManager:
 
         The manager is closed and its state cleared first, then the runtime is released: it
         synchronizes the device, repoints the model's dense weights to zero-size tensors and
-        frees the staging slots and the row store.  The model keeps its ``_dense_dwdp_active``
-        mark, so weight reloads stay refused.  A release error propagates with the state already
-        cleared.  The expert weight manager is never released here.
+        frees the staging slots and the row store.  Under the ``CLOSED`` protocol one INFO line
+        with the runtime's counters comes first (see :meth:`after_forward`).  The model keeps its
+        ``_dense_dwdp_active`` mark, so weight reloads stay refused.  A release error propagates
+        with the state already cleared.  The expert weight manager is never released here.
         """
         self._closed = True
         dense, self._dense = self._dense, None
         self._expert = None
         self._model_ref = None
-        if dense is not None:
-            dense.release()
+        self._scope_open = False
+        if dense is None:
+            return
+        if self._graph_mode:
+            self._counters = _Counters.of(dense)
+            logger.info(f"{LOG_PREFIX} release: {self._describe_counters()}")
+        dense.release()
+
+
+class _Counters(NamedTuple):
+    """The runtime counters :meth:`DenseDwdpManager.after_forward` reports."""
+
+    captures: int = 0
+    eager_forwards: int = 0
+    recoveries: int = 0
+    demand_fetches: int = 0
+    war_fences: int = 0
+
+    @classmethod
+    def of(cls, dense: DenseDWDP) -> _Counters:
+        return cls(
+            captures=dense.captures,
+            eager_forwards=dense.eager_forwards,
+            recoveries=dense.recoveries,
+            demand_fetches=dense.demand_fetches,
+            war_fences=dense.war_fences,
+        )
+
+    def describe(self) -> str:
+        return " ".join(f"{name}={value}" for name, value in self._asdict().items())
+
+
+def _end_aborted_forward(dense: DenseDWDP) -> None:
+    """``end_forward(False)`` for a forward that raised; an ``Exception`` from it is only logged."""
+    try:
+        dense.end_forward(False)
+    except Exception:  # the forward's own exception propagates; this one would replace it
+        logger.error(
+            f"{LOG_PREFIX} ending an aborted forward failed as well\n{traceback.format_exc()}"
+        )
 
 
 def _free_group(group: MPI.Intracomm) -> None:

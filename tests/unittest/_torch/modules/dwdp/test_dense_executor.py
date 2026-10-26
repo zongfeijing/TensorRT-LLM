@@ -17,12 +17,14 @@
 With expert DWDP the executor holds the ``DwdpManager``, which drives the attached dense DWDP
 manager; with standalone dense DWDP it holds the ``DenseDwdpManager`` itself.  Only the
 non-overlap loop primes before a forward: in the overlap loop, which standalone dense DWDP
-accepts, the model's forward entry (H0) primes every forward.
+accepts, the model's forward entry (H0) primes every forward.  After every forward, in either
+loop, the standalone manager's ``after_forward`` runs.
 
 The executor is assembled with ``object.__new__`` and only the attributes a method reads, as the
 executor tests do.
 """
 
+import contextlib
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -31,6 +33,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 pytestmark = pytest.mark.cpu_only
+
+#: ``torch.cuda`` as ``py_executor`` reaches it.
+_TORCH_CUDA = "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda"
 
 #: ``PyExecutor``'s rejection of expert DWDP with the overlap scheduler, unchanged.
 _OVERLAP_ERROR = "DWDP requires disable_overlap_scheduler=True. Overlap scheduler is not yet supported with DWDP."
@@ -53,6 +58,53 @@ def test_prime_dwdp_primes_a_standalone_dense_manager():
     executor._prime_dwdp()
 
     assert log == ["dense.prefetch_first_layers"]
+
+
+@pytest.mark.parametrize("has_manager", [True, False], ids=["standalone", "no_manager"])
+def test_after_forward_runs_once_per_forward_after_the_forward_is_joined(monkeypatch, has_manager):
+    log = []
+    current_stream = SimpleNamespace(wait_stream=lambda _stream: log.append("join"))
+    monkeypatch.setattr(f"{_TORCH_CUDA}.current_stream", lambda: current_stream)
+    monkeypatch.setattr(f"{_TORCH_CUDA}.stream", lambda _stream: contextlib.nullcontext())
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.ExpertStatistic.set_iter",
+        lambda _iteration: None,
+    )
+    # What ``PyExecutor._forward_step`` reads, as the executor tests of ``_forward_step`` build it.
+    executor = SimpleNamespace(
+        model_engine=SimpleNamespace(
+            route_capture=None, forward=lambda *_args, **_kwargs: log.append("forward")
+        ),
+        resource_manager=None,
+        iter_counter=0,
+        enable_spec_decode=False,
+        runtime_draft_len=0,
+        sampler=SimpleNamespace(get_cache_indirection=lambda: None),
+        execution_stream=SimpleNamespace(wait_stream=lambda _stream: None),
+        _iter_adp_dummy_ctx_tokens=0,
+        _iter_adp_dummy_gen_tokens=0,
+        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
+        _maybe_record_hang_diagnostic_phase=lambda *_args, **_kwargs: None,
+        _attach_encoder_output_to_execution_stream=lambda _requests: None,
+        _mark_cross_kv_projection_consumed=lambda _requests: None,
+        _kv_connector_wait_for_save=lambda: None,
+        dense_dwdp_manager=(
+            SimpleNamespace(after_forward=lambda: log.append("after_forward"))
+            if has_manager
+            else None
+        ),
+    )
+    batch = SimpleNamespace(
+        context_requests=[],
+        generation_requests=[],
+        num_context_requests=0,
+        num_generation_requests=1,
+    )
+
+    for _ in range(2):
+        PyExecutor._forward_step(executor, batch)
+
+    assert log == ["forward", "join", *(["after_forward"] if has_manager else [])] * 2
 
 
 # ---------------------------------------------------------------------------
@@ -112,9 +164,7 @@ def _exiting(log: list, executor_box: list, name: str) -> MagicMock:
 @pytest.fixture
 def no_cuda(monkeypatch):
     """``shutdown`` synchronizes the device when CUDA is available; these executors have none."""
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.is_available", lambda: False
-    )
+    monkeypatch.setattr(f"{_TORCH_CUDA}.is_available", lambda: False)
 
 
 @pytest.mark.parametrize("mode", ["standalone", "attached"])

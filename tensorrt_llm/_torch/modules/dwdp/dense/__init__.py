@@ -19,16 +19,20 @@ and MoE-dense blob ``D(l)``; the runtime gathers ``L(l+2) = A(l+2) + D(l+2)`` in
 slots on a copy stream.  It runs in one of two modes (``types.DenseMode``): with expert DWDP
 (attached) the dense group is the DWDP group and the copies share the expert DWDP copy stream;
 standalone, on an attention-DP instance without expert DWDP, the dense group is the attention-DP
-(tp) group and the copies run on the dense manager's own stream.  Submodules:
+(tp) group and the copies run on the dense manager's own stream.  Standalone with a
+``cuda_graph_config`` (graph mode) the runtime runs its closed protocol, under which every
+forward, eager, captured into a CUDA graph or replayed, starts and ends in the same boundary
+state; otherwise it runs the legacy, eager-only one.  Submodules:
 
 * ``config`` -- ``TRTLLM_DWDP_DENSE*`` switches.
-* ``types`` -- shared records, layout, slots, copy plans, CUDA seams, constants, errors.
+* ``types`` -- shared records, layout, slots, copy plans, forward protocols and the closed
+  schedule, CUDA seams, constants, errors.
 * ``layout`` -- collector, checks, blob layout, checksums.
 * ``repoint`` -- repointing module tensors into slots, rollback, release check, teardown.
-* ``runtime`` -- ``DenseDWDP``: slot rings, events and the per-layer hooks.
+* ``runtime`` -- ``DenseDWDP``: slot rings, events, the per-layer hooks and the forward protocols.
 * ``plan`` -- per-layer copy plans and their launcher.
 * ``store`` -- the sharded row store (FABRIC and in-process loopback).
-* ``watchdog`` -- the slot checksum watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2``.
+* ``watchdog`` -- the slot checksum watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2`` and ``3``.
 * ``setup`` -- setup phases P1-P6 over five fixed collectives.
 * ``manager`` -- ``DenseDwdpManager``: owns the committed runtime in both modes, primes it (H0)
   and is what the model's hooks find through ``get_global_dense_dwdp_manager``; standalone it

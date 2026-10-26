@@ -542,3 +542,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     # load_weights is inherited from KimiK25ForConditionalGeneration: the
     # MetaInitMode deferral/recreation logic is identical and constructs the
     # tower via _VISION_MODEL_CLS, which this class overrides above.
+
+    def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
+        """The text backbone's pre-replay hooks (the dense DWDP replay guard)."""
+        self.llm.register_cuda_graph_pre_replay_hooks(runner)

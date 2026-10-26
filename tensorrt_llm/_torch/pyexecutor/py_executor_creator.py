@@ -19,11 +19,13 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.modules.dwdp import (dense_dwdp_requested,
-                                              dwdp_global_rank)
-from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
+                                              dwdp_global_rank, fabric_gather)
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.gate import (dense_graph_mode,
+                                                         validate_dense_gate)
 from tensorrt_llm._torch.modules.dwdp.dense.manager import (
     DenseDwdpManager, get_global_dense_dwdp_manager)
-from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
+from tensorrt_llm._torch.modules.dwdp.dense.types import CopyMode, DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
@@ -229,6 +231,61 @@ def _check_dense_dwdp_launch(llm_args: TorchLlmArgs,
     if dense_dwdp_requested():
         return validate_dense_gate(llm_args, mapping)
     return None
+
+
+def _reserve_dense_gather_sms(llm_args: TorchLlmArgs) -> bool:
+    """Reserve the SMs of the standalone dense DWDP gather before MegaMoE exists.
+
+    MegaMoE keeps the occupancy it queries while the model is built, and
+    standalone dense DWDP setup reserves the gather's SMs only after the
+    weights load. So with ``TRTLLM_DWDP_DENSE_COPY=gather`` and the
+    ``MEGAMOE_CUTEDSL`` MoE backend, the gather's compute-side defaults
+    (``TRTLLM_CUTEDSL_SM_RESERVE`` among them) are applied here instead,
+    before the model is built; a value the launch sets explicitly wins. Any
+    other launch keeps them where setup applies them.
+
+    Returns:
+        Whether the defaults were applied, so that the reserve MegaMoE was
+        built with is to be checked (``_check_megamoe_sm_reserve``).
+    """
+    if llm_args.moe_config.backend != "MEGAMOE_CUTEDSL":
+        return False
+    if DenseConfig.from_env().standalone_copy_mode() is not CopyMode.GATHER:
+        return False
+    fabric_gather.apply_compute_side_defaults()
+    return True
+
+
+def _check_megamoe_sm_reserve() -> None:
+    """Check that MegaMoE was built with the dense DWDP gather's SM reserve.
+
+    A MegaMoE grid sized without it waits for the SMs the gather holds.
+
+    Raises:
+        RuntimeError: MegaMoE's first occupancy query saw another
+            ``TRTLLM_CUTEDSL_SM_RESERVE`` than the one set now, and
+            ``TRTLLM_DWDP_DENSE_REQUIRED`` is on; with it off, the mismatch is
+            logged as an error.
+    """
+    from ..cute_dsl_utils import sm_reserve
+    from ..moe.custom_ops.cute_dsl_megamoe_custom_op import \
+        megamoe_occupancy_sm_reserve
+
+    built_with, reserve = megamoe_occupancy_sm_reserve(), sm_reserve()
+    if built_with is None:
+        return
+    if built_with == reserve:
+        logger.info(f"Dense DWDP: MegaMoE was built with {reserve} SMs "
+                    "reserved for the dense gather")
+        return
+    message = (
+        f"Dense DWDP: MegaMoE was built with TRTLLM_CUTEDSL_SM_RESERVE="
+        f"{built_with}, but the dense gather runs with {reserve}, so MegaMoE "
+        "would wait for the SMs the gather holds. The reserve must be set "
+        "before MegaMoE's first occupancy query.")
+    if DenseConfig.from_env().required:
+        raise RuntimeError(message)
+    logger.error(message)
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -791,11 +848,16 @@ def _create_py_executor(
     # Standalone dense DWDP shards the dense weights over the attention-DP
     # group. Its manager is registered before the model is built, because the
     # model's layers capture it then; with expert DWDP, DwdpManager creates and
-    # registers the dense manager itself.
+    # registers the dense manager itself. With cuda_graph_config the manager
+    # runs in graph mode, where the CUDA graphs capture the dense schedule.
     dense_dwdp_manager: Optional[DenseDwdpManager] = None
+    gather_sms_reserved = False
     if dense_mode is DenseMode.STANDALONE:
+        gather_sms_reserved = _reserve_dense_gather_sms(llm_args)
+        graph_mode = dense_graph_mode(llm_args, dense_mode)
         dense_dwdp_manager = DenseDwdpManager(DenseMode.STANDALONE,
-                                              mapping=mapping)
+                                              mapping=mapping,
+                                              graph_mode=graph_mode)
         dense_dwdp_manager.__enter__()
         logger.info(
             "Dense DWDP manager initialized (standalone): attention-DP group "
@@ -847,6 +909,8 @@ def _create_py_executor(
             model_weights_memory_tag=model_weights_memory_tag,
             model_weights_restore_mode=model_weights_restore_mode,
         )
+    if gather_sms_reserved:
+        _check_megamoe_sm_reserve()
 
     # Model loading can disable reuse after runtime features were created.
     model_engine.attn_runtime_features.cache_reuse = (

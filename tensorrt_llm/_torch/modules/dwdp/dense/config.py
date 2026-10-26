@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Environment switches of dense DWDP; context workers only, no ``llm_args`` field.
+"""Environment switches of dense DWDP; no ``llm_args`` field.
 
 * ``TRTLLM_DWDP_DENSE`` -- turn dense DWDP on; default off.  With ``dwdp_config`` it runs with
   expert DWDP over the DWDP group; without, standalone over the attention-DP group of an instance
-  with ``enable_attention_dp`` and ``tp_size > 1`` (``gate.validate_dense_gate``).
+  with ``enable_attention_dp`` and ``tp_size > 1`` (``gate.validate_dense_gate``), in graph mode
+  when the launch also has ``cuda_graph_config`` (``gate.dense_graph_mode``).
 * ``TRTLLM_DWDP_DENSE_SEGMENTS`` -- ``attn,moe`` (default) or ``attn`` for attention only.
 * ``TRTLLM_DWDP_DENSE_REQUIRED`` -- default on: a failed setup raises on every rank; off: every rank
   drops dense DWDP and keeps serving with replicated dense weights.
@@ -31,26 +32,40 @@
   the first 8 moved storages that outlive the commit (each a scan of every live Python object);
   2: also run the per-layer slot checksum watchdog (each layer's H1 checks its slots against the
   layer's checksum; slow: every slot is read once more and the host waits for the GPU once per
-  forward); default 0.
+  forward); 3: also, in graph mode, assert on the device at the end of every forward (H4) that
+  the watchdog found no mismatch, so that a mismatch stops the process without a host
+  synchronization (for validation runs); default 0.
 * ``TRTLLM_DWDP_DENSE_COPY`` -- the transfer of standalone dense DWDP, on the dense manager's own
   copy stream: ``batched`` (default; one ``cudaMemcpyBatchAsync`` per layer on the copy engines),
   ``per_slice`` or ``gather`` (the SM fabric gather, which holds SMs next to the MoE all-to-all;
-  validated on Rubin with ``TRTLLM_DWDP_GATHER_KERNEL=tma`` and
-  ``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``).  The gate rejects an invalid value standalone.  With
-  expert DWDP the dense copies follow the expert transfer, and the gate warns that any value,
-  valid or not, is ignored.
+  validated on a Rubin context server with ``TRTLLM_DWDP_GATHER_KERNEL=tma`` and
+  ``TLLM_ROUTING_DISABLE_COOP_LAUNCH=1``).  The gate rejects an invalid value standalone.  Graph
+  mode needs it set, to ``gather`` or ``batched``, and rejects ``per_slice``: with ``batched`` the
+  decode CUDA graphs capture copy-engine copies, which hold no SMs, and the gate first checks that
+  the CUDA driver captures ``cudaMemcpyBatchAsync``; with ``gather`` they capture the SM gather
+  kernel, which holds SMs.  On Rubin (SM107), where generation servers were validated with the
+  SM gather, the gate recommends ``gather`` over ``batched``.  With expert DWDP the dense copies
+  follow the expert transfer, and the gate warns that any value, valid or not, is ignored.
+* ``TRTLLM_DWDP_DENSE_PRIME`` -- when graph mode gathers the first two covered layers of a step:
+  ``wrap`` (default; at the last two covered layers of the step before, so that the copies overlap
+  the tail of that step: final norm, ``lm_head``, drafter and sampling) or ``entry`` (at the start
+  of every forward; a fallback for debugging and A/B runs).  Outside graph mode dense DWDP primes
+  at the start of every forward, and the gate warns that any value, valid or not, is ignored.
 
 Booleans accept ``1/true/yes/on`` and ``0/false/no/off`` (any case); unset or empty means the
 default.  A flag that defaults to off is on only for an explicit true value; any other value logs
 a warning and keeps the default.  Integers that do not parse, or are negative, log a warning and
-keep the default.  An invalid segment list raises.  ``TRTLLM_DWDP_DENSE_COPY`` is read as set and
-validated only for standalone dense DWDP (:meth:`DenseConfig.standalone_copy_mode`).
+keep the default.  An invalid segment list raises.  ``TRTLLM_DWDP_DENSE_COPY`` and
+``TRTLLM_DWDP_DENSE_PRIME`` are read as set and validated only where they apply: standalone
+(:meth:`DenseConfig.standalone_copy_mode`) and in graph mode (:meth:`DenseConfig.prime_policy`).
 
-Standalone dense DWDP is meant for context-only servers.  The gate does not check the server role,
-which a worker sees as ``TRTLLM_DISAGG_ROLE`` only when ``trtllm-serve`` launches it with a role
-(``--server_role``, or a ctx or gen server in a disaggregated config).  An aggregated or generation
-attention-DP launch with ``TRTLLM_DWDP_DENSE=1`` that meets the gate's other requirements
-therefore passes it and pays the per-forward gather of every covered layer on every step.
+Standalone dense DWDP serves context servers, normally without CUDA graphs, and generation
+servers, with them.  Graph mode runs the ``CLOSED`` protocol, which captures the dense schedule of
+a whole step into every decode CUDA graph; expert DWDP and standalone dense DWDP without CUDA
+graphs keep the ``LEGACY`` protocol.  Either way every forward gathers every covered layer.  The
+gate logs the server role, which a worker sees as ``TRTLLM_DISAGG_ROLE`` only when
+``trtllm-serve`` launches it with a role (``--server_role``, or a ctx or gen server in a
+disaggregated config), but does not check it.
 """
 
 from __future__ import annotations
@@ -68,6 +83,7 @@ from .types import (
     SEGMENT_ORDER,
     CopyMode,
     DigestSwitches,
+    PrimePolicy,
     SegmentKind,
 )
 
@@ -79,6 +95,7 @@ DENSE_STORE_CHUNK_MB_ENV = "TRTLLM_DWDP_DENSE_STORE_CHUNK_MB"
 DENSE_STRICT_ENV = "TRTLLM_DWDP_DENSE_STRICT"
 DENSE_DEBUG_ENV = "TRTLLM_DWDP_DENSE_DEBUG"
 DENSE_COPY_ENV = "TRTLLM_DWDP_DENSE_COPY"
+DENSE_PRIME_ENV = "TRTLLM_DWDP_DENSE_PRIME"
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _FALSE_VALUES = ("0", "false", "no", "off")
@@ -161,6 +178,24 @@ def parse_copy_mode(value: str) -> CopyMode:
         ) from None
 
 
+def parse_prime_policy(value: str) -> PrimePolicy:
+    """Parse a ``TRTLLM_DWDP_DENSE_PRIME`` value.
+
+    Args:
+        value: ``wrap`` or ``entry``, any case, surrounding blanks ignored.
+
+    Returns:
+        The priming policy.
+
+    Raises:
+        ValueError: Any other value.
+    """
+    try:
+        return PrimePolicy(value.strip().lower())
+    except ValueError:
+        raise ValueError(f"{DENSE_PRIME_ENV}={value!r} must be one of wrap, entry") from None
+
+
 def dense_dwdp_requested(environ: Mapping[str, str] | None = None) -> bool:
     """Whether ``TRTLLM_DWDP_DENSE`` asks for dense DWDP; reads no other variable.
 
@@ -186,6 +221,9 @@ class DenseConfig:
         copy: ``TRTLLM_DWDP_DENSE_COPY`` as set, blanks stripped and case kept; None when unset or
             blank.  Kept as given and validated only by :meth:`standalone_copy_mode`, so reading
             the switches never fails because of it: with expert DWDP it is ignored.
+        prime: ``TRTLLM_DWDP_DENSE_PRIME`` as set, blanks stripped and case kept; None when unset
+            or blank.  Kept as given and validated only by :meth:`prime_policy`, like ``copy``:
+            outside graph mode it is ignored.
     """
 
     enabled: bool = False
@@ -196,6 +234,7 @@ class DenseConfig:
     strict: bool = False
     debug: int = 0
     copy: str | None = None
+    prime: str | None = None
 
     def __post_init__(self) -> None:
         segments = _canonical_segments(self.segments)
@@ -210,8 +249,8 @@ class DenseConfig:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> DenseConfig:
         """Read every ``TRTLLM_DWDP_DENSE*`` variable.
 
-        ``TRTLLM_DWDP_DENSE_COPY`` is stored without validation (see ``copy``), so it never makes
-        this raise.
+        ``TRTLLM_DWDP_DENSE_COPY`` and ``TRTLLM_DWDP_DENSE_PRIME`` are stored without validation
+        (see ``copy`` and ``prime``), so they never make this raise.
 
         Args:
             environ: Environment to read; ``os.environ`` if None.
@@ -226,6 +265,7 @@ class DenseConfig:
         else:
             segments = parse_segments(raw_segments)
         copy = (env.get(DENSE_COPY_ENV) or "").strip()
+        prime = (env.get(DENSE_PRIME_ENV) or "").strip()
         return cls(
             enabled=_bool_env(env, DENSE_ENV, False),
             segments=segments,
@@ -235,6 +275,7 @@ class DenseConfig:
             strict=_bool_env(env, DENSE_STRICT_ENV, False),
             debug=_int_env(env, DENSE_DEBUG_ENV, 0),
             copy=copy or None,
+            prime=prime or None,
         )
 
     def standalone_copy_mode(self) -> CopyMode:
@@ -251,6 +292,20 @@ class DenseConfig:
             return CopyMode.BATCHED
         return parse_copy_mode(self.copy)
 
+    def prime_policy(self) -> PrimePolicy:
+        """The priming policy of graph mode: ``prime`` parsed, ``WRAP`` when it is None.
+
+        Only graph-mode code calls it (the gate and the dense manager).  Outside graph mode dense
+        DWDP runs the ``LEGACY`` protocol, which primes at the start of every forward, as
+        ``ENTRY`` does, whatever ``prime`` holds.
+
+        Raises:
+            ValueError: ``prime`` is not one of wrap, entry (see :func:`parse_prime_policy`).
+        """
+        if self.prime is None:
+            return PrimePolicy.WRAP
+        return parse_prime_policy(self.prime)
+
     @property
     def slot_fill_byte(self) -> int:
         """Byte the slots are filled with at commit: 0, or ``DEBUG_FILL_BYTE`` (NaN) if debug."""
@@ -260,6 +315,14 @@ class DenseConfig:
     def slot_watchdog(self) -> bool:
         """Whether the per-layer slot checksum watchdog runs (``TRTLLM_DWDP_DENSE_DEBUG >= 2``)."""
         return self.debug >= 2
+
+    @property
+    def slot_watchdog_assert(self) -> bool:
+        """Whether H4 asserts on the device that the slot watchdog found no mismatch.
+
+        ``TRTLLM_DWDP_DENSE_DEBUG >= 3``; it takes effect in graph mode, the only one with an H4.
+        """
+        return self.debug >= 3
 
     def digest_switches(self, num_ranks: int) -> DigestSwitches:
         """The switches the layout depends on, for a group of ``num_ranks`` ranks."""

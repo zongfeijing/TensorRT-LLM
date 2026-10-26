@@ -93,6 +93,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -1967,6 +1968,26 @@ class KimiLinearDecoderLayer(nn.Module):
     # Read by dense DWDP setup next to ``dense_dwdp_roots``.
     dense_dwdp_attr_allow: frozenset[str] = DWDP_DENSE_ATTR_ALLOW
     dense_dwdp_exclude: frozenset[str] = DWDP_DENSE_EXCLUDE
+    DENSE_DWDP_MULTI_STREAM_SAFE: ClassVar[bool] = True
+    """Dense DWDP may run this layer with multi-stream execution, as it does in graph mode.
+
+    Every read of the layer's dense weights on an auxiliary stream forks after H1 and joins the
+    compute stream again before H2 (attention weights) or H3 (MoE-dense weights), so the consume
+    event that hook records orders the read before the next copy into its slot. The audited fork
+    points:
+
+    * ``block_sparse_moe``: the shared expert runs on the ``MoeShared`` stream and joins before
+      ``KimiK3MoERuntime.forward`` returns. The latent down projection forks onto the
+      ``MoeOutputMemset`` stream only with the CUTEDSL and CUTEDSL_FC12 backends, and the routed
+      experts join it; MEGAMOE_CUTEDSL has no such stream, and MegaMoE forks none of its own.
+    * ``linear_attn``: the KDA decode and verify projections fork the ``[f_a | b]`` chain for at
+      most 128 rows and join inside the mixer.
+    * ``self_attn``: the MLA forks (the latent layernorm, the latent-cache concat and the
+      generation RoPE beside the absorption BMM) join inside the attention call.
+
+    ``tests/unittest/_torch/modules/dwdp/test_dense_multistream_contract.py`` fails on a fork point
+    in these modules that is not on this list.
+    """
 
     def __init__(
         self,
@@ -2289,8 +2310,8 @@ class KimiLinearModel(DecoderModel):
         )
 
         # The dense DWDP manager exists before the model is built (DwdpManager registers it with
-        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() primes dense
-        # DWDP through it.
+        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() runs H0
+        # through it, and KimiLinearForCausalLM.forward opens the graph-mode forward scope with it.
         self._dense_dwdp = get_global_dense_dwdp_manager()
 
     def forward(
@@ -2305,10 +2326,12 @@ class KimiLinearModel(DecoderModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Dense DWDP H0: make sure the first two layers' dense weights (and, with expert DWDP,
-        # their experts) are enqueued before any layer runs (the non-overlap executor loop
-        # usually already did). After a forward that stopped midway, a WAR barrier on this stream
-        # comes first.
+        # Dense DWDP H0. In graph mode, H0 is the entry of the forward scope that
+        # KimiLinearForCausalLM.forward opens around this forward, the LM head and the spec worker,
+        # and this call only checks that the scope is open. Otherwise it makes sure the first two
+        # layers' dense weights (and, with expert DWDP, their experts) are enqueued before any
+        # layer runs (the non-overlap executor loop usually already did); after a forward that
+        # stopped midway, a WAR barrier on this stream comes first.
         manager = getattr(self, "_dense_dwdp", None)
         if manager is not None and manager.dense is not None:
             manager.ensure_primed()
@@ -2692,6 +2715,35 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         routed to a path that cannot transfer the recurrent state.
         """
         return "PYTHON"
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        """``SpecDecOneEngineForCausalLM.forward``, in the dense DWDP forward scope in graph mode.
+
+        In graph mode (standalone dense DWDP with a ``cuda_graph_config``) the text model, the LM
+        head and the spec worker run inside ``DenseDwdpManager.forward_scope()``: H0 is its entry
+        and H4, after the spec worker, its exit, so that with wrap priming the copies that prime
+        the next forward overlap the head and the drafter. The scope closes with ``ok=False`` when
+        anything in it raises. The multimodal wrapper gets here through ``self.llm.forward``.
+        Without a committed dense DWDP runtime, and outside graph mode, the forward runs as is.
+        """
+        manager = getattr(self.model, "_dense_dwdp", None)
+        if manager is None or manager.dense is None or not manager.graph_mode:
+            return super().forward(*args, **kwargs)
+        with manager.forward_scope():
+            return super().forward(*args, **kwargs)
+
+    def register_cuda_graph_pre_replay_hooks(self, runner) -> None:
+        """Register the dense DWDP replay guard with the decoder's CUDA graph runner.
+
+        In graph mode every CUDA graph replays a dense DWDP schedule captured from the dense
+        boundary state, so ``DenseDwdpManager.before_replay`` runs right before each replay
+        (``DenseDwdpManager.register_replay_guard``): it restores that state first if an aborted
+        eager forward left it broken. The multimodal wrapper forwards here. Without a dense DWDP
+        manager, and outside graph mode, nothing is registered.
+        """
+        manager = getattr(self.model, "_dense_dwdp", None)
+        if manager is not None:
+            manager.register_replay_guard(runner)
 
     # ------------------------------------------------------------------
     # Weight loading (streams the 1.5TB checkpoint; only the rank-local

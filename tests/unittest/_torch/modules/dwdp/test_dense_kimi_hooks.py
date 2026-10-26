@@ -14,7 +14,7 @@
 # limitations under the License.
 """The Kimi-K3 side of dense DWDP: hook placement and the load guard.
 
-Covers the hook calls H0-H3 of ``modeling_kimi_linear`` and its load guard.  Layers are real modules
+Covers the hook calls H0-H4 of ``modeling_kimi_linear`` and its load guard.  Layers are real modules
 built from a tiny Kimi-Linear config.  A real forward of the attention and MoE submodules needs
 attention metadata, KV-cache pools and the routed-expert kernels, so the hook tests replace exactly
 those submodules with recorders; everything else in the decoder-layer and model forward runs for
@@ -30,9 +30,15 @@ that mixer replaced by a stand-in.  The stand-in keeps the layer's real MLA bran
 ``KimiMLARuntime`` wrapper, which are what the roots and the hooks depend on.
 
 The model reaches dense DWDP through the dense DWDP manager it captures when built
-(``get_global_dense_dwdp_manager``), in both modes: attached to expert DWDP and standalone.
+(``get_global_dense_dwdp_manager``), in both modes: attached to expert DWDP and standalone.  In
+graph mode ``KimiLinearForCausalLM.forward`` runs the model, the LM head and the spec worker in the
+manager's forward scope, whose entry and exit are H0 and H4.  Those tests run a real two-layer text
+model in a ``KimiLinearForCausalLM`` built without its constructor, with recorders for the LM head
+and the spec worker, called directly and through the multimodal wrapper's ``forward``.
 """
 
+import contextlib
+from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +49,7 @@ pytest.importorskip("fla")
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
+from tensorrt_llm._torch.models.modeling_kimi_k3_vl import KimiK3ForConditionalGeneration
 from tensorrt_llm._torch.modules import kimi_k3_mla
 from tensorrt_llm._torch.modules.dwdp.dense.manager import set_global_dense_dwdp_manager
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, CutlassFusedMoE
@@ -325,11 +332,16 @@ class _RecordingDense:
 
 
 class _RecordingManager:
-    """``DenseDwdpManager.dense`` and ``DenseDwdpManager.ensure_primed``, recorded."""
+    """The ``DenseDwdpManager`` members the model uses, recorded.
 
-    def __init__(self, log: list, dense: object | None) -> None:
+    ``forward_scope`` logs its exit with whether its body completed: the ``ok`` the manager passes
+    to ``end_forward``.
+    """
+
+    def __init__(self, log: list, dense: object | None, *, graph_mode: bool = False) -> None:
         self._log = log
         self._dense = dense
+        self.graph_mode = graph_mode
 
     @property
     def dense(self) -> object | None:
@@ -337,6 +349,16 @@ class _RecordingManager:
 
     def ensure_primed(self) -> None:
         self._log.append(("ensure_primed",))
+
+    @contextlib.contextmanager
+    def forward_scope(self) -> Iterator[None]:
+        self._log.append(("scope_enter",))
+        ok = False
+        try:
+            yield
+            ok = True
+        finally:
+            self._log.append(("scope_exit", ok))
 
 
 def _install_recorders(layer: mkl.KimiLinearDecoderLayer, log: list) -> _Recorder:
@@ -359,8 +381,9 @@ def _install_recorders(layer: mkl.KimiLinearDecoderLayer, log: list) -> _Recorde
 
 
 def _attn_metadata() -> SimpleNamespace:
-    # The model forward checks the batch against ``num_tokens``; the recorders read nothing.
-    return SimpleNamespace(num_tokens=_TOKENS)
+    # The model forward checks the batch against ``num_tokens``, and the causal LM forward finds
+    # no padding; the recorders read nothing.
+    return SimpleNamespace(num_tokens=_TOKENS, padded_num_tokens=None)
 
 
 def _run_layer(layer: mkl.KimiLinearDecoderLayer) -> None:
@@ -435,6 +458,132 @@ def test_model_primes_before_the_embedding_only_with_dense(monkeypatch, state):
     with pytest.raises(ValueError, match="exactly one of input_ids or inputs_embeds"):
         model(_attn_metadata())
     assert log == []
+
+
+# ---------------------------------------------------------------------------
+# H0 and H4: the forward scope of the causal LM
+# ---------------------------------------------------------------------------
+
+
+class _SpecWorkerFailed(Exception):
+    """Raised by ``_RecordingTail`` as the spec worker when told to fail."""
+
+
+class _RecordingTail:
+    """Stands in for the LM head (the spec worker's ``target_logits``) and the spec worker.
+
+    The spec worker returns :attr:`output`, which the causal LM's forward returns as it is.
+    """
+
+    def __init__(self, log: list) -> None:
+        self._log = log
+        self.fail = False
+        self.output = object()
+
+    def forward(self, hidden_states: torch.Tensor, *args) -> torch.Tensor:
+        self._log.append(("lm_head",))
+        return hidden_states
+
+    def target_logits(self, hidden_states: torch.Tensor, *args) -> torch.Tensor:
+        self._log.append(("lm_head",))
+        return hidden_states
+
+    def __call__(self, *, logits: torch.Tensor, **kwargs) -> object:
+        self._log.append(("spec_worker",))
+        if self.fail:
+            raise _SpecWorkerFailed
+        return self.output
+
+
+def _spec_dec_lm(
+    monkeypatch: pytest.MonkeyPatch, log: list, manager: _RecordingManager | None
+) -> mkl.KimiLinearForCausalLM:
+    """A one-engine spec-dec ``KimiLinearForCausalLM`` around a real two-layer text model.
+
+    Layer 0 has the dense MLP, layer 1 the MoE block; both log through recorders, and the model
+    and its layers hold ``manager``.  The LM head and the spec worker are one ``_RecordingTail``.
+    """
+    model = _build_model(monkeypatch, _kda_config(2))
+    model.embed_tokens = _Embedding(log)
+    model._dense_dwdp = manager
+    for layer in model.layers:
+        _install_recorders(layer, log)
+        layer._dense_dwdp = manager
+    lm = mkl.KimiLinearForCausalLM.__new__(mkl.KimiLinearForCausalLM)
+    nn.Module.__init__(lm)
+    lm.model = model
+    lm.layer_idx = -1
+    lm.lm_head = lm.draft_model = None
+    lm.logits_processor = lm.spec_worker = _RecordingTail(log)
+    return lm
+
+
+def _spec_dec_inputs() -> dict:
+    # No layer is a hidden-state tap; the LM head reads every token.
+    spec_metadata = SimpleNamespace(
+        _capture_layer_set=frozenset(),
+        gather_ids=torch.arange(_TOKENS),
+        is_layer_capture=lambda layer_idx: False,
+    )
+    return {
+        "attn_metadata": _attn_metadata(),
+        "input_ids": torch.zeros(_TOKENS, dtype=torch.int32),
+        "spec_metadata": spec_metadata,
+    }
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "state, entry",
+    [
+        ("graph", "causal_lm"),
+        ("graph", "vl_wrapper"),
+        ("not_graph", "causal_lm"),
+        ("no_dense", "causal_lm"),
+        ("no_manager", "causal_lm"),
+    ],
+)
+def test_graph_mode_runs_the_model_head_and_spec_worker_in_the_scope(
+    monkeypatch, cpu_routed_experts, state, entry
+):
+    log = []
+    dense = _RecordingDense(log, covered=_MOE_LAYERS)
+    manager = {
+        "graph": _RecordingManager(log, dense, graph_mode=True),
+        "not_graph": _RecordingManager(log, dense),
+        "no_dense": _RecordingManager(log, None, graph_mode=True),
+        "no_manager": None,
+    }[state]
+    lm = _spec_dec_lm(monkeypatch, log, manager)
+    if entry == "causal_lm":
+        output = lm.forward(**_spec_dec_inputs())
+    else:
+        # The multimodal wrapper's forward, on a stand-in holding only the text backbone.
+        wrapper = SimpleNamespace(llm=lm)
+        output = KimiK3ForConditionalGeneration.forward(wrapper, **_spec_dec_inputs())
+
+    assert output is lm.spec_worker.output
+    if state in ("graph", "not_graph"):
+        model = [("ensure_primed",), ("embed",), ("covers", 0), *_layer_reads(0, "mlp")]
+        model += _hooked_layer_reads(1, "moe")
+    else:
+        model = [("embed",), *_layer_reads(0, "mlp"), *_layer_reads(1, "moe")]
+    tail = [("lm_head",), ("spec_worker",)]
+    if state == "graph":
+        assert log == [("scope_enter",), *model, *tail, ("scope_exit", True)]
+    else:
+        assert log == model + tail
+
+
+@pytest.mark.cpu_only
+def test_the_scope_closes_not_ok_when_the_spec_worker_raises(monkeypatch, cpu_routed_experts):
+    log = []
+    manager = _RecordingManager(log, _RecordingDense(log, covered=_MOE_LAYERS), graph_mode=True)
+    lm = _spec_dec_lm(monkeypatch, log, manager)
+    lm.spec_worker.fail = True
+    with pytest.raises(_SpecWorkerFailed):
+        lm.forward(**_spec_dec_inputs())
+    assert log[-2:] == [("spec_worker",), ("scope_exit", False)]
 
 
 # ---------------------------------------------------------------------------

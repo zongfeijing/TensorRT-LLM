@@ -87,6 +87,7 @@ def _forward_step_executor(engine, *, enable_spec_decode=False, runtime_draft_le
         _mark_cross_kv_projection_consumed=Mock(),
         _kv_connector_wait_for_save=Mock(),
         _handle_errors=Mock(),
+        dense_dwdp_manager=None,
     )
 
 

@@ -55,8 +55,10 @@ from tensorrt_llm._torch.modules.dwdp.dense.setup import PhaseReport, setup_dens
 from tensorrt_llm._torch.modules.dwdp.dense.store import DenseShardStore, LoopbackShardStore
 from tensorrt_llm._torch.modules.dwdp.dense.types import (
     ROW_ALIGN,
+    DenseProtocol,
     DenseRepointError,
     DenseSetupError,
+    PrimePolicy,
     SegmentKind,
 )
 from tensorrt_llm._torch.modules.dwdp.rendezvous import StoreDwdpGroup
@@ -1394,3 +1396,104 @@ def test_a_failure_in_any_phase_on_any_rank_abandons_everywhere(
         int(phase >= 4 or (phase == 3 and rank != failing)) for rank in range(num_ranks)
     ]
     assert [len(rank.launchers) for rank in group.ranks] == expected_launchers
+
+
+# ---------------------------------------------------------------------------
+# The runtime's protocol and the whole-model sharing audit
+# ---------------------------------------------------------------------------
+
+
+class SafeToyDecoderLayer(ToyDecoderLayer):
+    """A toy decoder layer that declares the dense DWDP aux-stream contract."""
+
+    DENSE_DWDP_MULTI_STREAM_SAFE = True
+
+
+LEGACY, CLOSED = DenseProtocol.LEGACY, DenseProtocol.CLOSED
+WRAP, ENTRY = PrimePolicy.WRAP, PrimePolicy.ENTRY
+
+
+@pytest.mark.parametrize(
+    "protocol, prime, debug, safe_layers, expected",
+    [
+        (None, None, 0, (), (LEGACY, ENTRY, False, None)),
+        (CLOSED, WRAP, 3, COVERED, (CLOSED, WRAP, True, True)),
+        (CLOSED, ENTRY, 2, COVERED[1:], (CLOSED, ENTRY, False, False)),
+    ],
+    ids=["defaults", "closed-wrap-every-layer-safe-debug3", "closed-entry-one-layer-not-debug2"],
+)
+def test_the_runtime_gets_the_protocol_the_layers_declaration_and_the_watchdog_assert(
+    make_group, monkeypatch, protocol, prime, debug, safe_layers, expected
+):
+    """``(protocol, prime, multi_stream_ok, watchdog.device_assert)``; only covered layers count."""
+    built = []
+
+    def runtime(*args, protocol, prime, multi_stream_ok, watchdog, **kwargs):
+        assert_on = None if watchdog is None else watchdog.device_assert
+        built.append((protocol, prime, multi_stream_ok, assert_on))
+        return DenseDWDP(
+            *args,
+            protocol=protocol,
+            prime=prime,
+            multi_stream_ok=multi_stream_ok,
+            watchdog=watchdog,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(dense_setup, "DenseDWDP", runtime)
+    group = make_group(specs_for(2, debug=debug))
+    for rank in group.ranks:
+        for layer in safe_layers:
+            rank.decoder.layers[layer].__class__ = SafeToyDecoderLayer
+    group.run(**({} if protocol is None else {"protocol": protocol, "prime": prime}))
+    group.committed()
+    assert built == [expected] * len(group.ranks)
+
+
+#: What the toy drafter shares with the target besides ``lm_head``: nothing, a module, a
+#: ``Parameter`` or a buffer under the dense roots.
+SHARED_WITH_DRAFTER = {
+    "lm_head-only": None,
+    "module": "model.layers.3.self_attn.kv_b_proj",
+    "parameter": "model.layers.4.block_sparse_moe.gate.weight",
+    "buffer": "model.layers.1.linear_attn.o_proj.weight",
+}
+
+
+@pytest.mark.parametrize(
+    "shared, protocol",
+    [(shared, CLOSED) for shared in SHARED_WITH_DRAFTER] + [("module", LEGACY)],
+    ids=[*SHARED_WITH_DRAFTER, "module-legacy"],
+)
+def test_a_drafter_may_share_lm_head_but_nothing_under_the_dense_roots(
+    make_group, shared, protocol
+):
+    """Sharing anything under the roots fails every rank at collective #1 (the P1 report).
+
+    Only the ``CLOSED`` protocol audits; the ``LEGACY`` setup stays as it was.
+    """
+    path = SHARED_WITH_DRAFTER[shared]
+    group = make_group(specs_for(2))
+    for rank in group.ranks:
+        model = rank.model
+        model.lm_head = ToyLinear(torch.ones(4, HIDDEN, dtype=BF16))
+        drafter = nn.Module()
+        drafter.layer = ToySharedMLP(torch.Generator().manual_seed(7))
+        drafter.lm_head = model.lm_head
+        if shared == "module":
+            drafter.shared = model.get_submodule(path)
+        elif shared == "parameter":
+            drafter.shared = model.get_parameter(path)
+        elif shared == "buffer":
+            drafter.register_buffer("shared", model.get_buffer(path), persistent=False)
+        model.draft_model = drafter
+    group.run(protocol=protocol, prime=WRAP if protocol is CLOSED else ENTRY)
+    if path is None or protocol is LEGACY:
+        group.committed()
+        group.assert_collectives(5)
+        return
+    group.assert_collectives(1)
+    group.assert_all_failed(
+        rf"collective #1 .*DenseLayoutError: .*{re.escape(path)}\b.*draft_model\.shared"
+    )
+    group.assert_restored()

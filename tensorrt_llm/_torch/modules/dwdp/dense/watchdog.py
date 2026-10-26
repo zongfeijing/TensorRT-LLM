@@ -12,14 +12,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Slot checksum watchdog of dense DWDP: ``TRTLLM_DWDP_DENSE_DEBUG=2``.
+"""Slot checksum watchdog of dense DWDP: ``TRTLLM_DWDP_DENSE_DEBUG=2`` and ``3``.
 
 At H1 of every covered layer, once compute waits for the layer's copies, ``DenseDWDP.wait_layer``
 has the watchdog check each slot the layer reads: on the compute stream, the checksum of the slot's
 blob is compared with the P1 content checksum of the layer's segment, and a mismatch adds one to
-that ``(layer, segment)``'s counter on the device.  Nothing reaches the host there.
-``DenseDWDP.layer_done`` reads the counters once per forward, at the last covered layer, and
-``DenseDWDP.release`` once more; each read synchronizes the host with the current stream.  Every
+that ``(layer, segment)``'s counter on the device.  Nothing reaches the host there, so a CUDA graph
+captures the checks.  The counters are read once per forward, by ``DenseDWDP.layer_done`` at the
+last covered layer under the legacy protocol and by ``DenseDWDP.poll_watchdog`` after the forward
+under the closed one, and once more by ``DenseDWDP.release``; each read synchronizes the host with
+the current stream.  With ``device_assert`` (``DEBUG=3``) the closed protocol's H4 also enqueues
+:meth:`SlotWatchdog.assert_clean_async`, which fails on the device without a host read.  Every
 check reads its whole blob once more, so the watchdog is a tool for validation runs.
 
 A correct gather leaves exactly the zero-padded blob in a slot: the row store is zero outside the
@@ -67,6 +70,8 @@ class SlotWatchdog:
             enabled segment: the blob size ``B`` and the P1 content checksum of the blob, whose
             word origin is the blob start.
         device: Device of the slots.
+        device_assert: ``TRTLLM_DWDP_DENSE_DEBUG=3``: the closed protocol enqueues
+            :meth:`assert_clean_async` at H4 of every forward.
 
     Raises:
         ValueError: ``expected`` does not hold exactly the covered ``(layer, segment)`` pairs, or
@@ -79,6 +84,8 @@ class SlotWatchdog:
         segments: Sequence[SegmentKind],
         expected: Mapping[SegmentKey, tuple[int, Checksum]],
         device: torch.device | str,
+        *,
+        device_assert: bool = False,
     ) -> None:
         self._layers = tuple(layers)
         self._segments = tuple(SegmentKind(kind) for kind in segments)
@@ -107,9 +114,12 @@ class SlotWatchdog:
         self._seen = [0] * len(keys)
         self._checks = 0
         self._mismatches = 0
+        self._device_assert = bool(device_assert)
 
     @classmethod
-    def from_layout(cls, layout: DenseLayout, device: torch.device | str) -> SlotWatchdog:
+    def from_layout(
+        cls, layout: DenseLayout, device: torch.device | str, *, device_assert: bool = False
+    ) -> SlotWatchdog:
         """The watchdog of a collected layout whose P1 checksums are computed.
 
         Raises:
@@ -120,7 +130,9 @@ class SlotWatchdog:
             key: (segment.blob_bytes, checksum)
             for (key, segment), checksum in zip(layout.segments.items(), checksums)
         }
-        return cls(layout.layers, layout.segment_kinds, expected, device)
+        return cls(
+            layout.layers, layout.segment_kinds, expected, device, device_assert=device_assert
+        )
 
     @property
     def layers(self) -> tuple[int, ...]:
@@ -133,8 +145,13 @@ class SlotWatchdog:
         return self._segments
 
     @property
+    def device_assert(self) -> bool:
+        """Whether H4 of the closed protocol enqueues :meth:`assert_clean_async` (``DEBUG=3``)."""
+        return self._device_assert
+
+    @property
     def checks(self) -> int:
-        """Slot checks enqueued so far."""
+        """Slot checks enqueued on the host so far; a CUDA graph replay of a check counts nothing."""
         return self._checks
 
     @property
@@ -185,6 +202,25 @@ class SlotWatchdog:
                 layer, kind = self._keys[index]
                 findings.append((layer, kind, new))
         return findings
+
+    def assert_clean_async(self) -> None:
+        """Enqueue a device assert that no check has found a mismatch so far.
+
+        ``torch._assert_async`` on the sum of the counters, on the current stream: the host never
+        waits, so a CUDA graph captures it.  A mismatch fails the assert, and the next
+        synchronization of the device raises, which ends the process: ``DEBUG=3`` is for
+        validation runs only.  On CPU tensors it raises at once.
+
+        Raises:
+            DenseProtocolError: Called after :meth:`release`.
+        """
+        counts = self._counts
+        if counts is None:
+            raise DenseProtocolError("slot watchdog assert after release")
+        torch._assert_async(
+            counts.sum() == 0,
+            "dense DWDP slot watchdog: a slot held other bytes than its layer's at H1",
+        )
 
     def release(self) -> None:
         """Drop the device tensors; :attr:`checks` and :attr:`mismatches` keep their values."""

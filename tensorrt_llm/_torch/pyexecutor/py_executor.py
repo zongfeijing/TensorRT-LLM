@@ -5033,7 +5033,10 @@ class PyExecutor:
         recovery after an aborted forward to the model's forward entry (H0).
         The overlap and pipeline-parallel loops do not call this: expert DWDP
         refuses the overlap scheduler, and a standalone dense DWDP manager is
-        primed by H0 in every forward there.
+        primed by H0 in every forward there. In CUDA graph mode the dense
+        runtime primes itself inside the model's forward scope, so this does
+        nothing for it: with wrap priming the previous forward's last layers
+        gather the first two, with entry priming the forward's own H0 does.
         """
         if self.dwdp_manager is not None:
             self.dwdp_manager.prefetch_first_layers()
@@ -8741,6 +8744,12 @@ class PyExecutor:
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
+
+            if self.dense_dwdp_manager is not None:
+                # Once per forward, graph replays included: in graph mode it
+                # polls the slot watchdog (TRTLLM_DWDP_DENSE_DEBUG >= 2) and
+                # logs the dense DWDP counters when they change.
+                self.dense_dwdp_manager.after_forward()
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:
