@@ -21,10 +21,13 @@ nothing pushes results back: FC1 gathers straight from the dense received plane,
 and the FC2 epilogue warps send results to their owning rank themselves through
 the bulk reduce-add. Twelve warps cover every role.
 
-The kernel owns the workspace tail reset. Because it outlives the communication
-kernel, it is the only participant that can safely zero the counters, which it
-does between two NVLink barriers so that no rank observes a half-cleared
-workspace or exits before the clearing is visible.
+The kernel owns the workspace tail reset. It is the only participant that can
+zero the counters, which it does between a grid sync and an NVLink barrier so
+that no rank observes a half-cleared workspace or exits before the clearing is
+visible. Outliving the communication kernel is not enough: a rank that no route
+reaches owns no tile, so nothing orders its tail after the peers' last payload
+publications, its own Gather-B waits or its refine groups' last claims, and the
+tail waits for all three before it resets.
 """
 
 import math
@@ -91,6 +94,9 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
     epilogue_register_count: ClassVar[int] = 256
     other_warp_register_count: ClassVar[int] = 80
     tail_barrier_id: ClassVar[int] = 8
+    # Gather-B warps arrive here once both their waits have passed, and the epilogue warps wait here
+    # before the tail reset, so the reset never zeroes a counter one of them is still polling.
+    gather_b_passed_barrier_id: ClassVar[int] = 9
 
     # Tuned for Rubin, not portable. VR200 carries 212 SMs and this kernel's 46
     # four-CTA clusters occupy 184, leaving 28 for the communication grid; go over that
@@ -589,6 +595,8 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             f"{'apply_topk_fc1' if self.apply_topk_at_fc1 else 'apply_topk_fc2'}_"
             f"{'inkernel_reduce' if self.reduce_topk_in_kernel else 'separate_reduce'}_"
             f"abstages{self._mainloop.num_weight_ab_stages}x{self._mainloop.num_token_ab_stages}"
+            # The tail-ordering revision: nothing cached under a name from before it may be served for it.
+            "_tailorder1"
         )
 
     def aot_compile(self, out_path: Optional[str] = None, **_compile_kwargs):
@@ -1122,6 +1130,11 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
             topk_scores=pool_topk_scores,
         )
 
+        gather_b_passed_barrier = pipeline.NamedBarrier(
+            barrier_id=self.gather_b_passed_barrier_id,
+            num_threads=32 * (len(self.epilogue_warp_ids) + len(self.gather_b_warp_ids)),
+        )
+
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
         self._mainloop.assign_device_members(
             self._smem_workspace, smem_base, cta_coord_in_cluster, hidden, intermediate_gateup
@@ -1268,6 +1281,48 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
 
             epilogue_thread_count = 32 * len(self.epilogue_warp_ids)
 
+            # The reset below zeroes counters that others may still poll or bump: this CTA's Gather-B
+            # warps (token_data_ready, then metadata_ready), the communication kernel's refine groups
+            # (metadata_ready, token_sf_plain_ready, then their refine_work_counter claims) and the
+            # peers' payload publications still on the wire. FC1's data dependency orders most of them
+            # before this point on a rank with tiles, but not a CTA without FC1 tiles nor a refine
+            # group's last claim, and nothing at all on a rank that no route reaches, whose epilogue
+            # gets here once metadata_ready is complete. A waiter the reset strands never returns, and
+            # a publication landing after it leaves the next launch off its "==" targets. So CTA 0
+            # waits for every publication and every last claim, and the grid sync below holds every
+            # CTA behind it.
+            iket.range_push("tail.wait_waiters_before_reset")
+            gather_b_passed_barrier.arrive_and_wait()
+            if linear_cta_idx == Int32(0):
+                if thread_idx == Int32(0):
+                    payload_target = Int32(self.token_comm.payload_ready_target)
+                    spin_wait(
+                        self._device_workspace.ptr(self.token_comm.token_data_ready_region),
+                        lambda value: value >= payload_target,
+                        scope="sys",
+                    )
+                    spin_wait(
+                        self._device_workspace.ptr(self.token_comm.token_sf_plain_ready_region),
+                        lambda value: value >= payload_target,
+                        scope="sys",
+                    )
+                    # Written before prefix_ready, so before the metadata_ready this warp waited for.
+                    refine_block_total = cute.arch.load(
+                        self._device_workspace.ptr(self.token_comm.refine_block_total_region),
+                        Int32,
+                        sem="acquire",
+                        scope="gpu",
+                    )
+                    claim_target = refine_block_total + Int32(
+                        self.token_comm.refine_final_claim_count
+                    )
+                    spin_wait(
+                        self._device_workspace.ptr(self.token_comm.refine_work_counter_region),
+                        lambda value: value >= claim_target,
+                        scope="gpu",
+                    )
+            iket.range_pop()
+
             iket.range_push("tail.grid_sync_before_reset")
             self.tail_barrier.sync(
                 epilogue_thread_count,
@@ -1318,6 +1373,7 @@ class BlockScaledSwapAbGenphaseMoeKernel(KernelClass):
                 lambda value: value == Int32(self.token_comm.metadata_ready_target),
                 scope="gpu",
             )
+            gather_b_passed_barrier.arrive()
             iket.range_pop()
             sched_consumer = scheduler.make_consumer()
             self._mainloop.run_tma_gather_b1(

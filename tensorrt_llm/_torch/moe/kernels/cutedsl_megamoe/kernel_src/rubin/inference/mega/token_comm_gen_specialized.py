@@ -596,6 +596,16 @@ class GenphaseTokenComm(KernelComponent):
         """Every pusher publishes to every peer, whether or not it sent that peer bytes."""
         return self.pusher_cta_count * self.world_size
 
+    @property
+    def refine_final_claim_count(self) -> int:
+        """Claims ``refine_work_counter`` takes beyond the ``refine_block_total`` real blocks in one launch.
+
+        A refine group keeps claiming until it draws an index of at least the total, so every group ends on
+        exactly one such claim, which is also its last access to the workspace. The groups belong to the
+        helper and the pushers; the exchange CTAs leave after sorting.
+        """
+        return self.refine_participant_groups * (1 + self.pusher_cta_count)
+
     # ------------------------------------------------------------------
     # GMEM workspace
     # ------------------------------------------------------------------
@@ -607,10 +617,11 @@ class GenphaseTokenComm(KernelComponent):
         zeroed between launches. This component never resets from inside: it exits
         while the dependent main kernel is still consuming ``token_data_ready``,
         so clearing counters here would strand any CTA that had not yet observed
-        them. The reset therefore belongs to whoever outlives it -- normally the
-        main kernel's tail, which zeroes the span between two NVLink barriers. A
-        launch without that main kernel (a standalone test) has to zero on the
-        host instead.
+        them. The reset therefore belongs to the main kernel's tail, which first
+        waits for this launch's last payload publications (``payload_ready_target``)
+        and refine claims (``refine_final_claim_count``) and then zeroes the span
+        between a grid sync and an NVLink barrier. A launch without that main
+        kernel (a standalone test) has to zero on the host instead.
         """
         self._register_symmetric_regions(workspace)
         self._register_local_regions(workspace)

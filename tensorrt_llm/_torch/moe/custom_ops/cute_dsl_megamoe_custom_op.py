@@ -49,7 +49,7 @@ from tensorrt_llm._torch.autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, sm_reserve
 from tensorrt_llm._torch.utils import (
     get_last_power_of_2_num_tokens_buckets,
     last_positive_power_of_2,
@@ -70,6 +70,7 @@ __all__ = [
     "default_megamoe_tactic",
     "enumerate_megamoe_candidate_tactics",
     "megamoe_activation_sf_bytes_per_row",
+    "megamoe_occupancy_sm_reserve",
     "validate_megamoe_tactic",
 ]
 
@@ -647,13 +648,41 @@ def _is_pow2_in_range(val: int, lo: int, hi: int) -> bool:
     return lo <= val <= hi and (val & (val - 1)) == 0
 
 
+# The SM reserve the first occupancy query ran with; None before it.
+_MEGAMOE_OCCUPANCY_SM_RESERVE: Optional[int] = None
+
+
+def megamoe_occupancy_sm_reserve() -> Optional[int]:
+    """The SM reserve (``TRTLLM_CUTEDSL_SM_RESERVE``) MegaMoE's first occupancy query ran with.
+
+    MegaMoE caches its occupancy without the reserve in the key and sizes its workspaces from it
+    while the model is built, so a reserve set after the first query never reaches it.  A caller
+    that needs a reserve (the dense DWDP SM gather) sets it before the model is built and
+    compares this value with ``sm_reserve()`` afterwards.
+
+    Returns:
+        The reserve, or None before the first query.
+    """
+    return _MEGAMOE_OCCUPANCY_SM_RESERVE
+
+
 @functools.lru_cache(maxsize=None)
 def _max_active_clusters(cluster_size: int, sm_version: Optional[int] = None) -> int:
-    """Query occupancy, keyed by cluster size and active architecture."""
+    """Query occupancy, keyed by cluster size and active architecture.
+
+    The key leaves the SM reserve out on purpose: the workspaces are sized from the first answer,
+    so every later launch must get the same one.  The first query records the reserve it ran with
+    (``megamoe_occupancy_sm_reserve``).
+    """
+    global _MEGAMOE_OCCUPANCY_SM_RESERVE
     del sm_version  # Cache-key discriminator; HardwareInfo queries the active device.
     import cutlass.utils as cutlass_utils
 
-    return int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
+    reserve = sm_reserve()
+    max_active_clusters = int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
+    if _MEGAMOE_OCCUPANCY_SM_RESERVE is None:
+        _MEGAMOE_OCCUPANCY_SM_RESERVE = reserve
+    return max_active_clusters
 
 
 def _launch_cluster_configuration(
