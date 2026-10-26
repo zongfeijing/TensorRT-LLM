@@ -1280,7 +1280,9 @@ def _create_py_executor(
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
             # Without the KV-cache estimation this is the final executor, which
-            # primes the standalone dense DWDP manager and exits it at shutdown.
+            # primes the DWDP manager or the standalone dense DWDP manager and
+            # exits it at shutdown.
+            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
             dense_dwdp_manager=dense_dwdp_manager
             if not estimating_kv_cache else None,
             max_num_sequences=max_num_seq_slots,
