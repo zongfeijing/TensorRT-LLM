@@ -73,6 +73,7 @@ from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
     _init_multi_frontend_mode, _signal_frontend_ready,
     _spawn_attached_frontends, _terminate_attached_frontends)
+from tensorrt_llm.serve.openai_server import _graceful_shutdown_timeout_from_env
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -537,6 +538,11 @@ def launch_server(
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
         runtime_control_api_key: Optional[str] = None):
+
+    # OpenAIServer reads the graceful-shutdown timeout when it starts uvicorn,
+    # after the model has loaded; read it here too, so that a malformed value
+    # fails before the model loads.
+    _graceful_shutdown_timeout_from_env()
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
