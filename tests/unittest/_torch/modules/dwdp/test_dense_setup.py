@@ -500,6 +500,7 @@ class FakeOps:
         self.compute = FakeStream("compute")
         self.copy = FakeStream("copy")
         self.current = self.compute
+        self.pdl_breaks = 0
 
     def new_event(self):
         return FakeEvent(self.log)
@@ -526,6 +527,10 @@ class FakeOps:
 
     def nvtx_range(self, message):
         return contextlib.nullcontext()
+
+    def new_pdl_break(self):
+        self.pdl_breaks += 1
+        return lambda: self.log.append("break")
 
 
 class FakeWeightManager:
@@ -921,7 +926,8 @@ class RankSpec:
     collective at which the rank sends a ``dict`` instead of its report.  ``loopback`` runs the
     real ``LoopbackShardStore`` instead of ``FakeStore``.  ``moe_layers`` None runs setup without
     an expert layer list, as standalone dense DWDP does; ``lazy_transfer`` passes a
-    ``LazyTransfer`` instead of the weight manager.
+    ``LazyTransfer`` instead of the weight manager.  ``use_gather`` and ``use_batched`` are the
+    transfer's mode, ``pdl_break`` is ``TRTLLM_DWDP_DENSE_PDL_BREAK``.
     """
 
     requested: bool = True
@@ -945,6 +951,7 @@ class RankSpec:
     use_gather: bool = False
     use_batched: bool = False
     lazy_transfer: bool = False
+    pdl_break: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -990,6 +997,7 @@ class Rank:
             min_bytes=TOY_MIN_BYTES,
             strict=spec.strict,
             debug=spec.debug,
+            pdl_break=spec.pdl_break,
         )
         self.stores = []
         self.launchers = []
@@ -1450,6 +1458,40 @@ def test_the_runtime_gets_the_protocol_the_layers_declaration_and_the_watchdog_a
     group.run(**({} if protocol is None else {"protocol": protocol, "prime": prime}))
     group.committed()
     assert built == [expected] * len(group.ranks)
+
+
+@pytest.mark.parametrize(
+    "use_gather, protocol, switch, line",
+    [
+        (True, CLOSED, None, "on (SM gather, graph mode, TRTLLM_DWDP_DENSE_PDL_BREAK unset): "),
+        (True, LEGACY, None, "off (SM gather, no graph mode, TRTLLM_DWDP_DENSE_PDL_BREAK unset)"),
+        (True, CLOSED, False, "off (TRTLLM_DWDP_DENSE_PDL_BREAK=0)"),
+        (True, LEGACY, True, "on (TRTLLM_DWDP_DENSE_PDL_BREAK=1): H1 and H2 "),
+        (False, LEGACY, None, "off (copy engines, TRTLLM_DWDP_DENSE_PDL_BREAK unset)"),
+        (False, LEGACY, True, "on (TRTLLM_DWDP_DENSE_PDL_BREAK=1): H1 and H2 "),
+    ],
+    ids=[
+        "gather",
+        "gather-legacy",
+        "gather-switched-off",
+        "gather-legacy-switched-on",
+        "copy-engines",
+        "copy-engines-switched-on",
+    ],
+)
+def test_the_runtime_gets_the_pdl_break_of_its_transfer_unless_switched(
+    make_group, use_gather, protocol, switch, line
+):
+    """On by default with the SM gather in graph mode, off with the copy engines and outside graph
+    mode; the switch wins over both.  The runtime creates the break in P2, and the commit logs one
+    line on it."""
+    group = make_group(specs_for(2, use_gather=use_gather, pdl_break=switch))
+    group.run(protocol=protocol, prime=WRAP if protocol is CLOSED else ENTRY)
+    on = line.startswith("on")
+    for rank, runtime in zip(group.ranks, group.committed()):
+        assert runtime.pdl_break is on and rank.ops.pdl_breaks == int(on)
+        (note,) = [message for message in group.messages(rank, "info") if "PDL break" in message]
+        assert note.startswith(f"[DWDP Dense] PDL break {line}"), note
 
 
 #: What the toy drafter shares with the target besides ``lm_head``: nothing, a module, a

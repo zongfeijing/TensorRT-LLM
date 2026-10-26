@@ -52,7 +52,13 @@ import pytest
 
 from tensorrt_llm._torch.modules.dwdp import fabric_gather, vmm
 from tensorrt_llm._torch.modules.dwdp.dense import gate
-from tensorrt_llm._torch.modules.dwdp.dense.config import DENSE_COPY_ENV, DENSE_ENV, DENSE_PRIME_ENV
+from tensorrt_llm._torch.modules.dwdp.dense.config import (
+    DENSE_COPY_ENV,
+    DENSE_ENV,
+    DENSE_PDL_BREAK_ENV,
+    DENSE_PRIME_ENV,
+    DenseConfig,
+)
 from tensorrt_llm._torch.modules.dwdp.dense.gate import dense_graph_mode, validate_dense_gate
 from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
@@ -107,7 +113,7 @@ _GATHER_DEFAULTS = (
 
 BATCHED_GRAPH_INFO = (
     "[DWDP Dense] TRTLLM_DWDP_DENSE_COPY=batched with CUDA graphs: every step copies every covered "
-    "layer on the copy engines, which hold no SMs, so no SM reserve applies"
+    "layer on the copy engines, which hold no SMs, so no SM reserve applies and the PDL break is off"
 )
 BATCHED_GRAPH_RUBIN_WARNING = (
     "[DWDP Dense] TRTLLM_DWDP_DENSE_COPY=batched with CUDA graphs on Rubin (SM107): every step "
@@ -435,6 +441,19 @@ def test_graph_mode_batched_copies_are_logged_for_the_platform(monkeypatch, mess
     assert "graph mode on" in messages[-1][1]
 
 
+def test_the_copy_engine_line_names_a_pdl_break_turned_on(monkeypatch, messages):
+    monkeypatch.setenv(DENSE_COPY_ENV, "batched")
+    monkeypatch.setenv(DENSE_PDL_BREAK_ENV, "1")
+    llm_args = _launch(STANDALONE, cuda_graph_config=CudaGraphConfig())
+
+    assert validate_dense_gate(llm_args, _mapping(STANDALONE)) is STANDALONE
+
+    assert messages[0] == (
+        "info",
+        BATCHED_GRAPH_INFO.replace("is off", f"is on ({DENSE_PDL_BREAK_ENV}=1)"),
+    )
+
+
 @pytest.mark.parametrize(
     "copy, graphs, probed",
     [("batched", True, True), ("batched", False, False), ("gather", True, False)],
@@ -515,7 +534,8 @@ def test_the_gb300_generation_server_runs_standalone_in_graph_mode_without_an_sm
     """``TRTLLM_DWDP_DENSE_COPY=batched``: standalone, graph mode, copy engines, no SM reserve.
 
     The creator applies the gather's compute-side defaults (the SM reserve among them) before the
-    model is built only for the gather, so with the copy engines none of them is set.
+    model is built only for the gather, so with the copy engines none of them is set, and setup
+    leaves the PDL break off.
     """
     monkeypatch.setenv(DENSE_COPY_ENV, "batched")
     _unset_gather_defaults(monkeypatch)
@@ -530,6 +550,7 @@ def test_the_gb300_generation_server_runs_standalone_in_graph_mode_without_an_sm
     assert not any(level == "warning" for level, _ in messages)
     assert py_executor_creator._reserve_dense_gather_sms(llm_args) is False
     assert [name for name in _GATHER_DEFAULTS if name in os.environ] == []
+    assert not DenseConfig.from_env().pdl_break_enabled(use_gather=False, closed=True)
 
 
 def test_the_same_server_with_the_gather_reserves_its_sms_before_the_model_is_built(

@@ -28,6 +28,9 @@ The recording model of ``test_dense_protocol`` (a wait binds to the latest recor
 * :meth:`CaptureFakeOps.replay` runs a graph again on the current stream: the capture stream's
   operations on the current stream, each joined stream's on a replay stream of its own, and every
   wait bound to the replay of the record it was bound to in the capture.
+* A PDL break (``new_pdl_break``, counted in ``pdl_breaks``) enqueues a ``break`` operation on the
+  current stream at each call; creating one in a capture raises :class:`CaptureError`, since its
+  buffer would come from the graph's memory pool.
 
 ``log`` holds the operations that ran, in host order, as ``test_dense_protocol.Entry`` items, so
 ``test_dense_protocol.assert_race_free`` can check them.
@@ -36,7 +39,7 @@ The recording model of ``test_dense_protocol`` (a wait binds to the latest recor
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from test_dense_protocol import Entry, happens_before, vector_clocks
 
@@ -98,6 +101,7 @@ class CaptureFakeOps:
         self.multi_stream = False
         self.graph: Graph | None = None
         self.replay_streams: dict[Stream, Stream] = {}
+        self.pdl_breaks = 0  # PDL breaks created
 
     # -- DeviceOps -------------------------------------------------------------
 
@@ -129,6 +133,13 @@ class CaptureFakeOps:
     @contextlib.contextmanager
     def nvtx_range(self, message: str) -> Iterator[None]:
         yield
+
+    def new_pdl_break(self) -> Callable[[], None]:
+        """The PDL break: each call enqueues a ``break`` on the current stream."""
+        if self.graph is not None:
+            raise CaptureError("the PDL break is created in a capture")
+        self.pdl_breaks += 1
+        return lambda: self.run("break", self.current)
 
     # -- stream operations -----------------------------------------------------
 

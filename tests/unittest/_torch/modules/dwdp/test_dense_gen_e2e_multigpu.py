@@ -52,9 +52,9 @@ holds more tokens with the memory dense DWDP frees.  Probes in the workers show 
 took each path above, that steps of the run without the watchdog began while the step before
 still ran, that every replay of a dense run, and none of a replicated one, ran behind the replay
 guard the model registers with the CUDA graph runner, that on every rank the runtime ran the
-transfer asked for (with the copy engines without an SM reserve in any run) and captured its
-graphs, and ended without a demand fetch, a fence fallback, a recovery or a slot watchdog
-mismatch, after serving steps that replayed graphs.
+transfer asked for (with the copy engines without an SM reserve in any run, and without the PDL
+break) and captured its graphs, and ended without a demand fetch, a fence fallback, a recovery or
+a slot watchdog mismatch, after serving steps that replayed graphs.
 """
 
 from __future__ import annotations
@@ -212,8 +212,9 @@ def _install_probes() -> None:
     dummies, batch size of the graph it replayed or None, whether the execution stream still ran
     earlier work when the step began)``.  ``guarded``: per graph replay, whether the dense replay
     guard (``DenseDwdpManager.register_replay_guard``) is among the runner's pre-replay hooks.
-    ``dense``: the dense runtime's ``_COUNTERS`` and its launcher's transfer (``copy``) when the
-    manager releases it.  The request queue waits for requests only in its first fetch.
+    ``dense``: the dense runtime's ``_COUNTERS``, its launcher's transfer (``copy``) and whether it
+    runs the PDL break (``pdl_break``) when the manager releases it.  The request queue waits for
+    requests only in its first fetch.
     """
     from tensorrt_llm._torch.modules.dwdp.dense.manager import DenseDwdpManager
     from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
@@ -249,6 +250,7 @@ def _install_probes() -> None:
         if self.dense is not None:
             record["dense"] = {name: getattr(self.dense, name) for name in _COUNTERS}
             record["dense"]["copy"] = self.dense._launcher.mode.value
+            record["dense"]["pdl_break"] = self.dense.pdl_break
         cleanup(self)
 
     def first_fetch_waits(self, timeout):
@@ -394,6 +396,8 @@ def test_dense_dwdp_keeps_the_tokens_of_a_generation_server(reference, debug):
         assert rank["guarded"] and all(rank["guarded"])
         counters = rank["dense"]
         assert counters["copy"] == transfer
+        # The PDL break's default: on with the SM gather in graph mode, off with the copy engines.
+        assert counters["pdl_break"] is (transfer == "gather")
         assert counters["captures"] > 0 and (counters["watchdog_checks"] > 0) is (debug >= 2)
         assert counters["recoveries"] == counters["demand_fetches"] == 0
         assert counters["war_fences"] == counters["watchdog_mismatches"] == 0

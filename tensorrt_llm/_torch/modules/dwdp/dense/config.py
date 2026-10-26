@@ -51,11 +51,24 @@
   the tail of that step: final norm, ``lm_head``, drafter and sampling) or ``entry`` (at the start
   of every forward; a fallback for debugging and A/B runs).  Outside graph mode dense DWDP primes
   at the start of every forward, and the gate warns that any value, valid or not, is ignored.
+* ``TRTLLM_DWDP_DENSE_PDL_BREAK`` -- the PDL break (``types.PdlBreak``): H1 of every covered
+  layer, right after the compute stream waits for the layer's gather, and H2, after the gather it
+  enqueues, launch one tiny kernel without programmatic dependent launch (PDL) on the compute
+  stream.  It keeps the PDL-launched kernel after the hook from being dispatched ahead of the
+  gather that becomes eligible with it, which would put the gather's clusters on the SMs that
+  MegaMoE needs for its 4-CTA clusters and stall MegaMoE until the gather ends.  Default: on with
+  the SM gather in graph mode (the closed protocol, where that stall was diagnosed); off with the
+  copy engines, which hold no SMs and whose copies a CUDA graph orders before a PDL-launched
+  kernel only through full dependencies, and outside graph mode (the legacy protocol); ``0``
+  turns it off (A/B runs), ``1`` on everywhere.  It adds one kernel launch per hook; setup logs
+  whether it is on.
 
 Booleans accept ``1/true/yes/on`` and ``0/false/no/off`` (any case); unset or empty means the
 default.  A flag that defaults to off is on only for an explicit true value; any other value logs
-a warning and keeps the default.  Integers that do not parse, or are negative, log a warning and
-keep the default.  An invalid segment list raises.  ``TRTLLM_DWDP_DENSE_COPY`` and
+a warning and keeps the default.  ``TRTLLM_DWDP_DENSE_PDL_BREAK`` has no fixed default: unset,
+empty or another value (with the warning) leave it to the transfer and the protocol
+(:meth:`DenseConfig.pdl_break_enabled`).  Integers that do not parse, or are negative, log a
+warning and keep the default.  An invalid segment list raises.  ``TRTLLM_DWDP_DENSE_COPY`` and
 ``TRTLLM_DWDP_DENSE_PRIME`` are read as set and validated only where they apply: standalone
 (:meth:`DenseConfig.standalone_copy_mode`) and in graph mode (:meth:`DenseConfig.prime_policy`).
 
@@ -96,15 +109,22 @@ DENSE_STRICT_ENV = "TRTLLM_DWDP_DENSE_STRICT"
 DENSE_DEBUG_ENV = "TRTLLM_DWDP_DENSE_DEBUG"
 DENSE_COPY_ENV = "TRTLLM_DWDP_DENSE_COPY"
 DENSE_PRIME_ENV = "TRTLLM_DWDP_DENSE_PRIME"
+DENSE_PDL_BREAK_ENV = "TRTLLM_DWDP_DENSE_PDL_BREAK"
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _FALSE_VALUES = ("0", "false", "no", "off")
 
 
 def _bool_env(environ: Mapping[str, str], name: str, default: bool) -> bool:
+    value = _optional_bool_env(environ, name, str(int(default)))
+    return default if value is None else value
+
+
+def _optional_bool_env(environ: Mapping[str, str], name: str, fallback: str) -> bool | None:
+    """``name`` as a boolean; None if unset or empty, or with a warning if not a boolean."""
     raw = environ.get(name)
     if raw is None or not raw.strip():
-        return default
+        return None
     value = raw.strip().lower()
     if value in _TRUE_VALUES:
         return True
@@ -112,9 +132,9 @@ def _bool_env(environ: Mapping[str, str], name: str, default: bool) -> bool:
         return False
     logger.warning(
         f"{LOG_PREFIX} {name}={raw!r} is not one of 1/true/yes/on or 0/false/no/off; "
-        f"using {int(default)}"
+        f"using {fallback}"
     )
-    return default
+    return None
 
 
 def _int_env(environ: Mapping[str, str], name: str, default: int) -> int:
@@ -224,6 +244,8 @@ class DenseConfig:
         prime: ``TRTLLM_DWDP_DENSE_PRIME`` as set, blanks stripped and case kept; None when unset
             or blank.  Kept as given and validated only by :meth:`prime_policy`, like ``copy``:
             outside graph mode it is ignored.
+        pdl_break: ``TRTLLM_DWDP_DENSE_PDL_BREAK``; None when unset, blank or not a boolean, so
+            that :meth:`pdl_break_enabled` follows the transfer and the protocol.
     """
 
     enabled: bool = False
@@ -235,6 +257,7 @@ class DenseConfig:
     debug: int = 0
     copy: str | None = None
     prime: str | None = None
+    pdl_break: bool | None = None
 
     def __post_init__(self) -> None:
         segments = _canonical_segments(self.segments)
@@ -276,6 +299,9 @@ class DenseConfig:
             debug=_int_env(env, DENSE_DEBUG_ENV, 0),
             copy=copy or None,
             prime=prime or None,
+            pdl_break=_optional_bool_env(
+                env, DENSE_PDL_BREAK_ENV, "the default (on with the SM gather in graph mode)"
+            ),
         )
 
     def standalone_copy_mode(self) -> CopyMode:
@@ -305,6 +331,23 @@ class DenseConfig:
         if self.prime is None:
             return PrimePolicy.WRAP
         return parse_prime_policy(self.prime)
+
+    def pdl_break_enabled(self, *, use_gather: bool, closed: bool) -> bool:
+        """Whether H1 and H2 launch the PDL break: ``pdl_break``, else ``use_gather and closed``.
+
+        Setup decides it for the transfer and the protocol it runs: on by default with the SM
+        gather in graph mode, where the gather that becomes eligible at a hook must be dispatched
+        before the next PDL-launched compute kernel (``types.PdlBreak``); off with the copy
+        engines, which hold no SMs, and under the legacy protocol, where that stall was not
+        observed.
+
+        Args:
+            use_gather: The dense copies use the SM fabric gather (``CopyMode.GATHER``).
+            closed: The runtime runs the closed protocol (graph mode).
+        """
+        if self.pdl_break is not None:
+            return self.pdl_break
+        return use_gather and closed
 
     @property
     def slot_fill_byte(self) -> int:

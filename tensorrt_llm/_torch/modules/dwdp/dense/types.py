@@ -30,9 +30,10 @@ This module holds what more than one part of the implementation reads or writes:
 * the forward protocols of the runtime and the static copy schedule of the closed one
   (:func:`closed_schedule`),
 * the CUDA seams the runtime calls, with their torch implementation (:class:`TorchCudaOps`),
+  and the PDL break of the hooks (:class:`PdlBreak`),
 * alignment constants, checksums and exceptions.
 
-Nothing here calls CUDA at import time; only :class:`TorchCudaOps` and
+Nothing here calls CUDA at import time; only :class:`TorchCudaOps`, :class:`PdlBreak` and
 :func:`allocate_slot_ring` with a CUDA device do, when called.
 """
 
@@ -1154,6 +1155,13 @@ class DeviceOps(Protocol):
         """Context that wraps an NVTX range named ``message``."""
         ...
 
+    def new_pdl_break(self) -> Callable[[], None]:
+        """A new :class:`PdlBreak`, whose calls enqueue its kernel on the current stream.
+
+        The runtime creates it once, when it is constructed, outside any capture.
+        """
+        ...
+
 
 class TorchCudaOps:
     """:class:`DeviceOps` backed by ``torch.cuda``.
@@ -1192,6 +1200,47 @@ class TorchCudaOps:
     def nvtx_range(self, message: str) -> AbstractContextManager[object]:
         """``torch.cuda.nvtx.range(message)``."""
         return torch.cuda.nvtx.range(message)
+
+    def new_pdl_break(self) -> PdlBreak:
+        """A :class:`PdlBreak` on the dense device."""
+        return PdlBreak(self._device)
+
+
+class PdlBreak:
+    """The PDL break: one tiny kernel that the next PDL-launched kernel cannot overtake.
+
+    A kernel launched with programmatic dependent launch (PDL) may launch once every block of the
+    kernels it depends on has exited or triggered it, and in a CUDA graph capture a stream wait
+    for an event of another stream gives it such a programmatic edge from that stream's kernel
+    too.  A kernel launched without PDL waits for full completion instead, as do the gather
+    behind the one that H1 waits for on the copy stream and the gather that H2 enqueues behind
+    the attention kernels.  So the PDL-launched compute kernel after the hook is dispatched first
+    (on Kimi-K3 generation servers the persistent attention-residual kernel, one CTA on every SM),
+    the gather's clusters land on the SMs that MegaMoE needs for its 4-CTA clusters as that
+    kernel's CTAs exit, and MegaMoE, whose clusters must all be resident at once, waits for the
+    gather to end.
+
+    Each call fills the break's own one-element buffer on the current stream: a plain kernel
+    launch (a kernel node in a capture) without the programmatic stream serialization attribute,
+    so it starts once everything before it has completed, together with the gather, and without
+    an early trigger, so a PDL-launched kernel after it launches only once its single block has
+    exited, by when the gather has normally been dispatched.  Nothing reads the buffer.
+
+    Copy-engine copies (``CopyMode.BATCHED``) need no break: they hold no SMs, and in a CUDA
+    graph a programmatic dependency joins kernel nodes only, so the PDL kernel after a hook
+    depends on a copy node through a full dependency.
+
+    Args:
+        device: The CUDA device of the buffer; None means the current device.
+    """
+
+    def __init__(self, device: torch.device | int | None = None) -> None:
+        device = "cuda" if device is None else device
+        self._buffer = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def __call__(self) -> None:
+        """Enqueue the break on the current stream."""
+        self._buffer.fill_(1)
 
 
 # ---------------------------------------------------------------------------

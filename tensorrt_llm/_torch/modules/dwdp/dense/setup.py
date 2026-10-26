@@ -35,7 +35,13 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ..setup import _get_decoder_model
-from .config import DENSE_ENV, DENSE_REQUIRED_ENV, DenseConfig, dense_dwdp_requested
+from .config import (
+    DENSE_ENV,
+    DENSE_PDL_BREAK_ENV,
+    DENSE_REQUIRED_ENV,
+    DenseConfig,
+    dense_dwdp_requested,
+)
 from .layout import collect_dense_layout, compute_checksums
 from .plan import DenseCopyLauncher, build_copy_plans, select_copy_mode
 from .repoint import BindingState, DenseBindings
@@ -297,9 +303,10 @@ def setup_dense_dwdp(
        the runtime on ``transfer.copy_stream`` (the first read of it; it records the consume
        events; with ``config.slot_watchdog`` it gets the slot checksum watchdog over the P1
        checksums, with its device assert if ``config.slot_watchdog_assert``) with ``protocol``,
-       ``prime`` and ``multi_stream_ok``, which is True when the class of every covered decoder
-       layer sets :data:`MULTI_STREAM_SAFE_ATTR` to True, then export.  Data: the exported
-       handles.
+       ``prime``, ``multi_stream_ok``, which is True when the class of every covered decoder
+       layer sets :data:`MULTI_STREAM_SAFE_ATTR` to True, and ``pdl_break``,
+       ``config.pdl_break_enabled(use_gather=transfer.use_gather, closed=protocol is CLOSED)``,
+       then export.  Data: the exported handles.
     3. P3: import and map the peers, build the plans and, with the copy stream current, the
        launcher; install it, ``synchronize``.  Doubles as the barrier after every write and
        mapping.
@@ -314,8 +321,9 @@ def setup_dense_dwdp(
     P6 (no collective, host only): ``DenseBindings.commit`` (drop originals, release check),
     ``torch.cuda.empty_cache()``, ``DenseDWDP.commit`` with ``config.slot_fill_byte``, set
     ``_dense_dwdp_active`` on the model and its decoder, log the commit line with the moved,
-    store, slot and freed bytes and the leak count; under ``CLOSED``, without leaks, warn when
-    the device got back less than half of the moved bytes net of the store and the slots.
+    store, slot and freed bytes and the leak count, then one line that says whether the PDL break
+    is on and why; under ``CLOSED``, without leaks, warn when the device got back less than half
+    of the moved bytes net of the store and the slots.
 
     Every phase's local work catches ``Exception`` into ``ok=False``; ``BaseException`` propagates.
     Abandoning releases everything this rank allocated: the bindings are rolled back, then the
@@ -448,6 +456,8 @@ class _DenseSetup:
         self._runtime: DenseDWDP | None = None
         self._launcher: LayerLauncher | None = None
         self._bindings: DenseBindings | None = None
+        # Whether the transfer uses the SM gather, read in P2 for the PDL break.
+        self._use_gather = False
 
     def run(self) -> DenseDWDP | None:
         """Run the phases; whatever escapes releases this rank's dense state first."""
@@ -611,6 +621,7 @@ class _DenseSetup:
                 watchdog = SlotWatchdog.from_layout(
                     layout, self._device, device_assert=self._config.slot_watchdog_assert
                 )
+            self._use_gather = bool(self._transfer.use_gather)
             # The first read of the copy stream, which the transfer may create here: a failure
             # is this rank's P2 report.
             self._runtime = DenseDWDP(
@@ -625,6 +636,9 @@ class _DenseSetup:
                 protocol=self._protocol,
                 prime=self._prime,
                 multi_stream_ok=_multi_stream_safe(self._decoder, layout.layers),
+                pdl_break=self._config.pdl_break_enabled(
+                    use_gather=self._use_gather, closed=self._protocol is DenseProtocol.CLOSED
+                ),
             )
             payload = store.export()
         except Exception as exc:  # a local failure must reach collective #2, never skip it
@@ -717,6 +731,10 @@ class _DenseSetup:
             f"freed(memory_allocated)={_gb(self._allocated_before - allocated_after)}GB "
             f"leaks={len(leaks)} layers={len(layout.layers)} segments={_segment_names(layout)} "
             f"setup={time.monotonic() - self._started:.1f}s"
+        )
+        closed = self._protocol is DenseProtocol.CLOSED
+        logger.info(
+            f"{LOG_PREFIX} {_pdl_break_note(config, self._use_gather, closed, runtime.pdl_break)}"
         )
         # A generation server sizes its KV cache from the free device memory after setup.
         net = layout.moved_bytes - layout.store_bytes - layout.slot_bytes
@@ -1052,6 +1070,25 @@ def _listing(findings: Sequence[str]) -> str:
 
 def _segment_names(layout: DenseLayout) -> str:
     return ",".join(kind.value for kind in layout.segment_kinds)
+
+
+def _pdl_break_note(config: DenseConfig, use_gather: bool, closed: bool, on: bool) -> str:
+    """The commit's line on the PDL break: whether it is on, and why."""
+    if config.pdl_break is None:
+        if not use_gather:
+            transfer = "copy engines"
+        else:
+            transfer = f"SM gather, {'graph mode' if closed else 'no graph mode'}"
+        why = f"{transfer}, {DENSE_PDL_BREAK_ENV} unset"
+    else:
+        why = f"{DENSE_PDL_BREAK_ENV}={int(config.pdl_break)}"
+    if not on:
+        return f"PDL break off ({why})"
+    return (
+        f"PDL break on ({why}): H1 and H2 of every covered layer launch one non-PDL kernel on the "
+        f"compute stream, so that the gather that becomes eligible there is dispatched before "
+        f"the next PDL-launched compute kernel"
+    )
 
 
 def _gb(nbytes: int) -> str:

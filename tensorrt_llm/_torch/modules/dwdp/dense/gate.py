@@ -31,7 +31,7 @@ from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, PrefillCudaGraphB
 from tensorrt_llm.logger import logger
 
 from .. import fabric_gather, vmm
-from .config import DENSE_COPY_ENV, DENSE_ENV, DENSE_PRIME_ENV, DenseConfig
+from .config import DENSE_COPY_ENV, DENSE_ENV, DENSE_PDL_BREAK_ENV, DENSE_PRIME_ENV, DenseConfig
 from .plan import batched_copy_capture_error
 from .types import LOG_PREFIX, CopyMode, DenseMode, PrimePolicy
 
@@ -116,8 +116,9 @@ def validate_dense_gate(llm_args: TorchLlmArgs, mapping: Mapping) -> DenseMode:
        standalone gather launch that passes logs one warning, which names the settings the gather
        was validated with on a context server or, in graph mode, the SM reserve set for it.  A
        graph-mode ``batched`` launch logs one INFO line: the copy engines hold no SMs, so no SM
-       reserve applies.  On Rubin (SM107), where the SM gather moves these copies faster than the
-       copy engines, it logs one warning that recommends ``gather`` instead.
+       reserve applies and the PDL break (``TRTLLM_DWDP_DENSE_PDL_BREAK``) is off unless set.  On
+       Rubin (SM107), where generation servers were validated with the SM gather, it logs one
+       warning that recommends ``gather`` instead.
 
     A launch that passes logs its mode, graph mode, priming policy and ``TRTLLM_DISAGG_ROLE``.
 
@@ -176,7 +177,7 @@ def validate_dense_gate(llm_args: TorchLlmArgs, mapping: Mapping) -> DenseMode:
             f"this host shares {handle_type.name} handles",
         )
     if mode is DenseMode.STANDALONE:
-        _check_standalone(copy_mode, graph_mode)
+        _check_standalone(config, copy_mode, graph_mode)
     role = os.environ.get(_DISAGG_ROLE_ENV) or "unset"
     logger.info(
         f"{LOG_PREFIX} launch gate passed: {mode.value} mode, graph mode "
@@ -259,7 +260,7 @@ def _check_speculation(speculative_config: DecodingBaseConfig | None, graph_mode
     _reject(_SPECULATION, f"speculative_config is {actual}")
 
 
-def _check_standalone(copy_mode: CopyMode, graph_mode: bool) -> None:
+def _check_standalone(config: DenseConfig, copy_mode: CopyMode, graph_mode: bool) -> None:
     """The standalone-only requirements (step 5), after the common ones."""
     if mpi_disabled():
         _reject(
@@ -268,7 +269,7 @@ def _check_standalone(copy_mode: CopyMode, graph_mode: bool) -> None:
             "TLLM_DISABLE_MPI=1",
         )
     if copy_mode is CopyMode.BATCHED and graph_mode:
-        _check_batched_graph_copies()
+        _check_batched_graph_copies(config)
     if copy_mode is not CopyMode.GATHER:
         return
     if fabric_gather.gather_op() is None:
@@ -294,7 +295,7 @@ def _check_standalone(copy_mode: CopyMode, graph_mode: bool) -> None:
     )
 
 
-def _check_batched_graph_copies() -> None:
+def _check_batched_graph_copies(config: DenseConfig) -> None:
     """Graph mode with ``batched`` (step 5): the capture probe, then the transfer's log line."""
     error = batched_copy_capture_error()
     if error is not None:
@@ -311,9 +312,13 @@ def _check_batched_graph_copies() -> None:
             f"{DENSE_COPY_ENV}=gather, which is recommended here"
         )
         return
+    if config.pdl_break_enabled(use_gather=False, closed=True):
+        pdl_break = f"the PDL break is on ({DENSE_PDL_BREAK_ENV}=1)"
+    else:
+        pdl_break = "the PDL break is off"
     logger.info(
         f"{LOG_PREFIX} {DENSE_COPY_ENV}=batched with CUDA graphs: every step copies every covered "
-        f"layer on the copy engines, which hold no SMs, so no SM reserve applies"
+        f"layer on the copy engines, which hold no SMs, so no SM reserve applies and {pdl_break}"
     )
 
 

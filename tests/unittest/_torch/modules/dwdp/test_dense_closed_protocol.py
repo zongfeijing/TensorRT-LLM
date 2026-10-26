@@ -31,8 +31,8 @@ import random
 from collections.abc import Callable, Iterable
 
 import pytest
-from _capture_fake_ops import CaptureError, CaptureFakeOps, Graph
-from test_dense_protocol import assert_race_free, happens_before, vector_clocks
+from _capture_fake_ops import CaptureError, CaptureFakeOps, Graph, Stream
+from test_dense_protocol import Entry, assert_race_free, happens_before, vector_clocks
 
 from tensorrt_llm._torch.modules.dwdp.dense.runtime import DenseDWDP
 from tensorrt_llm._torch.modules.dwdp.dense.types import (
@@ -93,6 +93,7 @@ class Model:
         multi_stream_ok: bool = True,
         strict: bool = False,
         watchdog: SlotWatchdog | None = None,
+        pdl_break: bool = False,
     ) -> None:
         self.ops = CaptureFakeOps()
         self.layers = tuple(layers)
@@ -112,6 +113,7 @@ class Model:
             protocol=protocol,
             prime=prime,
             multi_stream_ok=multi_stream_ok,
+            pdl_break=pdl_break,
         )
         self.runtime.set_launcher(self.launch)
         self.runtime.commit(None, fill_byte=0)
@@ -491,3 +493,86 @@ def test_the_watchdog_is_read_after_the_forward_and_asserted_at_h4(strict):
             runtime.poll_watchdog()
     else:
         assert runtime.poll_watchdog() == [(layer, ATTN, 1) for layer in (1, 3, 5, 7)]
+
+
+def assert_pdl_breaks(
+    ops: list[Entry], start: int, end: int, origin: Stream, layers: tuple[int, ...]
+) -> None:
+    """The PDL breaks of the forward ``ops[start:end]``, whose execution stream is ``origin``.
+
+    ``ops`` is a capture's operations or the log, with an eager forward or a replay at
+    ``start:end``.  Two breaks per covered layer, on ``origin``, H1's and H2's in host order.
+    H1's follows the latest copy of its layer, which the hook waited for, and precedes the
+    layer's attention read; the copy behind that copy on the copy stream does not wait for it.
+    H2's follows the attention read and precedes the MoE reads; the copy that H2 enqueues does
+    not wait for it.
+    """
+    clocks = vector_clocks(ops)
+
+    def before(first: int, second: int) -> bool:
+        return happens_before(ops, clocks, first, second)
+
+    def found(kind: str, what: str, layer: int) -> list[int]:
+        return [
+            index
+            for index in range(start, end)
+            if (ops[index].kind, ops[index].what, ops[index].layer) == (kind, what, layer)
+        ]
+
+    breaks = [index for index in range(start, end) if ops[index].kind == "break"]
+    assert len(breaks) == 2 * len(layers)
+    assert all(ops[index].stream is origin for index in breaks)
+    for number, brk in enumerate(breaks):
+        position, h2 = divmod(number, 2)
+        layer = layers[position]
+        (attention,) = found("read", ATTN.value, layer)
+        if h2:
+            assert before(attention, brk), f"H2({layer}): the attention read follows the break"
+            assert all(before(brk, read) for read in found("read", MOE.value, layer)), layer
+            if position + 2 < len(layers):
+                (gather,) = found("launch", "L", layers[position + 2])
+                assert not before(brk, gather), f"H2({layer}): its gather waits for the break"
+            continue
+        assert before(brk, attention), f"H1({layer}): the attention read precedes the break"
+        copies = [i for i in range(brk) if (ops[i].kind, ops[i].layer) == ("launch", layer)]
+        if not copies:  # a capture's entry barrier stands in for a copy made before the capture
+            continue
+        assert before(copies[-1], brk), f"H1({layer}): the break does not follow L({layer})"
+        behind = next((i for i in range(copies[-1] + 1, end) if ops[i].kind == "launch"), None)
+        assert behind is None or not before(brk, behind), f"H1({layer}): the next copy waits for it"
+
+
+@pytest.mark.parametrize("prime", [WRAP, ENTRY], ids=["wrap", "entry"])
+@pytest.mark.parametrize("pdl_break", [False, True], ids=["off", "on"])
+def test_every_forward_launches_the_pdl_break_after_the_h1_waits_and_the_h2_gathers(
+    pdl_break, prime
+):
+    """``pdl_break``: eager forwards (multi-stream execution off and on), a capture and its
+    replays launch the PDL break at H1 and H2 of every covered layer (:func:`assert_pdl_breaks`),
+    and the runtime creates it once, outside the captures; without it nothing is created or
+    launched."""
+    model = Model(prime=prime, pdl_break=pdl_break)
+    ops = model.ops
+    forwards = []
+
+    def step(action: Callable[[], None], multi_stream: bool = False) -> None:
+        start = len(ops.log)
+        ops.multi_stream = multi_stream
+        action()
+        ops.multi_stream = False
+        forwards.append((start, len(ops.log)))
+
+    step(model.forward)
+    model.capture(1)
+    step(lambda: model.replay(1))
+    step(model.forward, multi_stream=True)
+    step(lambda: model.replay(1))
+    graph = model.graphs[1]
+    assert ops.pdl_breaks == int(pdl_break)
+    if not pdl_break:
+        assert [entry for entry in (*ops.log, *graph.ops) if entry.kind == "break"] == []
+        return
+    assert_pdl_breaks(graph.ops, 0, len(graph.ops), graph.origin, model.layers)
+    for start, end in forwards:
+        assert_pdl_breaks(ops.log, start, end, ops.exec, model.layers)
+    assert model.assert_race_free() > 0

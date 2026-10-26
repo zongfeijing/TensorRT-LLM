@@ -65,10 +65,11 @@ Owner = tuple[int, str, int | None]
 class Entry:
     """One log entry, in host order.
 
-    ``kind`` is ``record``, ``wait``, ``launch`` or ``read`` (stream operations), or ``mark``,
-    ``nvtx``, ``sync``, ``detach``, ``store`` (host-side).  ``bound`` is the log index of the
-    record a ``wait`` binds to (None: the event was never recorded).  ``what`` is ``L``/``E`` for
-    a launch, the segment for a read, the hook for a mark and the range name for NVTX.
+    ``kind`` is ``record``, ``wait``, ``launch``, ``read`` or ``break`` (the PDL break; stream
+    operations), or ``mark``, ``nvtx``, ``sync``, ``detach``, ``store`` (host-side).  ``bound`` is
+    the log index of the record a ``wait`` binds to (None: the event was never recorded).
+    ``what`` is ``L``/``E`` for a launch, the segment for a read, the hook for a mark and the range
+    name for NVTX.
     """
 
     kind: str
@@ -117,6 +118,7 @@ class FakeOps:
         self.multi_stream = False
         self.sync_error: Exception | None = None
         self.record_observers: list[Callable[[FakeStream], None]] = []
+        self.pdl_breaks = 0  # PDL breaks created
 
     def new_event(self) -> FakeEvent:
         return FakeEvent(self)
@@ -147,6 +149,11 @@ class FakeOps:
     def nvtx_range(self, message: str) -> Iterator[None]:
         self.log.append(Entry("nvtx", what=message))
         yield
+
+    def new_pdl_break(self) -> Callable[[], None]:
+        """The PDL break: each call logs a ``break`` on the current stream."""
+        self.pdl_breaks += 1
+        return lambda: self.log.append(Entry("break", stream=self.current))
 
 
 def make_ring(kind: SegmentKind, depth: int | None = None) -> tuple[SlotBuffer, ...]:
@@ -252,6 +259,7 @@ class Driver:
         strict: bool = False,
         commit: bool = True,
         watchdog: SlotWatchdog | None = None,
+        pdl_break: bool = False,
     ) -> None:
         self.ops = FakeOps()
         self.log = self.ops.log
@@ -270,6 +278,7 @@ class Driver:
             ops=self.ops,
             strict=strict,
             watchdog=watchdog,
+            pdl_break=pdl_break,
         )
         self.runtime.set_launcher(self.launch_dense)
         if commit:
@@ -588,4 +597,65 @@ def test_war_barrier_then_reprime_after_an_abort():
     driver.forward()
     assert runtime.demand_fetches == 0 and runtime.war_fences == 0
     driver.assert_race_free()
+    driver.assert_no_host_sync()
+
+
+# ---------------------------------------------------------------------------
+# The PDL break
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("prime", [True, False], ids=["primed", "demand-fetched"])
+@pytest.mark.parametrize("pdl_break", [False, True], ids=["off", "on"])
+def test_the_pdl_break_follows_the_h1_waits_and_the_h2_gathers_on_compute(pdl_break, prime):
+    """``pdl_break``: H1 and H2 of every covered layer launch one break each, on compute.
+
+    H1 launches it after the compute waits, also after a demand fetch: it follows the copy of
+    ``L(l)`` and precedes the attention reads, and the copy of ``L(l + 1)``, next on the copy
+    stream, does not wait for it.  H2 launches it after the consume record and the copy of
+    ``L(l + 2)``, which does not wait for it either; it precedes the MoE reads.  No other hook
+    launches one, and the runtime creates it once, when it is constructed.  Without
+    ``pdl_break`` nothing is created or launched.
+    """
+    driver = Driver(pdl_break=pdl_break)
+    driver.forward(prime=prime)
+    driver.forward()
+    log, compute = driver.log, driver.ops.compute
+    owners = driver.owners()
+    breaks = [index for index, entry in enumerate(log) if entry.kind == "break"]
+    assert driver.ops.pdl_breaks == int(pdl_break)
+    if not pdl_break:
+        assert breaks == []
+        return
+    assert all(log[index].stream is compute for index in breaks)
+    expected = Counter({(hook, layer): 2 for hook in ("H1", "H2") for layer in driver.layers})
+    assert Counter(owners[index][1:] for index in breaks) == expected
+    clocks = vector_clocks(log)
+    waits = ["wait"] * len(driver.segments)
+    for forward in range(2):
+        for position, layer in enumerate(driver.layers):
+            for hook, before, after, races in (
+                ("H1", waits, "attn", position + 1),
+                ("H2", ["record"], "moe", position + 2),
+            ):
+                start, end = driver.spans[(forward, hook, layer)]
+                ops = [index for index in range(start, end) if log[index].stream is not None]
+                (brk,) = [index for index in ops if log[index].kind == "break"]
+                assert brk == ops[-1], f"{hook}({layer}): the break is not the hook's last op"
+                on_compute = [log[index].kind for index in ops if log[index].stream is compute]
+                assert on_compute[-len(before) - 1 :] == [*before, "break"], (hook, layer)
+                following = next(entry for entry in log[brk + 1 :] if entry.stream is compute)
+                assert (following.kind, following.what, following.layer) == ("read", after, layer)
+                if hook == "H1":
+                    copy = driver.launch_index("L", layer, forward)
+                    assert happens_before(log, clocks, copy, brk), f"H1({layer}) before L({layer})"
+                if races >= len(driver.layers):
+                    continue
+                eligible = driver.launch_index("L", driver.layers[races], forward)
+                if owners[eligible][1] == "H1":
+                    continue  # a fenced demand fetch, which waits for all compute work before it
+                assert not happens_before(log, clocks, brk, eligible), (
+                    f"the copy of L({driver.layers[races]}) waits for the break of {hook}({layer})"
+                )
+    assert driver.assert_race_free() > 0
     driver.assert_no_host_sync()

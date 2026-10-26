@@ -24,9 +24,9 @@ H0     ``KimiLinearModel.forward`` entry           ``DenseDwdpManager.ensure_pri
                                                    L(2)`` (with expert DWDP ``L(1), E(1),
                                                    L(2), E(2)``) unless already primed
 H1     decoder layer entry                         compute waits ``ready_A[s_A]`` and
-                                                   ``ready_D[s_D]``
+                                                   ``ready_D[s_D]``, then the PDL break
 H2     after the attention call                    record ``consume_A[s_A]``, then enqueue
-                                                   ``L(l + 2)``
+                                                   ``L(l + 2)``, then the PDL break
 H3     after the MoE block                         record ``consume_D[s_D]``
 =====  ==========================================  ==========================================
 
@@ -58,6 +58,11 @@ order on the execution stream:
 * H4 is :meth:`DenseDWDP.end_forward`, at the causal LM's forward exit: the current stream joins
   the copy stream, and a capture restores the eager event set, which a capture never records.  An
   eager forward that raised recovers there before its exception propagates.
+
+Under either protocol the PDL break (``types.PdlBreak``) runs only in a runtime built with
+``pdl_break`` (``TRTLLM_DWDP_DENSE_PDL_BREAK``, on by default with the SM gather in graph mode):
+H1 and H2 launch one tiny kernel without PDL on the compute stream, so that the PDL-launched
+compute kernel after the hook is not dispatched ahead of the gather that becomes eligible with it.
 """
 
 from __future__ import annotations
@@ -65,7 +70,7 @@ from __future__ import annotations
 import enum
 import operator
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -180,6 +185,11 @@ class DenseDWDP:
     protocol :meth:`poll_watchdog` reads them instead, after the forward, and with the watchdog's
     ``device_assert`` (``DEBUG=3``) H4 enqueues a device assert that none mismatched.
 
+    With ``pdl_break`` (``TRTLLM_DWDP_DENSE_PDL_BREAK``), H1 right after the compute stream's waits
+    and H2 after its gathers launch the PDL break (:class:`~.types.PdlBreak`) on the compute
+    stream, in every covered layer of eager forwards and captures alike, so a replay runs it where
+    the capture launched it.
+
     Args:
         layers: Covered layers, ascending; with expert DWDP the same list as the expert DWDP MoE
             layers.
@@ -203,6 +213,8 @@ class DenseDWDP:
             dense weights on an auxiliary stream forks after H1 and joins the compute stream
             before H2 (attention) or H3 (MoE-dense).  Without it, H0 refuses multi-stream
             execution.
+        pdl_break: ``TRTLLM_DWDP_DENSE_PDL_BREAK``: H1 and H2 launch the PDL break, which the
+            constructor creates with ``ops.new_pdl_break()``.
 
     Raises:
         ValueError: Empty, unsorted, duplicate or negative ``layers``; non-canonical
@@ -225,6 +237,7 @@ class DenseDWDP:
         protocol: DenseProtocol = DenseProtocol.LEGACY,
         prime: PrimePolicy = PrimePolicy.ENTRY,
         multi_stream_ok: bool = False,
+        pdl_break: bool = False,
     ) -> None:
         covered = _covered_layers(layers)
         kinds = _segment_kinds(segments)
@@ -279,6 +292,12 @@ class DenseDWDP:
         self._protocol = protocol
         self._prime_policy = prime
         self._multi_stream_ok = bool(multi_stream_ok)
+        # The PDL break of H1 and H2, or None; created here, outside any capture, and dropped at
+        # release, while ``_pdl_break_on`` keeps reporting it.
+        self._pdl_break_on = bool(pdl_break)
+        self._pdl_break: Callable[[], None] | None = (
+            self._ops.new_pdl_break() if self._pdl_break_on else None
+        )
         self._schedule: tuple[ScheduleEntry, ...] = ()
         # Closed protocol: the layers each ``(hook, trigger layer)`` gathers, in schedule order.
         self._gathers: dict[tuple[ScheduleHook, int | None], tuple[int, ...]] = {}
@@ -302,8 +321,8 @@ class DenseDWDP:
         logger.debug(
             f"{LOG_PREFIX} runtime: {len(covered)} layers {covered[0]}..{covered[-1]}, "
             f"segments {','.join(kind.value for kind in kinds)}, strict={int(self._strict)}, "
-            f"slot watchdog {'on' if watchdog is not None else 'off'}, {protocol.value} "
-            f"protocol{priming}"
+            f"slot watchdog {'on' if watchdog is not None else 'off'}, PDL break "
+            f"{'on' if self._pdl_break_on else 'off'}, {protocol.value} protocol{priming}"
         )
 
     # ------------------------------------------------------------------
@@ -344,6 +363,11 @@ class DenseDWDP:
     def prime_policy(self) -> PrimePolicy:
         """Where the closed protocol gathers the first two covered layers; unused when legacy."""
         return self._prime_policy
+
+    @property
+    def pdl_break(self) -> bool:
+        """Whether H1 and H2 launch the PDL break (``TRTLLM_DWDP_DENSE_PDL_BREAK``)."""
+        return self._pdl_break_on
 
     @property
     def forward_state(self) -> ForwardState:
@@ -557,11 +581,11 @@ class DenseDWDP:
         anything is enqueued); a warning is logged at the 1st, 2nd, 4th, 8th, ... demand fetch.
         Then compute waits every enabled segment's ``ready`` event, which opens the read windows
         of the slots' holders (``opened`` True, ``consumed`` False until H2 and H3; a holder that
-        an earlier forward already read gets a new window).  For the first layer it sets
-        ``primed`` False and ``forward_open`` True.  Wrapped in the NVTX range
-        ``dwdp.dense.wait/L{layer}``.  With a watchdog, the check of every slot it waited for is
-        then enqueued on the current stream, inside the read windows, in the NVTX range
-        ``dwdp.dense.watchdog/L{layer}``.
+        an earlier forward already read gets a new window), and with ``pdl_break`` the PDL break
+        follows the waits on the current stream.  For the first layer it sets ``primed`` False and
+        ``forward_open`` True.  Wrapped in the NVTX range ``dwdp.dense.wait/L{layer}``.  With a
+        watchdog, the check of every slot it waited for is then enqueued on the current stream,
+        inside the read windows, in the NVTX range ``dwdp.dense.watchdog/L{layer}``.
 
         Raises:
             DenseProtocolError: See above; also before :meth:`commit` or for an uncovered layer.
@@ -583,6 +607,7 @@ class DenseDWDP:
             for kind, slot in targets:
                 self._opened[kind][slot] = True
                 self._consumed[kind][slot] = False
+            self._launch_pdl_break()
         if position == 0:
             self._primed = False
             self._forward_open = True
@@ -599,6 +624,8 @@ class DenseDWDP:
         the current stream and marks the slot consumed.  Then, if a covered layer two positions
         ahead exists, :meth:`prefetch`-es it, so the copy stream's wait binds to the record just
         made (closed protocol: the gathers the closed schedule gives this hook, the same ones).
+        Then, with ``pdl_break``, the PDL break on the current stream, after the record that the
+        gather waits for, also where nothing is gathered (the last two covered layers).
 
         Raises:
             DenseProtocolError: The attention slot is not tagged ``layer``, or its read window is
@@ -616,10 +643,9 @@ class DenseDWDP:
         self._close_window(SegmentKind.ATTN, slot, layer, "attention_done")
         if closed:
             self._gather("H2", layer)
-            return
-        ahead = position + 2
-        if ahead < len(self._layers):
-            self._prefetch(self._layers[ahead], fence=False)
+        elif position + 2 < len(self._layers):
+            self._prefetch(self._layers[position + 2], fence=False)
+        self._launch_pdl_break()
 
     def layer_done(self, layer: int) -> None:
         """H3, after the MoE block: release ``D(layer)``.
@@ -939,10 +965,10 @@ class DenseDWDP:
 
         Order: ``ops.synchronize()`` -> the watchdog's last read (its mismatches are logged, never
         raised) and its release -> detach the bindings (zero-size tensors) -> drop the launcher
-        and its plans -> drop the slots -> ``store.release()`` (peer mappings and imports, then the
-        local store).  Every step runs even if an earlier one fails; the first error is raised at
-        the end and later ones are logged.  The dense manager's ``cleanup`` calls it; with expert
-        DWDP, ``DwdpManager.cleanup`` runs that before the expert teardown.
+        and its plans, the PDL break and the slots -> ``store.release()`` (peer mappings and
+        imports, then the local store).  Every step runs even if an earlier one fails; the first
+        error is raised at the end and later ones are logged.  The dense manager's ``cleanup``
+        calls it; with expert DWDP, ``DwdpManager.cleanup`` runs that before the expert teardown.
         """
         if self._phase is _Phase.RELEASED:
             return
@@ -973,6 +999,7 @@ class DenseDWDP:
             except Exception as exc:  # every teardown step runs; the first failure is raised below
                 failures.append(("detach the module bindings", exc))
         self._launcher = None
+        self._pdl_break = None
         self._slots = {}
         if store is not None:
             try:
@@ -1153,6 +1180,11 @@ class DenseDWDP:
         """Enqueue the gathers the closed schedule gives ``hook`` of ``trigger``, in its order."""
         for layer in self._gathers.get((hook, trigger), ()):
             self._prefetch(layer, fence=False)
+
+    def _launch_pdl_break(self) -> None:
+        """Enqueue the PDL break on the current stream (H1 and H2), if the runtime has one."""
+        if self._pdl_break is not None:
+            self._pdl_break()
 
     def _prime(self) -> None:
         """Gather ``L(first)`` and ``L(second)`` between forwards and mark them primed."""

@@ -26,7 +26,7 @@ state; otherwise it runs the legacy, eager-only one.  Submodules:
 
 * ``config`` -- ``TRTLLM_DWDP_DENSE*`` switches.
 * ``types`` -- shared records, layout, slots, copy plans, forward protocols and the closed
-  schedule, CUDA seams, constants, errors.
+  schedule, CUDA seams and the PDL break of the hooks, constants, errors.
 * ``layout`` -- collector, checks, blob layout, checksums.
 * ``repoint`` -- repointing module tensors into slots, rollback, release check, teardown.
 * ``runtime`` -- ``DenseDWDP``: slot rings, events, the per-layer hooks and the forward protocols.
