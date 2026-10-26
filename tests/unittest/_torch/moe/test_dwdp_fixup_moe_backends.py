@@ -12,20 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the MPI-allgather refactor of DWDP's ``fixup_moe_backends``.
+"""Unit tests for the small-parameter exchange of DWDP's setup and ``fixup_moe_backends``.
 
-These tests verify that the MPI-based allgather (replacing tekit's TCPDWDPStore)
-produces the same semantics as the tekit original:
+``_exchange_expert_scalars`` is the fixup's one collective: every rank contributes its
+small per-expert parameters (e.g. ``fc31_alpha``) and the gate's ``e_score_correction_bias``
+of every MoE layer in one ``comm.allgather``, the full ``[num_experts, ...]`` tensors are put
+together along the expert partition, and ``fixup_moe_backends`` installs them without any
+collective.
 
-- Each rank's local shard is contributed via comm.allgather.
-- Ranks receive a list of shards (one per peer, indexed by rank).
-- The function concatenates along dim 0 and updates the parameter in place.
-
-We mock the MPI communicator since the tests run single-process on one GPU.
-The mock's ``allgather`` returns a pre-built shard list that the test provides
-(simulating "what this rank would receive if 4 ranks each contributed their
-shard").  This lets us cover the multi-rank semantics end-to-end without a
-real MPI environment.
+We mock the communicator since the tests run single-process.  The mock's ``allgather``
+returns every simulated rank's report: the one this rank passes in, and the others built
+from the shards the test gives each rank.  This lets us cover the multi-rank semantics
+end-to-end without a real MPI environment.
 """
 
 import unittest
@@ -36,190 +34,193 @@ import torch
 import torch.nn as nn
 
 from tensorrt_llm._torch.modules.dwdp.setup import (
-    _allgather_e_score_correction_bias,
-    _allgather_expert_scales,
+    _collect_expert_scalars,
+    _exchange_expert_scalars,
     _scatter_shards_to_full,
+    fixup_moe_backends,
 )
+from tensorrt_llm._torch.modules.dwdp.specs import ExpertPartition
+from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4CuteDslFusedMoEMethod
 
 pytestmark = pytest.mark.cpu_only
 
+LAYER = 3
 
-def _make_mock_comm(all_shards):
-    """Create a mock MPI comm whose allgather() returns ``all_shards``.
 
-    ``all_shards`` is a list of torch.Tensor objects, one per simulated rank.
-    The mock ignores the input argument and returns the list, which is the
-    semantic shape of a real ``Intracomm.allgather(local_shard)`` call.
-    """
+class _Experts(nn.Module):
+    """An MoE backend: an expert weight plus the given small parameters."""
+
+    def __init__(self, num_experts, rows, params):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w3_w1_weight = nn.Parameter(torch.zeros(rows, 4), requires_grad=False)
+        for name, tensor in params.items():
+            setattr(self, name, nn.Parameter(tensor, requires_grad=False))
+
+
+class _Moe(nn.Module):
+    """An MoE wrapper whose gate holds ``e_score_correction_bias`` (when given one)."""
+
+    def __init__(self, experts, bias=None, bias_as_parameter=True):
+        super().__init__()
+        self.experts = experts
+        self.gate = nn.Module()
+        if bias is not None and bias_as_parameter:
+            self.gate.e_score_correction_bias = nn.Parameter(bias, requires_grad=False)
+        elif bias is not None:
+            self.gate.e_score_correction_bias = bias
+
+
+def _make_model(experts, bias=None, bias_as_parameter=True):
+    """A model whose layer ``LAYER`` is an MoE layer."""
+    model = nn.Module()
+    model.layers = nn.ModuleList([nn.Module() for _ in range(LAYER + 1)])
+    model.layers[LAYER].mlp = _Moe(experts, bias, bias_as_parameter)
+    return model
+
+
+def _make_rank_models(partition, params_per_rank, biases=None, bias_as_parameter=True):
+    """One model per DWDP rank, holding that rank's shards."""
+    models = []
+    for rank in range(partition.dwdp_size):
+        experts = _Experts(partition.num_experts, partition.count_of(rank), params_per_rank[rank])
+        bias = None if biases is None else biases[rank]
+        models.append(_make_model(experts, bias, bias_as_parameter))
+    return models
+
+
+def _make_mock_comm(models, rank, partition):
+    """A mock comm whose allgather() returns every rank's report, this rank's as passed in."""
+    reports = [
+        (None, _collect_expert_scalars(model, [LAYER], partition.num_experts)) for model in models
+    ]
     comm = MagicMock()
-    comm.allgather = MagicMock(side_effect=lambda _local: all_shards)
-    comm.Barrier = MagicMock()
-    comm.Get_rank = MagicMock(return_value=0)
-    comm.Get_size = MagicMock(return_value=len(all_shards))
+    comm.allgather = MagicMock(
+        side_effect=lambda local: [
+            local if r == rank else report for r, report in enumerate(reports)
+        ]
+    )
     return comm
 
 
-class TestAllgatherEScoreCorrectionBias(unittest.TestCase):
-    def _make_gate(self, bias_tensor, as_parameter=True):
-        """Minimal nn.Module with an e_score_correction_bias attribute."""
-        gate = nn.Module()
-        if as_parameter:
-            gate.e_score_correction_bias = nn.Parameter(bias_tensor, requires_grad=False)
-        else:
-            gate.e_score_correction_bias = bias_tensor
-        return gate
+def _exchange_and_fixup(models, rank, partition):
+    """Run the exchange and the fixup on ``rank``; return its comm and model."""
+    comm = _make_mock_comm(models, rank, partition)
+    model = models[rank]
+    scalars = _exchange_expert_scalars(comm, model, [LAYER], partition)
+    fixup_moe_backends(model, [LAYER], partition.num_experts, scalars)
+    return comm, model
 
+
+class TestExchangeEScoreCorrectionBias(unittest.TestCase):
     def test_missing_bias_is_noop(self):
-        gate = nn.Module()
-        comm = _make_mock_comm([torch.zeros(2)])
-        _allgather_e_score_correction_bias(
-            gate, layer_idx=3, dwdp_rank=0, dwdp_size=4, num_experts_total=16, comm=comm
-        )
-        comm.allgather.assert_not_called()
-        self.assertFalse(
-            hasattr(gate, "e_score_correction_bias")
-            and getattr(gate, "e_score_correction_bias") is not None
-            and isinstance(getattr(gate, "e_score_correction_bias"), (torch.Tensor, nn.Parameter))
-        )
+        partition = ExpertPartition.from_counts([2, 2, 2, 2])
+        params = [{"fc31_alpha": torch.ones(2)} for _ in range(4)]
+        models = _make_rank_models(partition, params)
 
-    def test_allgather_sharded_parameter(self):
-        """Sharded bias: allgather 4 shards, concat, replace nn.Parameter."""
+        comm, model = _exchange_and_fixup(models, 0, partition)
+
+        # One exchange for every layer, also without a bias.
+        comm.allgather.assert_called_once()
+        self.assertFalse(hasattr(model.layers[LAYER].mlp.gate, "e_score_correction_bias"))
+
+    def test_exchange_sharded_parameter(self):
+        """Sharded bias: 4 shards put together, the nn.Parameter replaced."""
         dwdp_size = 4
         shard_size = 2
         num_experts_total = shard_size * dwdp_size
+        partition = ExpertPartition.strided(
+            num_experts=num_experts_total, dwdp_size=dwdp_size, size=shard_size, stride=shard_size
+        )
         # Each rank's shard has unique values
         shards = [
             torch.arange(r * shard_size, (r + 1) * shard_size, dtype=torch.float32)
             for r in range(dwdp_size)
         ]
         expected = torch.cat(shards, dim=0)
+        params = [{"fc31_alpha": torch.ones(shard_size)} for _ in range(dwdp_size)]
 
         for dwdp_rank in range(dwdp_size):
             with self.subTest(dwdp_rank=dwdp_rank):
-                gate = self._make_gate(shards[dwdp_rank].clone())
-                comm = _make_mock_comm(shards)
+                models = _make_rank_models(partition, params, [s.clone() for s in shards])
 
-                _allgather_e_score_correction_bias(
-                    gate,
-                    layer_idx=3,
-                    dwdp_rank=dwdp_rank,
-                    dwdp_size=dwdp_size,
-                    num_experts_total=num_experts_total,
-                    comm=comm,
-                )
+                comm, model = _exchange_and_fixup(models, dwdp_rank, partition)
 
                 comm.allgather.assert_called_once()
+                gate = model.layers[LAYER].mlp.gate
                 self.assertIsInstance(gate.e_score_correction_bias, nn.Parameter)
                 self.assertEqual(gate.e_score_correction_bias.shape, (num_experts_total,))
                 torch.testing.assert_close(gate.e_score_correction_bias.data, expected)
 
-    def test_allgather_sharded_plain_tensor(self):
+    def test_exchange_sharded_plain_tensor(self):
         """Sharded bias stored as plain Tensor (not Parameter) — update in-place."""
         dwdp_size = 2
         shard_size = 3
         num_experts_total = shard_size * dwdp_size
+        partition = ExpertPartition.strided(
+            num_experts=num_experts_total, dwdp_size=dwdp_size, size=shard_size, stride=shard_size
+        )
         shards = [
             torch.arange(r * shard_size, (r + 1) * shard_size, dtype=torch.float32)
             for r in range(dwdp_size)
         ]
-        gate = self._make_gate(shards[0].clone(), as_parameter=False)
-        comm = _make_mock_comm(shards)
-
-        _allgather_e_score_correction_bias(
-            gate,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=dwdp_size,
-            num_experts_total=num_experts_total,
-            comm=comm,
+        params = [{"fc31_alpha": torch.ones(shard_size)} for _ in range(dwdp_size)]
+        models = _make_rank_models(
+            partition, params, [s.clone() for s in shards], bias_as_parameter=False
         )
 
+        comm, model = _exchange_and_fixup(models, 0, partition)
+
         comm.allgather.assert_called_once()
-        self.assertEqual(gate.e_score_correction_bias.shape, (num_experts_total,))
-        torch.testing.assert_close(gate.e_score_correction_bias, torch.cat(shards, dim=0))
+        bias = model.layers[LAYER].mlp.gate.e_score_correction_bias
+        self.assertNotIsInstance(bias, nn.Parameter)
+        self.assertEqual(bias.shape, (num_experts_total,))
+        torch.testing.assert_close(bias, torch.cat(shards, dim=0))
 
 
-class TestAllgatherExpertScales(unittest.TestCase):
-    def _make_experts_module(self, params):
-        """Return an nn.Module with the given {name: tensor} parameters."""
-        module = nn.Module()
-        for name, tensor in params.items():
-            setattr(module, name, nn.Parameter(tensor, requires_grad=False))
-        return module
-
+class TestExchangeExpertScales(unittest.TestCase):
     def test_skip_non_scale_params(self):
         """Parameters without scale keywords are not touched."""
         experts_per_rank = 2
-        module = self._make_experts_module(
-            {
-                "random_weight": torch.zeros(experts_per_rank, 4),
-                "fc31_alpha": torch.tensor([1.0, 2.0]),
-            }
-        )
+        partition = ExpertPartition.from_counts([experts_per_rank, experts_per_rank])
         all_alpha_shards = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
-        comm = _make_mock_comm(all_alpha_shards)
+        params = [
+            {"random_weight": torch.zeros(experts_per_rank, 4), "fc31_alpha": shard.clone()}
+            for shard in all_alpha_shards
+        ]
+        models = _make_rank_models(partition, params)
 
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=2,
-            comm=comm,
-            experts_per_rank=experts_per_rank,
-        )
+        comm, model = _exchange_and_fixup(models, 0, partition)
 
-        # Called exactly once — only fc31_alpha matched.
-        self.assertEqual(comm.allgather.call_count, 1)
+        # One exchange, which carries only fc31_alpha.
+        comm.allgather.assert_called_once()
+        _status, reported = comm.allgather.call_args.args[0]
+        self.assertEqual(sorted(reported[LAYER][0]), ["fc31_alpha"])
+        experts = model.layers[LAYER].mlp.experts
         # random_weight unchanged (still size (2,4))
-        self.assertEqual(module.random_weight.shape, (experts_per_rank, 4))
-        # fc31_alpha concatenated to full size (4,)
-        self.assertEqual(module.fc31_alpha.shape, (4,))
-        torch.testing.assert_close(module.fc31_alpha.data, torch.cat(all_alpha_shards, dim=0))
+        self.assertEqual(experts.random_weight.shape, (experts_per_rank, 4))
+        # fc31_alpha put together to full size (4,)
+        self.assertEqual(experts.fc31_alpha.shape, (4,))
+        torch.testing.assert_close(experts.fc31_alpha.data, torch.cat(all_alpha_shards, dim=0))
 
-    def test_allgather_multiple_scales(self):
-        """Two matching scale params: each gets its own allgather call."""
-        experts_per_rank = 2
-        dwdp_size = 2
+    def test_exchange_multiple_scales(self):
+        """Two matching scale params, one with a trailing dim: both put together."""
+        partition = ExpertPartition.from_counts([2, 2])
         alpha_shards = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
-        beta_shards = [torch.tensor([[5.0]]), torch.tensor([[6.0]])]
-        # fc31_alpha has shape (2,); fc2_alpha has shape (2,1) — both match
-        # experts_per_rank=2 on dim 0.
-        module = self._make_experts_module(
-            {
-                "fc31_alpha": alpha_shards[0].clone(),
-                "fc2_alpha": torch.tensor([[5.0]]),  # shape (1,1) — shape[0]=1 != 2
-            }
-        )
-        # Rewrite fc2_alpha with shape[0]=2 so it matches
-        module.fc2_alpha = nn.Parameter(torch.tensor([[1.0], [2.0]]), requires_grad=False)
-        # Two shards, each shape (2,1)
+        # fc2_alpha has shape (2, 1) — dim 0 is the rank's expert count too.
         beta_shards = [torch.tensor([[1.0], [2.0]]), torch.tensor([[3.0], [4.0]])]
+        params = [
+            {"fc31_alpha": alpha.clone(), "fc2_alpha": beta.clone()}
+            for alpha, beta in zip(alpha_shards, beta_shards)
+        ]
+        models = _make_rank_models(partition, params)
 
-        # The mock returns the pre-set shard list for whichever param is being
-        # allgathered. named_parameters() order is insertion order — the
-        # ordering here is fc31_alpha first, fc2_alpha second.
-        call_idx = {"n": 0}
+        comm, model = _exchange_and_fixup(models, 0, partition)
 
-        def _side_effect(_local):
-            idx = call_idx["n"]
-            call_idx["n"] += 1
-            return alpha_shards if idx == 0 else beta_shards
-
-        comm = MagicMock()
-        comm.allgather = MagicMock(side_effect=_side_effect)
-
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=dwdp_size,
-            comm=comm,
-            experts_per_rank=experts_per_rank,
-        )
-
-        self.assertEqual(comm.allgather.call_count, 2)
-        torch.testing.assert_close(module.fc31_alpha.data, torch.cat(alpha_shards, dim=0))
-        torch.testing.assert_close(module.fc2_alpha.data, torch.cat(beta_shards, dim=0))
+        self.assertEqual(comm.allgather.call_count, 1)
+        experts = model.layers[LAYER].mlp.experts
+        torch.testing.assert_close(experts.fc31_alpha.data, torch.cat(alpha_shards, dim=0))
+        torch.testing.assert_close(experts.fc2_alpha.data, torch.cat(beta_shards, dim=0))
 
 
 class TestScatterShardsToFull(unittest.TestCase):
@@ -291,54 +292,134 @@ class TestScatterShardsToFull(unittest.TestCase):
         torch.testing.assert_close(full, expected)
 
 
-class TestAllgatherExpertScalesNonUniform(unittest.TestCase):
-    """Validate ``_allgather_expert_scales`` end-to-end with the new
-    Phase 2 ``peer_ranges`` argument: shards loaded under Mode B
-    overlap (size > stride) must reconstruct the full bias correctly,
-    with overlapping experts getting the same value from any peer."""
+class TestExchangeExpertScalesNonUniform(unittest.TestCase):
+    """Validate ``_exchange_expert_scalars`` end-to-end on a redundant partition: shards loaded
+    under Mode B overlap (size > stride) must reconstruct the full parameter correctly, with
+    overlapping experts getting the same value from any peer."""
 
-    def _make_experts_module(self, params):
-        module = torch.nn.Module()
-        for name, tensor in params.items():
-            setattr(module, name, torch.nn.Parameter(tensor, requires_grad=False))
-        return module
-
-    def test_mode_b_overlap_dwdp3_via_peer_ranges(self):
+    def test_mode_b_overlap_dwdp3(self):
         # dwdp=3, 256 experts, Mode B with size=86, stride=85
         # (2*85 + 86 = 256 — exact equality, 1-expert overlap between
         # adjacent ranks).  Shards loaded by each rank cover overlapping
         # ranges; ``_scatter_shards_to_full`` writes the shared experts
         # multiple times but the values agree (same checkpoint).
-        peer_ranges = [(0, 86), (85, 171), (170, 256)]
-        all_shards = [
-            torch.arange(0, 86, dtype=torch.float32),  # rank 0: [0..85]
-            torch.arange(85, 171, dtype=torch.float32),  # rank 1: [85..170]
-            torch.arange(170, 256, dtype=torch.float32),  # rank 2: [170..255]
+        partition = ExpertPartition.strided(num_experts=256, dwdp_size=3, size=86, stride=85)
+        self.assertEqual(partition.peer_ranges, [(0, 86), (85, 171), (170, 256)])
+        params = [
+            {"fc31_alpha": torch.arange(start, end, dtype=torch.float32)}
+            for start, end in partition.ranges
         ]
-        module = self._make_experts_module(
-            {
-                "fc31_alpha": torch.arange(0, 86, dtype=torch.float32),
-            }
-        )
-        comm = _make_mock_comm(all_shards)
+        models = _make_rank_models(partition, params)
 
-        _allgather_expert_scales(
-            module,
-            layer_idx=3,
-            dwdp_rank=0,
-            dwdp_size=3,
-            comm=comm,
-            experts_per_rank=86,
-            num_experts_total=256,
-            peer_ranges=peer_ranges,
-        )
+        comm, model = _exchange_and_fixup(models, 0, partition)
 
         comm.allgather.assert_called_once()
         # Reconstructed alpha covers ALL 256 experts with their canonical values.
         torch.testing.assert_close(
-            module.fc31_alpha.data,
+            model.layers[LAYER].mlp.experts.fc31_alpha.data,
             torch.arange(0, 256, dtype=torch.float32),
         )
+
+
+def _alphas(partition):
+    """Each rank's ``fc31_alpha`` shard: the ids of the experts it stores."""
+    return [{"fc31_alpha": torch.arange(s, e, dtype=torch.float32)} for s, e in partition.ranges]
+
+
+class TestExchangeBalancedPartition(unittest.TestCase):
+    def test_every_rank_puts_75_and_74_expert_shards_together(self):
+        """Balanced DWDP12: every rank makes the one exchange, also one storing 74 experts.
+
+        The 75- and 74-row ``fc31_alpha`` shards come back as the ``[896]`` table, the full-sized
+        bias stays as it is, and the input scales agree.
+        """
+        partition = ExpertPartition.balanced(num_experts=896, dwdp_size=12)
+        params = [dict(shard, fc31_input_scale=torch.tensor(0.5)) for shard in _alphas(partition)]
+        bias = torch.linspace(-1.0, 1.0, 896)
+        for rank in range(partition.dwdp_size):
+            with self.subTest(rank=rank):
+                models = _make_rank_models(partition, params, [bias.clone()] * 12)
+
+                comm, model = _exchange_and_fixup(models, rank, partition)
+
+                comm.allgather.assert_called_once()
+                mlp = model.layers[LAYER].mlp
+                torch.testing.assert_close(mlp.experts.fc31_alpha.data, torch.arange(896.0))
+                torch.testing.assert_close(mlp.gate.e_score_correction_bias.data, bias)
+                self.assertEqual(mlp.experts.fc31_input_scale.item(), 0.5)
+
+
+class TestExchangeRefusesReportsThatDoNotFit(unittest.TestCase):
+    def test_every_rank_raises_the_same_error(self):
+        """The verdict is made from the gathered reports, the same on every rank."""
+        uneven = ExpertPartition.from_counts([3, 2])
+        # Experts 2-3 are stored on ranks 0 and 1, experts 4-5 on ranks 1 and 2.
+        overlap = ExpertPartition.strided(num_experts=8, dwdp_size=3, size=4, stride=2)
+        two_copies = _alphas(overlap)
+        two_copies[1]["fc31_alpha"][0] = -1.0
+        alphas = _alphas(uneven)
+        scales = [dict(a, fc31_input_scale=torch.tensor(s)) for a, s in zip(alphas, (1.0, 0.5))]
+        other_names = [alphas[0], dict(alphas[1], fc2_alpha=torch.ones(2))]
+        bias = "e_score_correction_bias"
+        cases = {
+            # case: (partition, small parameters per rank, bias per rank, offending name)
+            "two values of an overlapping expert": (overlap, two_copies, None, "fc31_alpha"),
+            "input scales that differ": (uneven, scales, None, "fc31_input_scale"),
+            "other parameter names": (uneven, other_names, None, "fc2_alpha"),
+            "a bias neither full nor per expert": (uneven, alphas, [torch.ones(3)] * 2, bias),
+            "a bias on one rank only": (uneven, alphas, [torch.ones(3), None], bias),
+        }
+        for case, (partition, params, biases, name) in cases.items():
+            with self.subTest(case):
+                messages = set()
+                for rank in range(partition.dwdp_size):
+                    models = _make_rank_models(partition, params, biases)
+                    with self.assertRaisesRegex(RuntimeError, name) as caught:
+                        _exchange_and_fixup(models, rank, partition)
+                    messages.add(str(caught.exception))
+                self.assertEqual(len(messages), 1, messages)
+
+
+class _ConfigurableMoE(nn.Module):
+    """ConfigurableMoE's shape: the backend holds the weights, the wrapper delegates to it."""
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+
+    @property
+    def w3_w1_weight(self):
+        return self.backend.w3_w1_weight
+
+
+class TestFixupConfigurableMoE(unittest.TestCase):
+    def test_both_modules_see_every_expert_and_the_quant_scales_the_full_alphas(self):
+        """K3's routed experts: a wrapper around a CuteDSL backend, which reads ``quant_scales``."""
+        partition = ExpertPartition.balanced(num_experts=7, dwdp_size=2)  # 4 + 3
+        models = []
+        for start, end in partition.ranges:
+            alpha = torch.arange(start, end, dtype=torch.float32)
+            block = torch.zeros(end - start, 1)
+            params = dict(
+                fc31_alpha=alpha,
+                fc2_alpha=alpha + 0.5,
+                fc31_input_scale=torch.tensor(1.0),
+                fc2_input_scale=torch.tensor(1.0),
+                w3_w1_weight_scale=block,
+                w2_weight_scale=block.clone(),
+            )
+            backend = _Experts(partition.num_experts, end - start, params)
+            NVFP4CuteDslFusedMoEMethod().setup_quant_scales(backend)
+            models.append(_make_model(_ConfigurableMoE(backend)))
+
+        _, model = _exchange_and_fixup(models, 1, partition)
+
+        wrapper = model.layers[LAYER].mlp.experts
+        self.assertEqual(wrapper.expert_size_per_partition, 7)
+        self.assertEqual(wrapper.backend.expert_size_per_partition, 7)
+        scales = wrapper.backend.quant_scales
+        torch.testing.assert_close(scales.fc1_global, torch.arange(7.0))
+        torch.testing.assert_close(scales.fc2_global, torch.arange(7.0) + 0.5)
 
 
 if __name__ == "__main__":

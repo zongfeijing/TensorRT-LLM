@@ -3416,7 +3416,8 @@
         },
         "num_experts_per_worker": {
           "default": 0,
-          "description": "The number of experts per worker.",
+          "description": "The number of routed experts each worker stores in a strided expert partition, where worker r stores the experts from r * num_prefetch_experts. Leave both fields at 0 (the default) for the balanced partition: every worker stores floor or ceil of num_experts / dwdp_size contiguous experts, and no expert is stored twice.",
+          "minimum": 0,
           "title": "Num Experts Per Worker",
           "type": "integer"
         },
@@ -3428,7 +3429,8 @@
         },
         "num_prefetch_experts": {
           "default": 0,
-          "description": "The number of prefetch experts per worker.",
+          "description": "The stride between the first experts of consecutive workers in a strided expert partition (not a number of prefetched experts). Equal to num_experts_per_worker for disjoint ranges, smaller for ranges that overlap. Leave both fields at 0 for the balanced partition.",
+          "minimum": 0,
           "title": "Num Prefetch Experts",
           "type": "integer"
         }

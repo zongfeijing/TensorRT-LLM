@@ -144,6 +144,30 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "dwdp_config": {
+                    "dwdp_size": 12,
+                    "num_experts_per_worker": 0,
+                    "num_prefetch_experts": 0,
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "dwdp_config": {
+                    "dwdp_size": 12,
+                    "num_experts_per_worker": 82,
+                    "num_prefetch_experts": 74,
+                }
+            },
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -155,6 +179,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             True,
         ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
+            False,
+        ),
         (
             generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},
