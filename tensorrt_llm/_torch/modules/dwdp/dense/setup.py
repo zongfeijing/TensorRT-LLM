@@ -12,21 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dense DWDP setup: phases P1-P6 over five fixed collectives (design 3.2.6, 3.3.3, 3.7).
+"""Dense DWDP setup: phases P1-P6 over five fixed collectives.
 
-Setup runs once per context worker, from ``DwdpManager.setup`` right after the expert DWDP setup
-returned, so the model is fully loaded and post-processed and the expert transport, buffers and
-backend fixups are done.  Each phase's local work is wrapped so that a failure becomes
-``ok=False`` in the next collective instead of an exception that would skip it; every rank makes
-the same collectives in the same order and reaches the same verdict from the same gathered
-payloads (design 3.3.3).
+Setup runs once per context worker, after the model is fully loaded and post-processed: from
+``DwdpManager.setup`` right after the expert DWDP setup returned (with expert DWDP, so the expert
+transport, buffers and backend fixups are done), or from ``manager.DenseDwdpManager.setup``
+(standalone, over the attention-DP group).  Each phase's local work is wrapped so that a failure
+becomes ``ok=False`` in the next collective instead of an exception that would skip it; every
+rank makes the same collectives in the same order and reaches the same verdict from the same
+gathered payloads (design 3.3.3).
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import NamedTuple, Protocol
 
 import torch
 from torch import nn
@@ -51,15 +52,13 @@ from .types import (
     LayerLauncher,
     SegmentKind,
     SlotBuffer,
+    StreamLike,
     TorchCudaOps,
     allocate_slot_ring,
 )
 from .watchdog import SlotWatchdog
 
-if TYPE_CHECKING:
-    from ..weight_manager import DWDPWeightManager
-
-#: Free device memory P1 requires on top of the store and the slots (design 3.1.6).
+#: Free device memory P1 requires on top of the store and the slots.
 SETUP_HEADROOM_BYTES = 2 << 30
 
 #: The phase each collective concludes, by collective number.
@@ -76,7 +75,12 @@ _MAX_LISTED = 8
 
 
 class GroupComm(Protocol):
-    """The DWDP group calls setup makes: an mpi4py sub-communicator or ``StoreDwdpGroup``."""
+    """The calls setup makes on the dense group.
+
+    The dense group is the DWDP group with expert DWDP (an mpi4py sub-communicator or
+    ``StoreDwdpGroup``), or the MPI sub-communicator over the attention-DP group standalone
+    (``manager.standalone_group``).
+    """
 
     def allgather(self, obj: object) -> list[object]:
         """Gather one picklable object per rank, ordered by rank."""
@@ -88,6 +92,32 @@ class GroupComm(Protocol):
 
     def Get_size(self) -> int:
         """Ranks in the group."""
+        ...
+
+
+class DenseTransfer(Protocol):
+    """Where and how the dense copies run.
+
+    ``DWDPWeightManager`` (with expert DWDP: the expert DWDP copy stream and transfer) and
+    ``manager.StandaloneTransfer`` (standalone: the dense manager's own stream and
+    ``TRTLLM_DWDP_DENSE_COPY``) implement it.  Setup first reads ``copy_stream`` in P2, inside the
+    phase's local work: an implementation may create the stream on that first read, and a failure
+    then becomes this rank's failed P2 report.
+    """
+
+    @property
+    def copy_stream(self) -> StreamLike:
+        """The stream every dense copy runs on; the same object on every read."""
+        ...
+
+    @property
+    def use_gather(self) -> bool:
+        """Whether the copies use the SM fabric gather (``CopyMode.GATHER``)."""
+        ...
+
+    @property
+    def use_batched_prefetch(self) -> bool:
+        """Whether the copies use one batched copy-engine copy per layer (``CopyMode.BATCHED``)."""
         ...
 
 
@@ -106,7 +136,7 @@ class PhaseReport(NamedTuple):
 
 
 class _CollectData(NamedTuple):
-    """The data of one rank in collective #1 (design 3.3.3)."""
+    """The data of one rank in collective #1."""
 
     requested: bool
     """``TRTLLM_DWDP_DENSE`` on this rank."""
@@ -129,6 +159,9 @@ class _CollectData(NamedTuple):
     free_bytes: int
     """Free device memory before setup allocated anything, with the allocator cache emptied."""
 
+    strict: bool = False
+    """``TRTLLM_DWDP_DENSE_STRICT`` on this rank: it decides a raise after the commit point."""
+
 
 #: Collective #1 data of a rank that did not ask for dense DWDP.
 _NOT_REQUESTED = _CollectData(False, True, "", (), 0, 0, 0)
@@ -136,10 +169,10 @@ _NOT_REQUESTED = _CollectData(False, True, "", (), 0, 0, 0)
 #: Builds the row store for ``(layout, rank, device)``; tests pass the loopback store.
 StoreFactory = Callable[[DenseLayout, int, torch.device], DenseShardStore]
 
-#: Builds the copy launcher for ``(plans, weight_manager, device)``; setup calls it with the
-#: expert DWDP copy stream current.
+#: Builds the copy launcher for ``(plans, transfer, device)``; setup calls it with the transfer's
+#: copy stream current.
 LauncherFactory = Callable[
-    [Mapping[int, LayerCopyPlan], "DWDPWeightManager", torch.device], LayerLauncher
+    [Mapping[int, LayerCopyPlan], DenseTransfer, torch.device], LayerLauncher
 ]
 
 #: ``(free, total)`` bytes of the dense device, as ``torch.cuda.mem_get_info`` returns them.
@@ -147,14 +180,16 @@ MemGetInfo = Callable[[], tuple[int, int]]
 
 
 def dense_roots_available(model: nn.Module) -> bool:
-    """Whether the model's decoder layers provide ``dense_dwdp_roots`` (design 3.2.1).
+    """Whether the model's decoder layers provide ``dense_dwdp_roots``.
 
-    ``DwdpManager.setup`` calls :func:`setup_dense_dwdp` for such models whether or not dense
-    DWDP is requested on this rank, so collective #1 always runs and catches ranks whose
-    ``TRTLLM_DWDP_DENSE`` disagrees.  The answer depends only on the model code, so it is the
-    same on every rank: for a model without roots no rank makes a dense collective, and a rank
-    that asks for dense DWDP calls :func:`refuse_dense_dwdp_without_roots` instead.  The decoder
-    is found as the expert DWDP setup finds it; a model without one has no roots.
+    With expert DWDP, ``DwdpManager.setup`` calls :func:`setup_dense_dwdp` for such models whether
+    or not dense DWDP is requested on this rank, so collective #1 always runs and catches ranks
+    whose ``TRTLLM_DWDP_DENSE`` disagrees.  Standalone, ``DenseDwdpManager.setup`` checks it
+    before it creates the dense group.  The answer depends only on the model code, so it is the
+    same on every rank: for a model without roots no rank makes a dense collective (standalone,
+    no rank builds the group either), and a rank that asks for dense DWDP calls
+    :func:`refuse_dense_dwdp_without_roots` instead.  The decoder is found as the expert DWDP
+    setup finds it; a model without one has no roots.
     """
     try:
         decoder = _get_decoder_model(model)
@@ -164,15 +199,17 @@ def dense_roots_available(model: nn.Module) -> bool:
 
 
 def refuse_dense_dwdp_without_roots(model: nn.Module) -> None:
-    """Turn down a request for dense DWDP on a model without ``dense_dwdp_roots`` (design 3.2.1).
+    """Turn down a request for dense DWDP on a model without ``dense_dwdp_roots``.
 
-    ``DwdpManager.setup`` calls it instead of :func:`setup_dense_dwdp` on a rank whose
-    ``TRTLLM_DWDP_DENSE`` is on when :func:`dense_roots_available` is False.  No rank makes a
-    dense collective for such a model (whether it has roots is the same on every rank), so this
-    rank decides alone and at once rather than wait in collective #1 for peers whose switch is
-    off: it raises if its ``TRTLLM_DWDP_DENSE_REQUIRED`` is on (also when its switches cannot be
-    read), else logs an error and returns, and dense DWDP stays off with the dense weights
-    replicated.  A rank whose ``TRTLLM_DWDP_DENSE`` is off does not call it and carries on.
+    ``DwdpManager.setup`` (with expert DWDP) calls it instead of :func:`setup_dense_dwdp` on a
+    rank whose ``TRTLLM_DWDP_DENSE`` is on when :func:`dense_roots_available` is False, and so
+    does ``DenseDwdpManager.setup`` (standalone, where every rank asks for dense DWDP) instead of
+    building the dense group.  No rank makes a dense collective for such a model (whether it has
+    roots is the same on every rank), so this rank decides alone and at once rather than wait in
+    collective #1 for peers whose switch is off: it raises if its ``TRTLLM_DWDP_DENSE_REQUIRED``
+    is on (also when its switches cannot be read), else logs an error and returns, and dense DWDP
+    stays off with the dense weights replicated.  A rank whose ``TRTLLM_DWDP_DENSE`` is off does
+    not call it and carries on.
 
     Args:
         model: The loaded model, named in the message.
@@ -197,7 +234,7 @@ def refuse_dense_dwdp_without_roots(model: nn.Module) -> None:
 
 
 def dense_dwdp_active(model: nn.Module) -> bool:
-    """Whether dense DWDP moved the dense weights of ``model`` (design 3.2.8).
+    """Whether dense DWDP moved the dense weights of ``model``.
 
     True once setup P6 (or a release after the commit point) set ``_dense_dwdp_active = True``
     on the model or its decoder.  The mark stays after the runtime is released, when the modules
@@ -215,13 +252,13 @@ def dense_dwdp_active(model: nn.Module) -> bool:
 
 def setup_dense_dwdp(
     model: nn.Module,
-    weight_manager: DWDPWeightManager,
+    transfer: DenseTransfer,
     comm: GroupComm,
     *,
     dwdp_rank: int,
     dwdp_size: int,
     device_id: int,
-    moe_layers: list[int],
+    moe_layers: Sequence[int] | None = None,
     config: DenseConfig | None = None,
     store_factory: StoreFactory | None = None,
     ops: DeviceOps | None = None,
@@ -229,22 +266,25 @@ def setup_dense_dwdp(
     launcher_factory: LauncherFactory | None = None,
     mem_get_info: MemGetInfo | None = None,
 ) -> DenseDWDP | None:
-    """Shard, verify and repoint the dense weights of ``model`` (design 3.2.6, 3.3.3).
+    """Shard, verify and repoint the dense weights of ``model``.
 
     Each collective carries a :class:`PhaseReport` per rank; its local work and verdict:
 
     1. P1: read the config, ``layout.collect_dense_layout`` over the decoder layers with the
        ``dense_dwdp_attr_allow`` / ``dense_dwdp_exclude`` tables the layers carry, check that the
-       covered layers are ``moe_layers`` and that ``free >= store + slots +
+       covered layers are ``moe_layers`` (if given) and that ``free >= store + slots +
        SETUP_HEADROOM_BYTES`` (``free`` read after ``torch.cuda.empty_cache()``), then
        ``layout.compute_checksums``; no copies.  A rank that did not ask for dense DWDP does none
        of this.  Data ``(requested, required, digest, checksums, store_bytes, slot_bytes,
-       free_bytes)``.  No rank requested: return None and make no further collective.  Some did:
-       every rank raises a configuration error, whatever ``required`` says.  All ok with equal
-       digests and checksums: continue; else abandon.
+       free_bytes, strict)``.  No rank requested: return None and make no further collective.
+       Some did: every rank raises a configuration error, whatever ``required`` says.  All ok
+       with equal digests, ``strict`` and checksums: continue; else abandon.  The checksums catch
+       a dense tensor that has the same shape on every rank but other bytes, e.g. a
+       tensor-parallel shard.
     2. P2: allocate the store and the slots, write this rank's rows, ``synchronize``, construct
-       the runtime (it records the consume events; with ``config.slot_watchdog`` it gets the
-       slot checksum watchdog over the P1 checksums), export.  Data: the exported handles.
+       the runtime on ``transfer.copy_stream`` (the first read of it; it records the consume
+       events; with ``config.slot_watchdog`` it gets the slot checksum watchdog over the P1
+       checksums), export.  Data: the exported handles.
     3. P3: import and map the peers, build the plans and, with the copy stream current, the
        launcher; install it, ``synchronize``.  Doubles as the barrier after every write and
        mapping.
@@ -274,20 +314,23 @@ def setup_dense_dwdp(
     Args:
         model: The loaded model (the VL wrapper or the causal LM); the decoder is found like the
             expert setup finds it.
-        weight_manager: The expert DWDP weight manager: copy stream and transfer mode.
-        comm: The DWDP group.
-        dwdp_rank: This rank in the group.
-        dwdp_size: Group size ``N``.
+        transfer: Copy stream and transfer mode: the expert DWDP weight manager with expert DWDP,
+            a ``manager.StandaloneTransfer`` standalone.
+        comm: The dense group: the DWDP group, or the attention-DP group standalone.
+        dwdp_rank: This rank in the dense group (its DWDP rank, or its tp rank standalone).
+        dwdp_size: Dense group size ``N``.
         device_id: CUDA device of this rank.
-        moe_layers: Expert DWDP MoE layers; the covered dense layers must equal them.
+        moe_layers: Expert DWDP MoE layers; the covered dense layers must equal them.  None
+            (standalone): no such check; the covered layers are the decoder layers whose dense
+            roots are not empty, ascending.
         config: Switches; ``DenseConfig.from_env()`` (inside P1) if None.  ``config.enabled`` (or
             ``TRTLLM_DWDP_DENSE``) says whether this rank asks for dense DWDP.
         store_factory: Row store constructor; ``FabricShardStore`` if None.
         ops: CUDA seam for the runtime; ``TorchCudaOps(device_id)`` if None.
         device: The dense device; ``cuda:<device_id>`` if None (unit tests pass the CPU).
         launcher_factory: Builds the copy launcher from the plans; if None,
-            ``DenseCopyLauncher(plans, select_copy_mode(use_gather=weight_manager.use_gather,
-            use_batched=weight_manager.use_batched_prefetch), device=device)``.
+            ``DenseCopyLauncher(plans, select_copy_mode(use_gather=transfer.use_gather,
+            use_batched=transfer.use_batched_prefetch), device=device)``.
         mem_get_info: ``(free, total)`` device memory; ``torch.cuda.mem_get_info(device_id)`` if
             None.
 
@@ -299,7 +342,8 @@ def setup_dense_dwdp(
         DenseSetupError: Abandoned with ``required`` on, ranks disagree on
             ``TRTLLM_DWDP_DENSE``, or this rank could not restore its original dense weights.
         DenseRepointError: ``config.strict`` and an original storage survived the commit (this
-            rank only; its dense state is released first).
+            rank only; its dense state is released first).  ``config.strict`` must be the same on
+            every rank: collective #1 abandons when it differs.
     """
     if config is not None:
         requested = config.enabled
@@ -307,7 +351,7 @@ def setup_dense_dwdp(
         requested = dense_dwdp_requested()
     run = _DenseSetup(
         model,
-        weight_manager,
+        transfer,
         comm,
         rank=dwdp_rank,
         size=dwdp_size,
@@ -336,14 +380,14 @@ class _DenseSetup:
     def __init__(
         self,
         model: nn.Module,
-        weight_manager: DWDPWeightManager,
+        transfer: DenseTransfer,
         comm: GroupComm,
         *,
         rank: int,
         size: int,
         device_id: int,
         device: torch.device | None,
-        moe_layers: Sequence[int],
+        moe_layers: Sequence[int] | None,
         config: DenseConfig | None,
         requested: bool,
         store_factory: StoreFactory,
@@ -352,7 +396,7 @@ class _DenseSetup:
         mem_get_info: MemGetInfo,
     ) -> None:
         self._model = model
-        self._weight_manager = weight_manager
+        self._transfer = transfer
         self._comm = comm
         self._rank = rank
         self._size = size
@@ -499,7 +543,8 @@ class _DenseSetup:
                 attr_allow=attr_allow,
                 exclude=exclude,
             )
-            _check_coverage(layout, self._moe_layers)
+            if self._moe_layers is not None:
+                _check_coverage(layout, self._moe_layers)
             _check_free_memory(layout, free_bytes)
             compute_checksums(layout)
             data = _CollectData(
@@ -510,6 +555,7 @@ class _DenseSetup:
                 store_bytes=layout.store_bytes,
                 slot_bytes=layout.slot_bytes,
                 free_bytes=free_bytes,
+                strict=config.strict,
             )
         except Exception as exc:  # a local failure must reach collective #1, never skip it
             return PhaseReport(
@@ -535,11 +581,13 @@ class _DenseSetup:
             watchdog = None
             if self._config.slot_watchdog:
                 watchdog = SlotWatchdog.from_layout(layout, self._device)
+            # The first read of the copy stream, which the transfer may create here: a failure
+            # is this rank's P2 report.
             self._runtime = DenseDWDP(
                 layout.layers,
                 layout.segment_kinds,
                 self._slots,
-                self._weight_manager.copy_stream,
+                self._transfer.copy_stream,
                 ops=self._ops,
                 strict=self._config.strict,
                 store=store,
@@ -562,8 +610,8 @@ class _DenseSetup:
                 chunk_bases=store.chunk_bases(),
                 slot_bases=slot_bases,
             )
-            with self._ops.stream(self._weight_manager.copy_stream):
-                self._launcher = self._launcher_factory(plans, self._weight_manager, self._device)
+            with self._ops.stream(self._transfer.copy_stream):
+                self._launcher = self._launcher_factory(plans, self._transfer, self._device)
             self._runtime.set_launcher(self._launcher)
             self._ops.synchronize()
         except Exception as exc:  # a local failure must reach collective #3, never skip it
@@ -654,7 +702,7 @@ class _DenseSetup:
     def _mark_active(self) -> None:
         """Flag the model and its decoder: their dense tensors are no longer their own weights.
 
-        The weight reload, update and load guards (design 3.2.8) read this flag.
+        The weight reload, update and load guards read this flag.
         """
         self._model._dense_dwdp_active = True
         if self._decoder is not None:
@@ -708,11 +756,15 @@ class _DenseSetup:
 
 
 def _copy_launcher(
-    plans: Mapping[int, LayerCopyPlan], weight_manager: DWDPWeightManager, device: torch.device
+    plans: Mapping[int, LayerCopyPlan], transfer: DenseTransfer, device: torch.device
 ) -> LayerLauncher:
-    """The production launcher: the transfer the expert DWDP prefetch uses (design 3.5.3)."""
+    """The production launcher in the transfer's mode.
+
+    With expert DWDP that is the transfer the expert DWDP prefetch uses; standalone, the one
+    ``TRTLLM_DWDP_DENSE_COPY`` picks.
+    """
     mode = select_copy_mode(
-        use_gather=weight_manager.use_gather, use_batched=weight_manager.use_batched_prefetch
+        use_gather=transfer.use_gather, use_batched=transfer.use_batched_prefetch
     )
     return DenseCopyLauncher(plans, mode, device=device)
 
@@ -730,7 +782,7 @@ def _allocated_bytes(device: torch.device) -> int:
 
 
 def _model_tables(layers: Sequence[tuple[int, nn.Module]]) -> tuple[frozenset[str], frozenset[str]]:
-    """The model's allow and exclude tables, read from the decoder layers (design 3.2.1).
+    """The model's allow and exclude tables, read from the decoder layers.
 
     Raises:
         DenseLayoutError: Decoder layers carry different tables; the collector applies one pair
@@ -775,7 +827,7 @@ def _check_coverage(layout: DenseLayout, moe_layers: Sequence[int]) -> None:
 
 
 def _check_free_memory(layout: DenseLayout, free_bytes: int) -> None:
-    """P1 precheck: ``free >= store + slots + SETUP_HEADROOM_BYTES`` (design 3.1.6).
+    """P1 precheck: ``free >= store + slots + SETUP_HEADROOM_BYTES``.
 
     Raises:
         DenseSetupError: Too little free device memory.
@@ -812,7 +864,11 @@ def _failures(reports: Sequence[PhaseReport]) -> str:
 
 
 def _disagreement(layout: DenseLayout | None, data: Sequence[_CollectData]) -> str:
-    """Why ok ranks cannot share rows: different layouts, or the same layout with other bytes."""
+    """Why ok ranks cannot share rows: different layouts, or the same layout with other bytes.
+
+    Nor can ranks whose ``TRTLLM_DWDP_DENSE_STRICT`` differs go on together: a leak found after
+    the commit point would raise on some of them only.
+    """
     digests = _group_ranks(item.digest for item in data)
     if len(digests) > 1:
         listed = "; ".join(f"{digest[:16]} on {_ranks(ranks)}" for digest, ranks in digests.items())
@@ -820,6 +876,10 @@ def _disagreement(layout: DenseLayout | None, data: Sequence[_CollectData]) -> s
             f"the dense layouts differ across ranks (digest {listed}): the ranks' models or "
             f"TRTLLM_DWDP_DENSE_* switches differ"
         )
+    stricts = _group_ranks(item.strict for item in data)
+    if len(stricts) > 1:
+        listed = " vs ".join(f"{int(value)} on {_ranks(ranks)}" for value, ranks in stricts.items())
+        return f"TRTLLM_DWDP_DENSE_STRICT differs across ranks ({listed})"
     findings = []
     for index, (layer, kind) in enumerate(layout.segments):
         holders = _group_ranks(item.checksums[index] for item in data)

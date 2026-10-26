@@ -19,9 +19,10 @@ Per covered layer ``l`` (``s_A`` and ``s_D`` are its slots in the attention and 
 =====  ==========================================  ==========================================
 Hook   Call site                                   Action
 =====  ==========================================  ==========================================
-H0     ``KimiLinearModel.forward`` entry           ``DwdpManager.ensure_primed()``: barrier
-                                                   after an abort, then ``L(1), E(1), L(2),
-                                                   E(2)`` unless already primed
+H0     ``KimiLinearModel.forward`` entry           ``DenseDwdpManager.ensure_primed()``:
+                                                   barrier after an abort, then ``L(1),
+                                                   L(2)`` (with expert DWDP ``L(1), E(1),
+                                                   L(2), E(2)``) unless already primed
 H1     decoder layer entry                         compute waits ``ready_A[s_A]`` and
                                                    ``ready_D[s_D]``
 H2     after the attention call                    record ``consume_A[s_A]``, then enqueue
@@ -30,11 +31,12 @@ H3     after the MoE block                         record ``consume_D[s_D]``
 =====  ==========================================  ==========================================
 
 All reads of ``A(l)`` happen between H1 and H2; all reads of ``D(l)`` between H1 and H3.  Copies
-run on the expert DWDP copy stream, so the copy FIFO is ``... E(l+1), L(l+2), E(l+2), L(l+3)
-...``: enqueue order equals deadline order.  Between commit and release the runtime never
-synchronizes the host; every dependency is a stream wait on an event.  The one exception is the
-slot watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2`` (``watchdog.SlotWatchdog``), whose counters H3 of
-the last covered layer reads once per forward.
+run on the copy stream: the expert DWDP copy stream with expert DWDP, so the copy FIFO is ``...
+E(l+1), L(l+2), E(l+2), L(l+3) ...``, or the dense manager's own stream standalone, so it is
+``... L(l+2), L(l+3) ...``; either way enqueue order equals deadline order.  Between commit and
+release the runtime never synchronizes the host; every dependency is a stream wait on an event.
+The one exception is the slot watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2``
+(``watchdog.SlotWatchdog``), whose counters H3 of the last covered layer reads once per forward.
 """
 
 from __future__ import annotations
@@ -86,7 +88,10 @@ class _Phase(enum.Enum):
 
 
 class DenseDWDP:
-    """Slot rings, events and per-layer hooks of dense DWDP; owned by ``DwdpManager``.
+    """Slot rings, events and per-layer hooks of dense DWDP; owned by the dense manager.
+
+    The dense manager (``manager.DenseDwdpManager``) holds the committed runtime in both modes:
+    with expert DWDP ``DwdpManager`` attaches it, standalone the manager sets it up itself.
 
     State, per enabled segment and ring slot ``s``: ``ready[seg][s]`` (recorded on the copy stream
     after a gather, waited by compute: RAW), ``consume[seg][s]`` (recorded on the compute stream at
@@ -134,11 +139,14 @@ class DenseDWDP:
     ``(layer, segment)`` whose slot held other bytes (``strict``: raises).
 
     Args:
-        layers: Covered layers, ascending; the same list as the expert DWDP MoE layers.
+        layers: Covered layers, ascending; with expert DWDP the same list as the expert DWDP MoE
+            layers.
         segments: Enabled segment kinds in canonical order (``ATTN`` first).
         slots: Ring per enabled segment, ``len(slots[seg]) == RING_DEPTH[seg]``; owned by the
             runtime once the constructor returns (if it raises, the caller keeps them).
-        copy_stream: The expert DWDP copy stream (``DWDPWeightManager.copy_stream``).
+        copy_stream: The copy stream: the expert DWDP copy stream with expert DWDP
+            (``DWDPWeightManager.copy_stream``), the dense manager's own stream standalone
+            (``manager.StandaloneTransfer.copy_stream``).
         ops: CUDA seam; ``TorchCudaOps()`` if None.
         strict: ``TRTLLM_DWDP_DENSE_STRICT``: demand fetches, fence fallbacks and watchdog
             mismatches raise.
@@ -169,7 +177,7 @@ class DenseDWDP:
         kinds = _segment_kinds(segments)
         rings = _slot_rings(kinds, slots)
         if copy_stream is None:
-            raise ValueError("dense DWDP needs the expert DWDP copy stream")
+            raise ValueError("dense DWDP needs a copy stream")
         if watchdog is not None and (watchdog.layers, watchdog.segments) != (covered, kinds):
             raise ValueError(
                 f"the slot watchdog covers layers {list(watchdog.layers)} and segments "
@@ -398,7 +406,7 @@ class DenseDWDP:
         events they record in every forward.  Inside a CUDA graph capture those records and
         copies would go into the graph instead of running, and the host state would describe
         work that never ran; with multi-stream execution, reads would run on streams that no
-        event covers.  H0 (``DwdpManager.ensure_primed``) calls this before it records or
+        event covers.  H0 (``DenseDwdpManager.ensure_primed``) calls this before it records or
         enqueues anything, and H1 (:meth:`wait_layer`) before it waits: a refused hook records,
         enqueues and changes nothing, so the next eager forward finds the state the refused hook
         found.  Valid in every phase.
@@ -513,13 +521,14 @@ class DenseDWDP:
                 self._report_watchdog(self._watchdog.poll(), strict=self._strict)
 
     # ------------------------------------------------------------------
-    # Priming and recovery (driven by DwdpManager)
+    # Priming and recovery (driven by the dense manager)
     # ------------------------------------------------------------------
 
     def prefetch(self, layer: int) -> None:
         """Enqueue ``L(layer)`` (every enabled segment, one launch) on the copy stream.
 
-        Used by H2 and by ``DwdpManager`` priming (``L(first), E(first), L(second), E(second)``).
+        Used by H2 and by the dense manager's priming (``L(first), L(second)``; with expert DWDP
+        ``L(first), E(first), L(second), E(second)``).
         Same as ``_prefetch(layer, fence=False)``: a target slot whose holder's read window is
         open gets the fence, recorded on the current stream.  The model runs H1-H3 of every
         covered layer in order, so no window is open while ``forward_open`` is False: every
@@ -535,7 +544,7 @@ class DenseDWDP:
         self._prefetch(layer, fence=False)
 
     def mark_primed(self) -> None:
-        """Record that ``DwdpManager`` enqueued the first two layers (dense and expert).
+        """Record that the dense manager enqueued the first two layers (and their experts).
 
         Raises:
             DenseProtocolError: Before :meth:`commit`; a forward is open (run
@@ -567,8 +576,8 @@ class DenseDWDP:
         model's H0), so later copies wait for every read the dead forward enqueued; then every tag
         ``EMPTY_TAG``, no read window open, every ``consumed`` True, ``primed`` and
         ``forward_open`` False.  Copies the dead forward left on the copy stream still run first
-        (FIFO), and the next ready records follow them.  ``DwdpManager`` re-records the two expert
-        consume events alongside.
+        (FIFO), and the next ready records follow them.  With expert DWDP the dense manager
+        re-records the two expert consume events alongside.
 
         Raises:
             DenseProtocolError: Before :meth:`commit`.
@@ -636,8 +645,8 @@ class DenseDWDP:
         raised) and its release -> detach the bindings (zero-size tensors) -> drop the launcher
         and its plans -> drop the slots -> ``store.release()`` (peer mappings and imports, then the
         local store).  Every step runs even if an earlier one fails; the first error is raised at
-        the end and later ones are logged.  ``DwdpManager.cleanup`` calls it before the expert
-        teardown.
+        the end and later ones are logged.  The dense manager's ``cleanup`` calls it; with expert
+        DWDP, ``DwdpManager.cleanup`` runs that before the expert teardown.
         """
         if self._phase is _Phase.RELEASED:
             return

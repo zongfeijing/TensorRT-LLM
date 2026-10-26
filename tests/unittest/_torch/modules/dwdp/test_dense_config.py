@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests of the dense DWDP switches (design 3.8), how their values are parsed.
+"""CPU tests of the dense DWDP switches and how their values are parsed.
 
 * Booleans: ``1/true/yes/on`` and ``0/false/no/off`` in any case and with blanks around them;
   unset or blank keeps the default; any other value logs a warning and keeps the default, so the
@@ -20,7 +20,8 @@
 * ``TRTLLM_DWDP_DENSE_SEGMENTS`` is a comma-separated, case-insensitive list that must include
   ``attn``; an invalid list raises.
 
-The switch tests pass an ``environ`` dict and do not touch the process environment.
+The switch tests pass an ``environ`` dict and do not touch
+the process environment.
 """
 
 import pytest

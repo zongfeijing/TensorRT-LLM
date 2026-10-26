@@ -14,9 +14,12 @@
 # limitations under the License.
 """Dense DWDP: row-sharded replicated dense weights, gathered two layers ahead of their use.
 
-Every rank of the DWDP group keeps one row of each MoE decoder layer's attention blob ``A(l)`` and
-MoE-dense blob ``D(l)``; the runtime gathers ``L(l+2) = A(l+2) + D(l+2)`` into small staging slots
-on the expert DWDP copy stream.  Submodules:
+Every rank of the dense group keeps one row of each MoE decoder layer's attention blob ``A(l)``
+and MoE-dense blob ``D(l)``; the runtime gathers ``L(l+2) = A(l+2) + D(l+2)`` into small staging
+slots on a copy stream.  It runs in one of two modes (``types.DenseMode``): with expert DWDP
+(attached) the dense group is the DWDP group and the copies share the expert DWDP copy stream;
+standalone, on an attention-DP instance without expert DWDP, the dense group is the attention-DP
+(tp) group and the copies run on the dense manager's own stream.  Submodules:
 
 * ``config`` -- ``TRTLLM_DWDP_DENSE*`` switches.
 * ``types`` -- shared records, layout, slots, copy plans, CUDA seams, constants, errors.
@@ -27,7 +30,11 @@ on the expert DWDP copy stream.  Submodules:
 * ``store`` -- the sharded row store (FABRIC and in-process loopback).
 * ``watchdog`` -- the slot checksum watchdog of ``TRTLLM_DWDP_DENSE_DEBUG=2``.
 * ``setup`` -- setup phases P1-P6 over five fixed collectives.
-* ``gate`` -- the launch gate ``py_executor_creator`` runs before the model is built.
+* ``manager`` -- ``DenseDwdpManager``: owns the committed runtime in both modes, primes it (H0)
+  and is what the model's hooks find through ``get_global_dense_dwdp_manager``; standalone it
+  also builds the group and the transfer and runs setup.
+* ``gate`` -- the launch gate ``py_executor_creator`` runs before the model is built; it picks
+  the mode.
 
 Import the submodules directly; this package imports none of them.
 """

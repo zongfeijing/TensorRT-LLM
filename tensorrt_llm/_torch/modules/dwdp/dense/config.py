@@ -14,7 +14,9 @@
 # limitations under the License.
 """Environment switches of dense DWDP; context workers only, no ``llm_args`` field.
 
-* ``TRTLLM_DWDP_DENSE`` -- turn dense DWDP on; default off.
+* ``TRTLLM_DWDP_DENSE`` -- turn dense DWDP on; default off.  With ``dwdp_config`` it runs with
+  expert DWDP over the DWDP group; without, standalone over the attention-DP group of an instance
+  with ``enable_attention_dp`` and ``tp_size > 1`` (``gate.validate_dense_gate``).
 * ``TRTLLM_DWDP_DENSE_SEGMENTS`` -- ``attn,moe`` (default) or ``attn`` for attention only.
 * ``TRTLLM_DWDP_DENSE_REQUIRED`` -- default on: a failed setup raises on every rank; off: every rank
   drops dense DWDP and keeps serving with replicated dense weights.
@@ -22,17 +24,31 @@
 * ``TRTLLM_DWDP_DENSE_STORE_CHUNK_MB`` -- 0 (default): one store handle; > 0: whole layers per
   handle of about this many MiB.
 * ``TRTLLM_DWDP_DENSE_STRICT`` -- turn demand fetches, leaks, unknown large attributes, shared
-  storages and slot watchdog mismatches into errors; default off.
+  storages and slot watchdog mismatches into errors; default off.  It must be the same on every
+  rank: when the ranks differ, setup fails on every rank, which raises unless
+  ``TRTLLM_DWDP_DENSE_REQUIRED`` is off.
 * ``TRTLLM_DWDP_DENSE_DEBUG`` -- 1: fill the slots with NaN at commit, and name the holders of
   the first 8 moved storages that outlive the commit (each a scan of every live Python object);
   2: also run the per-layer slot checksum watchdog (each layer's H1 checks its slots against the
   layer's checksum; slow: every slot is read once more and the host waits for the GPU once per
   forward); default 0.
+* ``TRTLLM_DWDP_DENSE_COPY`` -- the transfer of standalone dense DWDP, on the dense manager's own
+  copy stream: ``batched`` (default; one ``cudaMemcpyBatchAsync`` per layer on the copy engines),
+  ``per_slice`` or ``gather`` (the SM fabric gather; experimental standalone: it holds SMs next to
+  the MoE all-to-all).  The gate rejects an invalid value standalone.  With expert DWDP the dense
+  copies follow the expert transfer, and the gate warns that any value, valid or not, is ignored.
 
 Booleans accept ``1/true/yes/on`` and ``0/false/no/off`` (any case); unset or empty means the
 default.  A flag that defaults to off is on only for an explicit true value; any other value logs
 a warning and keeps the default.  Integers that do not parse, or are negative, log a warning and
-keep the default.  An invalid segment list raises.
+keep the default.  An invalid segment list raises.  ``TRTLLM_DWDP_DENSE_COPY`` is read as set and
+validated only for standalone dense DWDP (:meth:`DenseConfig.standalone_copy_mode`).
+
+Standalone dense DWDP is meant for context-only servers.  The gate does not check the server role,
+which a worker sees as ``TRTLLM_DISAGG_ROLE`` only when ``trtllm-serve`` launches it with a role
+(``--server_role``, or a ctx or gen server in a disaggregated config).  An aggregated or generation
+attention-DP launch with ``TRTLLM_DWDP_DENSE=1`` that meets the gate's other requirements
+therefore passes it and pays the per-forward gather of every covered layer on every step.
 """
 
 from __future__ import annotations
@@ -48,6 +64,7 @@ from .types import (
     DEFAULT_MIN_BYTES,
     LOG_PREFIX,
     SEGMENT_ORDER,
+    CopyMode,
     DigestSwitches,
     SegmentKind,
 )
@@ -59,6 +76,7 @@ DENSE_MIN_BYTES_ENV = "TRTLLM_DWDP_DENSE_MIN_BYTES"
 DENSE_STORE_CHUNK_MB_ENV = "TRTLLM_DWDP_DENSE_STORE_CHUNK_MB"
 DENSE_STRICT_ENV = "TRTLLM_DWDP_DENSE_STRICT"
 DENSE_DEBUG_ENV = "TRTLLM_DWDP_DENSE_DEBUG"
+DENSE_COPY_ENV = "TRTLLM_DWDP_DENSE_COPY"
 
 _TRUE_VALUES = ("1", "true", "yes", "on")
 _FALSE_VALUES = ("0", "false", "no", "off")
@@ -121,6 +139,26 @@ def parse_segments(value: str) -> tuple[SegmentKind, ...]:
     return tuple(kind for kind in SEGMENT_ORDER if kind.value in names)
 
 
+def parse_copy_mode(value: str) -> CopyMode:
+    """Parse a ``TRTLLM_DWDP_DENSE_COPY`` value.
+
+    Args:
+        value: ``batched``, ``per_slice`` or ``gather``, any case, surrounding blanks ignored.
+
+    Returns:
+        The transfer.
+
+    Raises:
+        ValueError: Any other value.
+    """
+    try:
+        return CopyMode(value.strip().lower())
+    except ValueError:
+        raise ValueError(
+            f"{DENSE_COPY_ENV}={value!r} must be one of batched, per_slice, gather"
+        ) from None
+
+
 def dense_dwdp_requested(environ: Mapping[str, str] | None = None) -> bool:
     """Whether ``TRTLLM_DWDP_DENSE`` asks for dense DWDP; reads no other variable.
 
@@ -143,6 +181,9 @@ class DenseConfig:
         store_chunk_mb: ``TRTLLM_DWDP_DENSE_STORE_CHUNK_MB``.
         strict: ``TRTLLM_DWDP_DENSE_STRICT``.
         debug: ``TRTLLM_DWDP_DENSE_DEBUG``.
+        copy: ``TRTLLM_DWDP_DENSE_COPY`` as set, blanks stripped and case kept; None when unset or
+            blank.  Kept as given and validated only by :meth:`standalone_copy_mode`, so reading
+            the switches never fails because of it: with expert DWDP it is ignored.
     """
 
     enabled: bool = False
@@ -152,6 +193,7 @@ class DenseConfig:
     store_chunk_mb: int = 0
     strict: bool = False
     debug: int = 0
+    copy: str | None = None
 
     def __post_init__(self) -> None:
         segments = _canonical_segments(self.segments)
@@ -166,6 +208,9 @@ class DenseConfig:
     def from_env(cls, environ: Mapping[str, str] | None = None) -> DenseConfig:
         """Read every ``TRTLLM_DWDP_DENSE*`` variable.
 
+        ``TRTLLM_DWDP_DENSE_COPY`` is stored without validation (see ``copy``), so it never makes
+        this raise.
+
         Args:
             environ: Environment to read; ``os.environ`` if None.
 
@@ -178,6 +223,7 @@ class DenseConfig:
             segments = SEGMENT_ORDER
         else:
             segments = parse_segments(raw_segments)
+        copy = (env.get(DENSE_COPY_ENV) or "").strip()
         return cls(
             enabled=_bool_env(env, DENSE_ENV, False),
             segments=segments,
@@ -186,17 +232,22 @@ class DenseConfig:
             store_chunk_mb=_int_env(env, DENSE_STORE_CHUNK_MB_ENV, 0),
             strict=_bool_env(env, DENSE_STRICT_ENV, False),
             debug=_int_env(env, DENSE_DEBUG_ENV, 0),
+            copy=copy or None,
         )
 
-    @property
-    def has_moe(self) -> bool:
-        """Whether the MoE-dense segment is enabled."""
-        return SegmentKind.MOE in self.segments
+    def standalone_copy_mode(self) -> CopyMode:
+        """The transfer of standalone dense DWDP: ``copy`` parsed, ``BATCHED`` when it is None.
 
-    @property
-    def store_chunk_bytes(self) -> int:
-        """Store chunk limit in bytes; 0 means a single chunk."""
-        return self.store_chunk_mb << 20
+        Only standalone code calls it (the gate and ``DenseDwdpManager.setup``); with expert DWDP
+        the dense copies follow the expert transfer whatever ``copy`` holds.
+
+        Raises:
+            ValueError: ``copy`` is not one of batched, per_slice, gather (see
+                :func:`parse_copy_mode`).
+        """
+        if self.copy is None:
+            return CopyMode.BATCHED
+        return parse_copy_mode(self.copy)
 
     @property
     def slot_fill_byte(self) -> int:

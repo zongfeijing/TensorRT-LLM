@@ -23,10 +23,12 @@ This module owns four concerns and delegates the rest:
     plus runtime entry points that forward to ``DWDPWeightManager``
     (``prefetch_first_layers``, ``wait_and_bind``,
     ``record_compute_and_prefetch_next``)
-  * Dense DWDP ownership: the ``DenseDWDP`` runtime that ``setup(model)``
-    commits, exposed as ``dense`` to the model's layer hooks, primed together
-    with the expert prefetch (``prefetch_first_layers``, ``ensure_primed``)
-    and released before the expert teardown
+  * Attached dense DWDP: the ``DenseDwdpManager`` created and registered
+    with this manager, through which the model's layer hooks reach the
+    ``DenseDWDP`` runtime. ``setup(model)`` commits the runtime over the DWDP
+    group and hands it to the dense manager together with the weight
+    manager, so the dense manager primes it together with the expert
+    prefetch; ``cleanup`` releases it before the expert teardown
 
 The heavy lifting — MNNVL handle allocation, composite VA layout,
 double-buffer scheduling — lives in ``tensorrt_llm._torch.modules.dwdp``
@@ -56,11 +58,16 @@ from tensorrt_llm._torch.modules.dwdp import (
     store_rendezvous_enabled,
     teardown_dwdp,
 )
+from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager,
+    get_global_dense_dwdp_manager,
+)
 from tensorrt_llm._torch.modules.dwdp.dense.setup import (
     dense_dwdp_active,
     dense_roots_available,
     refuse_dense_dwdp_without_roots,
 )
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -82,21 +89,25 @@ class DwdpManager:
 
     Construction creates the DWDP group: an MPI sub-communicator, or a
     ``StoreDwdpGroup`` when the context workers are launched independently
-    (see ``modules.dwdp.rendezvous``). ``add_layer`` is the
-    Single Source of Truth for MoE layer indices — ``configurable_moe``
-    registers each MoE layer during model construction, and ``setup(model)``
-    passes that list to ``setup_dwdp()`` so ``collect_moe_params`` never has
-    to re-discover layers by walking the model tree.
+    (see ``modules.dwdp.rendezvous``), and the attached dense DWDP manager
+    (``dense_manager``); ``__enter__`` registers both globally.
+    ``add_layer`` is the Single Source of Truth for MoE layer indices —
+    ``configurable_moe`` registers each MoE layer during model construction,
+    and ``setup(model)`` passes that list to ``setup_dwdp()`` so
+    ``collect_moe_params`` never has to re-discover layers by walking the
+    model tree.
 
     After ``setup()`` returns, the runtime methods (``prefetch_first_layers``,
     ``wait_and_bind``, ``record_compute_and_prefetch_next``) forward to the
     ``DWDPWeightManager`` instance produced by ``setup_dwdp``.
 
-    When dense DWDP is committed, ``dense`` returns its runtime; the model's
-    decoder-layer hooks drive it and the model's forward calls
-    ``ensure_primed``. Each forward then starts from
+    When dense DWDP is committed, the dense manager owns its runtime
+    (``dense``) and holds the weight manager to prime it: the model's
+    decoder-layer hooks drive the runtime and the model's forward calls
+    ``DenseDwdpManager.ensure_primed``. Each forward then starts from
     ``L(first), E(first), L(second), E(second)`` in that copy-stream order,
     where ``L`` is a layer's dense gather and ``E`` its expert prefetch.
+    Without a committed runtime the dense manager does nothing.
     """
 
     def __init__(
@@ -107,6 +118,10 @@ class DwdpManager:
     ) -> None:
         if get_global_dwdp_manager() is not None:
             raise RuntimeError("DwdpManager already registered globally")
+        # __enter__ registers the attached dense DWDP manager as well; refuse a
+        # registered one here, before the DWDP group exists.
+        if get_global_dense_dwdp_manager() is not None:
+            raise RuntimeError("DenseDwdpManager already registered globally")
         # Independently launched workers each have their own MPI world, so the
         # group rendezvous over a TCPStore instead of COMM_WORLD.
         self._store_rendezvous = store_rendezvous_enabled()
@@ -184,9 +199,10 @@ class DwdpManager:
         # Set by setup(model); None until then
         self._weight_manager: Optional[DWDPWeightManager] = None
         self._model_ref: Optional[weakref.ReferenceType[nn.Module]] = None
-        # The committed dense DWDP runtime; None when dense DWDP is off, before
-        # setup(model) and after cleanup()
-        self._dense: DenseDWDP | None = None
+        # Owns the committed dense DWDP runtime. Created whether or not
+        # TRTLLM_DWDP_DENSE is set: the model's layers capture it when they are
+        # built, and without a runtime it does nothing.
+        self._dense_manager = DenseDwdpManager(DenseMode.ATTACHED)
 
     # ------------------------------------------------------------------
     # DWDP group
@@ -219,9 +235,25 @@ class DwdpManager:
     # ------------------------------------------------------------------
 
     def __enter__(self) -> "DwdpManager":
+        """Register this manager and its dense DWDP manager globally: both or neither."""
         if get_global_dwdp_manager() is not None:
             raise RuntimeError("DwdpManager already registered globally")
         set_global_dwdp_manager(self)
+        try:
+            self._dense_manager.__enter__()
+        except BaseException:
+            # Not entered, so no __exit__ follows: free the DWDP group __init__ created and
+            # unregister. Nothing else exists before setup().
+            try:
+                self.cleanup()
+            except BaseException:
+                logger.error(
+                    "[DwdpManager] Failed to free the DWDP group after the dense DWDP "
+                    f"manager could not register\n{traceback.format_exc()}"
+                )
+            finally:
+                set_global_dwdp_manager(None)
+            raise
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
@@ -229,46 +261,52 @@ class DwdpManager:
             self.cleanup()
         finally:
             set_global_dwdp_manager(None)
+            self._dense_manager.__exit__(None, None, None)
         return False
 
     def is_enabled(self) -> bool:
         return self.dwdp_size > 1
 
     @property
+    def dense_manager(self) -> DenseDwdpManager:
+        """The attached dense DWDP manager, registered globally while this manager is entered."""
+        return self._dense_manager
+
+    @property
     def dense(self) -> DenseDWDP | None:
         """The committed dense DWDP runtime, or None when dense DWDP is not active.
 
-        None when dense DWDP is off or was abandoned, before ``setup(model)``
-        commits it and after ``cleanup()``. The model's layer hooks run only
-        while it is not None.
+        The dense manager's runtime: None when dense DWDP is off or was
+        abandoned, before ``setup(model)`` commits it and after ``cleanup()``.
+        The model's layer hooks run only while it is not None.
         """
-        return self._dense
+        return self._dense_manager.dense
 
     def cleanup(self) -> None:
         """Release dense DWDP, tear down the weight manager, free the DWDP group.
 
-        Dense DWDP goes first: its release synchronizes the device, repoints the
-        model's dense weights to zero-size tensors and frees the staging slots
-        and the row store. The model keeps its ``_dense_dwdp_active`` mark, so
-        weight reloads stay refused. If the model was garbage collected first,
-        the bindings of its modules count as detached, since nothing can read
-        them any more. Every step runs even when an earlier one fails; the
-        first error is raised at the end and later ones are logged. Idempotent.
+        Dense DWDP goes first (``DenseDwdpManager.cleanup``, which also drops
+        its reference to the weight manager): the release synchronizes the
+        device, repoints the model's dense weights to zero-size tensors and
+        frees the staging slots and the row store. The model keeps its
+        ``_dense_dwdp_active`` mark, so weight reloads stay refused. If the
+        model was garbage collected first, the bindings of its modules count
+        as detached, since nothing can read them any more. Every step runs even
+        when an earlier one fails; the first error is raised at the end and
+        later ones are logged. Idempotent.
         """
         cleanup_error = None
         cleanup_traceback = None
         try:
             model = self._model_ref() if self._model_ref is not None else None
-            dense, self._dense = self._dense, None
-            if dense is not None:
-                try:
-                    dense.release()
-                except BaseException as exc:  # the expert teardown below must still run
-                    cleanup_error, cleanup_traceback = exc, exc.__traceback__
-                    logger.error(
-                        "[DwdpManager] Dense DWDP release failed; tearing down expert "
-                        f"DWDP anyway\n{traceback.format_exc()}"
-                    )
+            try:
+                self._dense_manager.cleanup()  # a no-op without a committed runtime
+            except BaseException as exc:  # the expert teardown below must still run
+                cleanup_error, cleanup_traceback = exc, exc.__traceback__
+                logger.error(
+                    "[DwdpManager] Dense DWDP release failed; tearing down expert "
+                    f"DWDP anyway\n{traceback.format_exc()}"
+                )
             if model is not None and self._weight_manager is not None:
                 teardown_dwdp(model, expected_manager=self._weight_manager)
             elif self._weight_manager is not None:
@@ -322,11 +360,12 @@ class DwdpManager:
         ``setup_dense_dwdp`` on every rank, also on a rank that did not ask
         for dense DWDP, so the first dense collective gives every rank of the
         group the same verdict when ranks disagree on ``TRTLLM_DWDP_DENSE``.
-        The committed runtime, if any, becomes ``dense``; dense setup errors
-        propagate. Whether a model has roots depends only on its code, so on
-        a model without them no rank makes a dense collective: a rank that
-        asks for dense DWDP there decides alone, at once
-        (``refuse_dense_dwdp_without_roots``: it raises unless its
+        The committed runtime, if any, goes to the dense manager together with
+        the weight manager (``DenseDwdpManager.attach``) and becomes
+        ``dense``; dense setup errors propagate. Whether a model has roots
+        depends only on its code, so on a model without them no rank makes a
+        dense collective: a rank that asks for dense DWDP there decides alone,
+        at once (``refuse_dense_dwdp_without_roots``: it raises unless its
         ``TRTLLM_DWDP_DENSE_REQUIRED`` is off).
 
         Called once from ``py_executor_creator`` after weight loading. Once
@@ -346,7 +385,7 @@ class DwdpManager:
         """
         if self.dwdp_group is None:
             raise RuntimeError("DwdpManager.setup() called after cleanup()")
-        if self._dense is not None:
+        if self._dense_manager.dense is not None:
             if self._model_ref is None or self._model_ref() is not model:
                 raise RuntimeError(
                     "DwdpManager.setup(): dense DWDP is already committed for another "
@@ -373,7 +412,7 @@ class DwdpManager:
         )
         self._model_ref = weakref.ref(model)
         if dense_roots_available(model):
-            self._dense = setup_dense_dwdp(
+            dense = setup_dense_dwdp(
                 model,
                 self._weight_manager,
                 self.dwdp_group,
@@ -382,6 +421,8 @@ class DwdpManager:
                 device_id=device_id,
                 moe_layers=layer_indices,
             )
+            if dense is not None:
+                self._dense_manager.attach(dense, expert=self._weight_manager)
         elif dense_dwdp_requested():
             refuse_dense_dwdp_without_roots(model)
         if self._store_rendezvous:
@@ -397,37 +438,32 @@ class DwdpManager:
         """Executor-loop priming of the first two MoE layers before a forward.
 
         Without dense DWDP, prefetches the experts of the first two MoE layers.
-        With dense DWDP, enqueues ``L(first), E(first), L(second), E(second)``
-        unless the slots are already primed, or a forward is still open, which
-        means the previous forward aborted: the model's ``ensure_primed`` then
+        With dense DWDP, the dense manager enqueues
+        ``L(first), E(first), L(second), E(second)`` unless the slots are
+        already primed, or a forward is still open, which means the previous
+        forward aborted: the model's ``DenseDwdpManager.ensure_primed`` then
         recovers on the execution stream.
         """
         if self._weight_manager is None:
             raise RuntimeError("DwdpManager.setup() has not been called yet")
-        dense = self._dense
-        if dense is None:
+        if self._dense_manager.dense is None:
             first = self._weight_manager.first_moe_layer()
             self._weight_manager.prefetch_layer(first)
             second = self._weight_manager.next_moe_layer(first)
             if second is not None:
                 self._weight_manager.prefetch_layer(second)
             return
-        if dense.forward_open or dense.primed:
-            return
-        self._prime_all(dense, self._weight_manager)
+        self._dense_manager.prefetch_first_layers()
 
     def ensure_primed(self) -> None:
-        """Model-side priming (H0): called at the model's forward entry when ``dense`` is set.
+        """Model-side priming (H0) through ``DenseDwdpManager.ensure_primed``.
 
-        Runs on the execution stream, so it also covers the forwards the
-        executor loop does not prime (warmup, autotuning, KV-cache estimation).
-        It refuses a CUDA graph capture and multi-stream execution
-        (``DenseDWDP.require_eager``) before it records or enqueues anything,
-        so a refused forward leaves the runtime as it found it. Then, if the
-        previous forward aborted between its first and last layer, it records
-        a WAR barrier on this stream: every dense consume event, then the
-        consume events of both expert slots, so the next copies wait for every
-        read the aborted forward enqueued. Then it enqueues
+        The model reaches the dense manager directly; this delegate serves
+        callers that hold the ``DwdpManager``. The dense manager refuses a CUDA
+        graph capture and multi-stream execution before it records or enqueues
+        anything; after an aborted forward it records a WAR barrier on the
+        current stream (every dense consume event, then the consume events of
+        both expert slots); then it enqueues
         ``L(first), E(first), L(second), E(second)`` unless already primed.
 
         Raises:
@@ -435,36 +471,9 @@ class DwdpManager:
             DenseProtocolError: The current stream is capturing a CUDA graph,
                 or multi-stream execution is on.
         """
-        dense = self._dense
-        weight_manager = self._weight_manager
-        if dense is None or weight_manager is None:
+        if self._dense_manager.dense is None or self._weight_manager is None:
             raise RuntimeError("DwdpManager.ensure_primed() needs an active dense DWDP runtime")
-        dense.require_eager("DwdpManager.ensure_primed (H0)")
-        if dense.forward_open:
-            dense.war_barrier()
-            first = weight_manager.first_moe_layer()
-            weight_manager.record_compute(first)
-            second = weight_manager.next_moe_layer(first)
-            if second is not None:
-                weight_manager.record_compute(second)
-        if not dense.primed:
-            self._prime_all(dense, weight_manager)
-
-    @staticmethod
-    def _prime_all(dense: DenseDWDP, weight_manager: DWDPWeightManager) -> None:
-        """Enqueue the first two layers in deadline order, then mark the dense slots primed.
-
-        ``L(l)`` goes before ``E(l)``: the copy stream runs them in enqueue
-        order, and layer ``l`` reads ``L(l)`` (attention) before ``E(l)``
-        (experts).
-        """
-        first = weight_manager.first_moe_layer()
-        for layer in (first, weight_manager.next_moe_layer(first)):
-            if layer is None:
-                break
-            dense.prefetch(layer)
-            weight_manager.prefetch_layer(layer)
-        dense.mark_primed()
+        self._dense_manager.ensure_primed()
 
     def wait_and_bind(self, backend_module: nn.Module, layer_idx: int) -> None:
         """Wait for prefetch and bind full-tensor views onto backend weights."""

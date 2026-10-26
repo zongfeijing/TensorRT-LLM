@@ -12,18 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests of the dense DWDP setup (design 3.2.6, 3.3.3, 3.7; design section 5, step S5(a)).
+"""CPU tests of the dense DWDP setup.
 
-Every rank of an ``N``-rank DWDP group is a thread that runs ``setup_dense_dwdp`` on its own copy
+Every rank of an ``N``-rank dense group is a thread that runs ``setup_dense_dwdp`` on its own copy
 of a Kimi-K3-like toy model.  The threads gather over ``StoreDwdpGroup`` on one in-process
 ``HashStore`` with every wait bounded, so a rank that skips or adds a collective fails the test
 instead of hanging it.  Fakes stand in for the device: ``FakeOps`` for the stream and event seam,
 ``FakeStore`` keeps one rank's rows in host memory and exports their addresses (``LoopbackStore``
 runs the real loopback store instead), ``FakeLauncher`` runs the real copy plans as host
 memmoves, so each rank's slots are reassembled from every rank's rows the way the gather
-reassembles them, and ``FakeMemInfo`` models a caching allocator in front of the device.  Every
-fake appends what setup asked of it to its rank's log, so the tests check the order of the steps
-as well as their outcome.  Faults are injected in each phase on each rank.
+reassembles them, and ``FakeMemInfo`` models a caching allocator in front of the device.  The
+transfer is the expert weight manager's surface (``FakeWeightManager``, as with expert DWDP) or a
+``LazyTransfer`` that creates its stream at the first read (as standalone); a rank runs with or
+without the expert layer list.  Every fake appends what setup asked of it to its rank's log, so
+the tests check the order of the steps as well as their outcome.
 """
 
 from __future__ import annotations
@@ -78,7 +80,7 @@ TOTAL_BYTES = 200 << 30
 # Toy Kimi-K3 decoder (patterns of test_dense_layout.py, smaller)
 # ---------------------------------------------------------------------------
 
-#: The model tables of design 3.2.1.
+#: The two model tables: plain attributes that may anchor a storage, names that never do.
 ATTR_ALLOW = frozenset(
     {
         "_bfa_proj_weight",
@@ -228,7 +230,7 @@ class ToyKDA(nn.Module):
         self.b_proj = ToyLinear(_ints(g, (B_ROWS, HIDDEN), BF16))
         self.f_b_proj = ToyLinear(_ints(g, (HIDDEN, 32), BF16))
         self.o_norm = ToyNorm(g, HIDDEN)
-        # What the K3 loader's finalize step leaves behind (design 3.1.3, 3.2.2).
+        # What the K3 loader's finalize step leaves behind.
         self.qkvg_proj = ToyFp8Linear(fused, _bytes(g, (4 * ROWS, 32)))
         pad = torch.zeros(PAD_ROWS, HIDDEN, dtype=BF16)
         bfa = torch.cat([self.f_a_proj.weight.data, self.b_proj.weight.data, pad])
@@ -299,7 +301,7 @@ class ToyMoE(nn.Module):
 
 
 class ToyDecoderLayer(nn.Module):
-    """A decoder layer with the model seam of design 3.2.1: roots plus the two tables."""
+    """A decoder layer with the model seam dense DWDP reads: roots plus the two tables."""
 
     dense_dwdp_attr_allow = ATTR_ALLOW
     dense_dwdp_exclude = EXCLUDE
@@ -525,7 +527,7 @@ class FakeOps:
 
 
 class FakeWeightManager:
-    """The W1 properties of ``DWDPWeightManager`` that dense setup reads."""
+    """The properties of ``DWDPWeightManager`` that dense setup reads."""
 
     def __init__(self, copy_stream, *, use_gather=False, use_batched_prefetch=False):
         self._copy_stream = copy_stream
@@ -543,6 +545,30 @@ class FakeWeightManager:
     @property
     def use_batched_prefetch(self):
         return self._use_batched_prefetch
+
+
+class LazyTransfer:
+    """A ``DenseTransfer`` that is not a weight manager: it creates its stream at the first read.
+
+    The creation is logged as ``stream`` in the rank's log; the ``stream`` fault makes it raise.
+    """
+
+    def __init__(self, rank, *, use_gather=False, use_batched_prefetch=False):
+        self.rank = rank
+        self.use_gather = use_gather
+        self.use_batched_prefetch = use_batched_prefetch
+        self.created = 0
+        self._stream = None
+
+    @property
+    def copy_stream(self):
+        if self._stream is None:
+            self.rank.log.append("stream")
+            self.created += 1
+            if self.rank.spec.fail == "stream":
+                raise RuntimeError("injected: creating the copy stream failed")
+            self._stream = self.rank.ops.copy
+        return self._stream
 
 
 class FakeMemInfo:
@@ -883,13 +909,16 @@ class RankSpec:
 
     ``fail`` names a fault: ``store`` (store constructor), ``allocate``, ``write``, ``export``,
     ``import`` (store steps), ``runtime`` (no copy stream, so the runtime constructor raises),
-    ``launcher`` (launcher factory), ``p4_raise`` / ``p5_raise`` (a copy raises), ``lose_buffer``
-    (the P5 copy of the last layer deletes the ``weight`` buffer of ``LOST_MODULE``, so the
-    self-check and then the rollback fail).  ``interrupt`` names a store step that raises
-    ``KeyboardInterrupt``.  ``corrupt`` flips one slot byte.  ``perturb`` adds 1 to the first
-    element of a decoder parameter.  ``comm_rank`` overrides the rank the group reports;
-    ``malformed`` is the collective at which the rank sends a ``dict`` instead of its report.
-    ``loopback`` runs the real ``LoopbackShardStore`` instead of ``FakeStore``.
+    ``stream`` (a ``LazyTransfer`` whose stream cannot be created), ``launcher`` (launcher
+    factory), ``p4_raise`` / ``p5_raise`` (a copy raises), ``lose_buffer`` (the P5 copy of the
+    last layer deletes the ``weight`` buffer of ``LOST_MODULE``, so the self-check and then the
+    rollback fail).  ``interrupt`` names a store step that raises ``KeyboardInterrupt``.
+    ``corrupt`` flips one slot byte.  ``perturb`` adds 1 to the first element of a decoder
+    parameter.  ``comm_rank`` overrides the rank the group reports; ``malformed`` is the
+    collective at which the rank sends a ``dict`` instead of its report.  ``loopback`` runs the
+    real ``LoopbackShardStore`` instead of ``FakeStore``.  ``moe_layers`` None runs setup without
+    an expert layer list, as standalone dense DWDP does; ``lazy_transfer`` passes a
+    ``LazyTransfer`` instead of the weight manager.
     """
 
     requested: bool = True
@@ -899,7 +928,7 @@ class RankSpec:
     seed: int = 0
     kinds: tuple[str, ...] = LAYER_KINDS
     roots: bool = True
-    moe_layers: tuple[int, ...] = COVERED
+    moe_layers: tuple[int, ...] | None = COVERED
     free_bytes: int = PLENTY_FREE_BYTES
     cached_bytes: int = 0
     fail: str | None = None
@@ -911,6 +940,7 @@ class RankSpec:
     loopback: bool = False
     use_gather: bool = False
     use_batched: bool = False
+    lazy_transfer: bool = False
 
 
 @dataclass(frozen=True)
@@ -944,6 +974,11 @@ class Rank:
             use_gather=spec.use_gather,
             use_batched_prefetch=spec.use_batched,
         )
+        self.transfer = self.weight_manager
+        if spec.lazy_transfer or spec.fail == "stream":
+            self.transfer = LazyTransfer(
+                self, use_gather=spec.use_gather, use_batched_prefetch=spec.use_batched
+            )
         self.mem_get_info = FakeMemInfo(self)
         self.config = DenseConfig(
             enabled=spec.requested,
@@ -971,8 +1006,8 @@ class Rank:
         self.stores.append(store)
         return store
 
-    def launcher_factory(self, plans, weight_manager, device):
-        assert weight_manager is self.weight_manager and device == torch.device("cpu")
+    def launcher_factory(self, plans, transfer, device):
+        assert transfer is self.transfer and device == torch.device("cpu")
         self.log.append("factory")
         self.factory_streams.append(self.ops.current)
         if self.spec.fail == "launcher":
@@ -1018,15 +1053,16 @@ class Rank:
             "mem_get_info": self.mem_get_info,
             **overrides,
         }
+        moe_layers = self.spec.moe_layers
         try:
             self.result = setup_dense_dwdp(
                 self.model,
-                self.weight_manager,
+                self.transfer,
                 self.comm,
                 dwdp_rank=self.index,
                 dwdp_size=size,
                 device_id=0,
-                moe_layers=list(self.spec.moe_layers),
+                moe_layers=None if moe_layers is None else list(moe_layers),
                 **seams,
             )
         except (Exception, KeyboardInterrupt) as exc:  # the test inspects every rank's outcome
@@ -1129,10 +1165,16 @@ class Group:
                 rank.result.release()
 
 
-@pytest.fixture
-def make_group(monkeypatch):
-    """Builds rank groups; routes setup's slots, plans, cache release and logs to the test."""
+@contextlib.contextmanager
+def rank_groups(monkeypatch, group_type=None, log_modules=()):
+    """Builds rank groups; routes setup's slots, plans, cache release and logs to the test.
+
+    Yields ``make(specs)``, which builds a group of ``group_type`` (``Group`` if None) over a
+    fresh ``HashStore``.  The groups' log capture also replaces the ``logger`` of every module in
+    ``log_modules``.  On exit every group releases what its ranks still hold.
+    """
     torch_distributed = pytest.importorskip("torch.distributed")
+    group_type = Group if group_type is None else group_type
     memory = HostMemory()
     capture = CaptureLogger()
     groups = []
@@ -1171,18 +1213,27 @@ def make_group(monkeypatch):
 
     monkeypatch.setattr(dense_setup, "allocate_slot_ring", recording_allocate_slot_ring)
     monkeypatch.setattr(dense_setup, "build_copy_plans", recording_build_copy_plans)
-    monkeypatch.setattr(dense_setup, "logger", capture)
-    monkeypatch.setattr(dense_repoint, "logger", capture)
+    for module in (dense_setup, dense_repoint, *log_modules):
+        monkeypatch.setattr(module, "logger", capture)
     monkeypatch.setattr(torch.cuda, "empty_cache", recording_empty_cache)
 
     def make(specs):
-        group = Group(specs, memory, capture, torch_distributed.HashStore)
+        group = group_type(specs, memory, capture, torch_distributed.HashStore)
         groups.append(group)
         return group
 
-    yield make
-    for group in groups:
-        group.release_runtimes()
+    try:
+        yield make
+    finally:
+        for group in groups:
+            group.release_runtimes()
+
+
+@pytest.fixture
+def make_group(monkeypatch):
+    """Builds rank groups that run ``setup_dense_dwdp`` (see :func:`rank_groups`)."""
+    with rank_groups(monkeypatch) as make:
+        yield make
 
 
 def specs_for(num_ranks, **fields):
@@ -1201,7 +1252,7 @@ COMMIT_LINE = re.compile(
     "strict,debug", [(False, 0), (False, 1), (True, 0)], ids=["warn", "warn-debug", "strict"]
 )
 def test_a_leaked_original_is_reported_after_the_commit_point(make_group, strict, debug):
-    group = make_group([RankSpec(), RankSpec(strict=strict, debug=debug)])
+    group = make_group([RankSpec(strict=strict), RankSpec(strict=strict, debug=debug)])
     leaker = group.ranks[1]
     # A holder the bindings do not know about keeps one original alive.
     hidden = leaker.decoder.layers[1].linear_attn.o_proj.weight
@@ -1231,6 +1282,24 @@ def test_a_leaked_original_is_reported_after_the_commit_point(make_group, strict
     assert torch.equal(
         raw_bytes(hidden), leaker.snapshot.values["layers.1.linear_attn.o_proj.weight"]
     )
+
+
+def test_strict_differing_across_ranks_abandons_at_the_first_collective(make_group):
+    group = make_group([RankSpec(), RankSpec(strict=True)]).run()
+    group.assert_collectives(1)
+    group.assert_all_failed(r"collective #1 .*TRTLLM_DWDP_DENSE_STRICT differs across ranks")
+    group.assert_restored()
+
+
+@pytest.mark.parametrize("num_ranks,off", [(2, 0), (2, 1), (4, 2)])
+def test_ranks_that_disagree_on_the_dense_switch_all_raise(make_group, num_ranks, off):
+    specs = specs_for(num_ranks, required=False)
+    specs[off] = replace(specs[off], requested=False)
+    group = make_group(specs).run()
+    group.assert_collectives(1)
+    group.assert_all_failed(r"TRTLLM_DWDP_DENSE differs across the DWDP group")
+    group.assert_restored()
+    assert all(rank.stores == [] for rank in group.ranks)
 
 
 @pytest.mark.parametrize("required", [True, False], ids=["required", "optional"])

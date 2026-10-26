@@ -113,6 +113,7 @@ from ...models.modeling_utils import QuantAlgo, QuantConfig
 from ..attention.backends import AttentionMetadata
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from ..model_config import ModelConfig
+from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.gated_mlp import GatedMLP
 from ..modules.kimi_kda import KimiKDALinearAttention
 from ..modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
@@ -124,7 +125,6 @@ from ..modules.situ import SituAndMul
 from ..moe.fused_moe import ConfigurableMoE, SiTuActivation, TRTLLMGenFusedMoE, create_moe
 from ..moe.fused_moe.interface import MoESchedulerKind
 from ..moe.fused_moe.routing import DeepSeekV3MoeRoutingMethod
-from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
@@ -2078,9 +2078,10 @@ class KimiLinearDecoderLayer(nn.Module):
         self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
-        # The DWDP manager exists before the model is built; forward() reaches the dense DWDP
-        # runtime through it.
-        self._dwdp = get_global_dwdp_manager()
+        # The dense DWDP manager exists before the model is built (DwdpManager registers it with
+        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() reaches the
+        # dense DWDP runtime through it.
+        self._dense_dwdp = get_global_dense_dwdp_manager()
 
     def dense_dwdp_roots(self, segment: str) -> list[tuple[str, nn.Module]]:
         """The modules holding this layer's dense DWDP weights of ``segment``.
@@ -2141,8 +2142,8 @@ class KimiLinearDecoderLayer(nn.Module):
         # shared expert, latent projections) between H1 and H3 (layer_done). Their staging slots
         # are refilled with a later layer's weights once a window closes, so a read outside its
         # window sees another layer's bytes.
-        dwdp = getattr(self, "_dwdp", None)
-        dense = dwdp.dense if dwdp is not None else None
+        manager = getattr(self, "_dense_dwdp", None)
+        dense = manager.dense if manager is not None else None
         if dense is not None and not dense.covers(self.layer_idx):
             dense = None
         if dense is not None:
@@ -2287,9 +2288,10 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
-        # The DWDP manager exists before the model is built; forward() primes dense DWDP
-        # through it.
-        self._dwdp = get_global_dwdp_manager()
+        # The dense DWDP manager exists before the model is built (DwdpManager registers it with
+        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() primes dense
+        # DWDP through it.
+        self._dense_dwdp = get_global_dense_dwdp_manager()
 
     def forward(
         self,
@@ -2303,12 +2305,13 @@ class KimiLinearModel(DecoderModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        # Dense DWDP H0: make sure the first two layers' dense and expert weights are enqueued
-        # before any layer runs (the executor loop usually already did). After a forward that
-        # stopped midway, a WAR barrier on this stream comes first.
-        dwdp = getattr(self, "_dwdp", None)
-        if dwdp is not None and dwdp.dense is not None:
-            dwdp.ensure_primed()
+        # Dense DWDP H0: make sure the first two layers' dense weights (and, with expert DWDP,
+        # their experts) are enqueued before any layer runs (the non-overlap executor loop
+        # usually already did). After a forward that stopped midway, a WAR barrier on this stream
+        # comes first.
+        manager = getattr(self, "_dense_dwdp", None)
+        if manager is not None and manager.dense is not None:
+            manager.ensure_primed()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)

@@ -17,11 +17,11 @@
 A recording fake of the runtime's CUDA seam logs every event record, stream wait and copy launch
 in host order; a wait binds to the latest record of its event before it, as
 ``cudaStreamWaitEvent`` does.  A driver calls the runtime the way ``KimiLinearModel`` (H0-H3),
-``ConfigurableMoE`` (the expert copies ``E(l)``, on the same copy stream) and ``DwdpManager``
-(priming, WAR barrier) do, and logs the model's weight reads on the compute stream.  The tests
-check the bindings the design lists (invariants I1-I4, table 2.4), that the host never
-synchronizes after commit and, with vector clocks over the log, that no copy into a slot can
-overlap a read of that slot.
+``ConfigurableMoE`` (the expert copies ``E(l)``, on the same copy stream) and, with expert DWDP,
+``DenseDwdpManager`` (priming, WAR barrier) do, and logs the model's weight reads on the compute
+stream.  The tests check waits against the records the runtime's invariants I1-I4 name, that the
+host never synchronizes after commit and, with vector clocks over the log, that no copy into a
+slot can overlap a read of that slot.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from tensorrt_llm._torch.modules.dwdp.dense.manager import H0_HOOK
 from tensorrt_llm._torch.modules.dwdp.dense.runtime import DenseDWDP
 from tensorrt_llm._torch.modules.dwdp.dense.types import (
     EMPTY_TAG,
@@ -52,12 +53,8 @@ MOE = SegmentKind.MOE
 BOTH = (ATTN, MOE)
 ATTN_ONLY = (ATTN,)
 K3_LAYERS = tuple(range(1, 93))
-#: Hook that closes each segment's read window (design 3.4.2).
-WINDOW_END = {ATTN: "H2", MOE: "H3"}
 #: ``(forward, hook, layer)`` of the hook during which a log entry was made.
 Owner = tuple[int, str, int | None]
-#: How ``DwdpManager.ensure_primed`` names itself when ``require_eager`` refuses it.
-H0_HOOK = "DwdpManager.ensure_primed (H0)"
 
 # ---------------------------------------------------------------------------
 # Recording fake of the CUDA seam
@@ -195,8 +192,48 @@ def happens_before(
     return first != second and clocks[second].get(stream, 0) >= clocks[first][stream]
 
 
+def assert_race_free(
+    log: list[Entry], layers: tuple[int, ...], segments: tuple[SegmentKind, ...]
+) -> int:
+    """Check every logged read against every copy into its slot; returns the reads checked.
+
+    A copy ``L(l)`` writes the slot of ``l`` (by its position in ``layers``) in the ring of every
+    segment in ``segments``.  RAW: the latest copy of the read layer into the slot completes
+    before the read.  WAR: every later copy into the slot starts after the read completes.
+    """
+    clocks = vector_clocks(log)
+    position = {layer: index for index, layer in enumerate(layers)}
+    writes: dict[tuple[SegmentKind, int], list[tuple[int, int]]] = {}
+    for index, entry in enumerate(log):
+        if entry.kind == "launch" and entry.what == "L":
+            for kind in segments:
+                key = (kind, position[entry.layer] % RING_DEPTH[kind])
+                writes.setdefault(key, []).append((index, entry.layer))
+    reads = 0
+    for index, entry in enumerate(log):
+        if entry.kind != "read":
+            continue
+        kind = SegmentKind(entry.what)
+        key = (kind, position[entry.layer] % RING_DEPTH[kind])
+        slot_writes = writes.get(key, [])
+        sources = [w for w, layer in slot_writes if w < index and layer == entry.layer]
+        assert sources, f"read #{index} of {kind.value}({entry.layer}) precedes its copy"
+        source = sources[-1]
+        assert happens_before(log, clocks, source, index), (
+            f"RAW: read #{index} of {kind.value}({entry.layer}) may start before copy #{source}"
+        )
+        for later, layer in slot_writes:
+            if later > source:
+                assert happens_before(log, clocks, index, later), (
+                    f"WAR: copy #{later} of L({layer}) into {kind.value}[{key[1]}] may start "
+                    f"before read #{index} of {kind.value}({entry.layer}) completes"
+                )
+        reads += 1
+    return reads
+
+
 # ---------------------------------------------------------------------------
-# Driver: the model, ConfigurableMoE and DwdpManager around the runtime
+# Driver: the model, ConfigurableMoE and DenseDwdpManager around the runtime
 # ---------------------------------------------------------------------------
 
 
@@ -265,17 +302,21 @@ class Driver:
         """A kernel that reads ``kind``'s weights of ``layer`` on the current stream."""
         self.log.append(Entry("read", stream=self.ops.current, what=kind.value, layer=layer))
 
-    # -- DwdpManager -----------------------------------------------------------
+    # -- DenseDwdpManager, with expert DWDP ------------------------------------
 
     def prime_all(self) -> None:
-        """``DwdpManager._prime_all``: ``L(first), E(first), L(second), E(second)``."""
+        """``DenseDwdpManager._prime_all``: ``L(first), E(first), L(second), E(second)``."""
         for layer in self.layers[:2]:
             self.runtime.prefetch(layer)
             self.launch_expert(layer)
         self.runtime.mark_primed()
 
     def ensure_primed(self) -> None:
-        """``DwdpManager.ensure_primed`` at the model's H0 (design 3.4.6)."""
+        """``DenseDwdpManager.ensure_primed`` at the model's H0.
+
+        Without the expert consume records the manager adds after a WAR barrier: no dense copy
+        waits for them.
+        """
         self.runtime.require_eager(H0_HOOK)
         if self.runtime.forward_open:
             self.runtime.war_barrier()
@@ -391,75 +432,9 @@ class Driver:
                 return entry
         raise AssertionError(f"no copy launch before #{index}")
 
-    def expected_war_owner(self, kind: SegmentKind, layer: int, forward: int) -> Owner:
-        """Whose consume record the copy of ``L(layer)`` into ``kind``'s ring waits for.
-
-        The slot's previous holder: the layer one ring depth earlier in the same forward, else
-        the last layer of the previous forward that used the slot, else the records of P6.
-        """
-        depth = RING_DEPTH[kind]
-        position = self.layers.index(layer)
-        if position >= depth:
-            return (forward, WINDOW_END[kind], self.layers[position - depth])
-        if forward == 0:
-            return (0, "commit", None)
-        previous = max(p for p in range(len(self.layers)) if p % depth == position % depth)
-        return (forward - 1, WINDOW_END[kind], self.layers[previous])
-
-    def assert_war_bindings(self) -> int:
-        """Check that every dense copy waits for exactly the previous holders of its slots."""
-        owners = self.owners()
-        checked = 0
-        for index, entry in enumerate(self.log):
-            if entry.kind != "launch" or entry.what != "L":
-                continue
-            forward = owners[index][0]
-            waits = self.copy_waits_before(index)
-            assert all(self.log[self.log[w].bound].stream is self.ops.compute for w in waits)
-            bound = Counter(owners[self.log[w].bound] for w in waits)
-            expected = Counter(
-                self.expected_war_owner(kind, entry.layer, forward) for kind in self.segments
-            )
-            assert bound == expected, f"L({entry.layer}) of forward {forward}"
-            checked += 1
-        return checked
-
     def assert_race_free(self) -> int:
-        """Check every logged read against every copy into its slot; returns the reads checked.
-
-        RAW: the latest copy of the read layer into the slot completes before the read.  WAR:
-        every later copy into the slot starts after the read completes.
-        """
-        log = self.log
-        clocks = vector_clocks(log)
-        position = {layer: index for index, layer in enumerate(self.layers)}
-        writes: dict[tuple[SegmentKind, int], list[tuple[int, int]]] = {}
-        for index, entry in enumerate(log):
-            if entry.kind == "launch" and entry.what == "L":
-                for kind in self.segments:
-                    key = (kind, position[entry.layer] % RING_DEPTH[kind])
-                    writes.setdefault(key, []).append((index, entry.layer))
-        reads = 0
-        for index, entry in enumerate(log):
-            if entry.kind != "read":
-                continue
-            kind = SegmentKind(entry.what)
-            key = (kind, position[entry.layer] % RING_DEPTH[kind])
-            slot_writes = writes.get(key, [])
-            sources = [w for w, layer in slot_writes if w < index and layer == entry.layer]
-            assert sources, f"read #{index} of {kind.value}({entry.layer}) precedes its copy"
-            source = sources[-1]
-            assert happens_before(log, clocks, source, index), (
-                f"RAW: read #{index} of {kind.value}({entry.layer}) may start before copy #{source}"
-            )
-            for later, layer in slot_writes:
-                if later > source:
-                    assert happens_before(log, clocks, index, later), (
-                        f"WAR: copy #{later} of L({layer}) into {kind.value}[{key[1]}] may start "
-                        f"before read #{index} of {kind.value}({entry.layer}) completes"
-                    )
-            reads += 1
-        return reads
+        """:func:`assert_race_free` over the driver's log; returns the reads checked."""
+        return assert_race_free(self.log, self.layers, self.segments)
 
     def assert_no_host_sync(self) -> None:
         """Check that the host never synchronized after commit, so it can run ahead of the GPU."""

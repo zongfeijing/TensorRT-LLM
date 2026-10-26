@@ -33,7 +33,10 @@ rest of the MoE block real, its forward included, and their checkpoint slices ar
 Dense DWDP is set up by the real ``setup_dense_dwdp`` (P1-P6 with Phase V and the P5 self-check)
 for one rank of a 16-rank group held in this process: the group's collectives hand every rank
 this rank's report, and the loopback store holds all 16 rows.  The deployed configuration moves
-both segments over the TMA SM gather.
+both segments over the TMA SM gather.  Standalone (an
+attention-DP instance without expert DWDP, e.g. Kimi-K3 DEP16 CTX) a ``DenseDwdpManager`` of one
+rank of the tp group sets it up itself, with its own ``StandaloneTransfer`` (batched copies on a
+copy stream setup creates in P2) and no expert at all, over groups of 16, 4 and 2 ranks.
 ``strict`` turns a demand fetch, a fence fallback, a leaked original, an unknown large attribute
 or a shared storage into an error; ``debug=1`` fills the slots with NaN at commit, and the
 decoder test also runs ``debug=2``, whose slot watchdog checks every slot at each H1 against the
@@ -47,12 +50,15 @@ same address with the same shape, as Kimi-K3's MLA layers 3, 7, ..., 91 do.  Kim
 layer, 92, shares the second attention slot with KDA layers, which no MLA layer built here does.
 Read outside its window, a layer sees another layer's weights.
 
-``test_k3_decoder_forward_is_bit_exact_through_the_dense_hooks`` runs ``KimiLinearModel.forward``
-itself, with H0-H3 at their call sites, real KDA prefill and MLA context attention over fresh
-context requests, and checks every layer's output and the final hidden state, also after a
-forward that aborted midway and on an execution stream the executor loop primed for.  Both tests
-delay the copies of one forward and the read windows of another with spin kernels, so that a
-read or a copy that did not wait for its event would see another layer's bytes.  The KV cache is
+``test_k3_decoder_forward_is_bit_exact_through_the_dense_hooks`` (attached) and
+``test_k3_decoder_forward_is_bit_exact_standalone`` run ``KimiLinearModel.forward`` itself, with
+H0-H3 at their call sites, real KDA prefill and MLA context attention over fresh context
+requests, and check every layer's output and the final hidden state, also after a forward that
+aborted midway and on an execution stream the executor loop primed for.  The dense manager is
+registered before the model is built, so the model's hooks capture it (``_dense_dwdp``) as in a
+deployment.  Both tests delay the copies of one forward and the read windows of another with
+spin kernels, so that a read or a copy that did not wait for its event would see another layer's
+bytes.  The KV cache is
 BF16 (``helix_test_utils`` builds a ``KVCacheManagerV2``), so the MLA layers run the BF16
 context path.  The deployment gives every MLA layer but 91 and 92 an NVFP4 KV cache, whose context
 path for requests with a cached prefix reads ``kv_b_proj`` through the FP8-output GEMM.
@@ -98,13 +104,23 @@ from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
 from tensorrt_llm._torch.modules.dwdp import fabric_gather
 from tensorrt_llm._torch.modules.dwdp.dense import setup as dense_setup
 from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager,
+    StandaloneTransfer,
+    set_global_dense_dwdp_manager,
+)
 from tensorrt_llm._torch.modules.dwdp.dense.plan import DenseCopyLauncher, select_copy_mode
 from tensorrt_llm._torch.modules.dwdp.dense.runtime import DenseDWDP
 from tensorrt_llm._torch.modules.dwdp.dense.store import LoopbackShardStore
-from tensorrt_llm._torch.modules.dwdp.dense.types import CopyMode, DenseLayout, SegmentKind
+from tensorrt_llm._torch.modules.dwdp.dense.types import (
+    CopyMode,
+    DenseLayout,
+    DenseMode,
+    SegmentKind,
+)
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, CuteDslFusedMoE
-from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
+from tensorrt_llm._torch.pyexecutor.dwdp import set_global_dwdp_manager
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.utils import model_extra_attrs
 from tensorrt_llm.mapping import Mapping
@@ -231,19 +247,40 @@ def _k3_config() -> KimiLinearConfig:
     )
 
 
-def _model_config(cfg: KimiLinearConfig) -> ModelConfig:
-    """The deployed context worker: tp1 with attention DP, FP8 block-scaled attention."""
+def _model_config(cfg: KimiLinearConfig, mapping: Mapping | None = None) -> ModelConfig:
+    """The deployed context worker: attention DP, FP8 block-scaled attention.
+
+    Args:
+        cfg: The model configuration.
+        mapping: The worker's mapping; tp1 with attention DP (the DWDP context worker) if None.
+    """
     fp8 = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
     declared = {}
     for layer in range(_NUM_LAYERS):
         names = _KDA_PROJECTIONS if layer + 1 in _KDA_LAYERS else _MLA_PROJECTIONS
         declared.update({f"model.layers.{layer}.self_attn.{name}": fp8 for name in names})
+    if mapping is None:
+        mapping = Mapping(world_size=1, tp_size=1, rank=0, enable_attention_dp=True)
     return ModelConfig(
         pretrained_config=cfg,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0, enable_attention_dp=True),
+        mapping=mapping,
         quant_config=QuantConfig(),
         quant_config_dict=declared,
         moe_backend="CUTEDSL",
+    )
+
+
+def _dep_mapping(num_ranks: int, rank: int) -> Mapping:
+    """Rank ``rank`` of a DEP instance of ``num_ranks`` ranks, as Kimi-K3 DEP16 CTX runs.
+
+    Tp and MoE EP ``num_ranks`` with attention DP; standalone dense DWDP's group is its tp group.
+    """
+    return Mapping(
+        world_size=num_ranks,
+        tp_size=num_ranks,
+        rank=rank,
+        moe_ep_size=num_ranks,
+        enable_attention_dp=True,
     )
 
 
@@ -305,10 +342,43 @@ class _RoutedExpertsStandIn(ConfigurableMoE):
         return x * probabilities.to(x.dtype)
 
 
+#: Seeds the random checkpoint.
+_CHECKPOINT_SEED = 20261016
+
+
 def _build_model(
-    monkeypatch: pytest.MonkeyPatch, device: torch.device
+    monkeypatch: pytest.MonkeyPatch,
+    device: torch.device,
+    *,
+    mapping: Mapping | None = None,
+    checkpoint: dict[str, torch.Tensor] | None = None,
 ) -> mkl.KimiLinearForCausalLM:
-    """The nine-layer K3 model with random weights loaded and post-processed as deployed."""
+    """The nine-layer K3 model with random weights loaded and post-processed as deployed.
+
+    Args:
+        monkeypatch: Installs the routed-expert stand-in.
+        device: The CUDA device.
+        mapping: The model's mapping; tp1 with attention DP if None.
+        checkpoint: The tensors to load (another build's, kept by the caller); random tensors for
+            this build's shapes if None.
+    """
+    model, expert_jobs = _construct_model(monkeypatch, device, mapping)
+    if checkpoint is None:
+        generator = torch.Generator(device=device).manual_seed(_CHECKPOINT_SEED)
+        _load_model(model, _checkpoint(model, generator, device), expert_jobs, device)
+    else:
+        _load_model(model, checkpoint, expert_jobs, device)
+    return model
+
+
+def _construct_model(
+    monkeypatch: pytest.MonkeyPatch, device: torch.device, mapping: Mapping | None
+) -> tuple[mkl.KimiLinearForCausalLM, list]:
+    """The nine-layer K3 model before its weights are loaded.
+
+    Returns:
+        The model and the list its ``load_weights`` records the routed-expert jobs into.
+    """
     monkeypatch.setattr(mkl, "create_moe", lambda **kwargs: _RoutedExpertsStandIn(**kwargs))
     expert_jobs = []
     # The routed experts are the stand-in's; their checkpoint slices are not loaded.
@@ -317,17 +387,27 @@ def _build_model(
         "_load_expert_slices",
         lambda self, weights, jobs: expert_jobs.extend(jobs),
     )
-    model_config = _model_config(_k3_config())
+    model_config = _model_config(_k3_config(), mapping)
     with torch.device(device):
         model = mkl.KimiLinearForCausalLM(model_config).eval()
-    generator = torch.Generator(device=device).manual_seed(20261016)
-    weights = _checkpoint(model, generator, device)
-    model.load_weights(weights)
+    return model, expert_jobs
+
+
+def _load_model(
+    model: mkl.KimiLinearForCausalLM,
+    weights: dict[str, torch.Tensor],
+    expert_jobs: list,
+    device: torch.device,
+) -> None:
+    """``load_weights`` and the model loader's post-load walk, as deployed.
+
+    Loads a shallow copy of ``weights``, so the caller may load them into another build.
+    """
+    model.load_weights(dict(weights))
     del weights
     ModelLoader._walk_full_post_load(model)
     torch.cuda.synchronize(device)
     assert [layer for layer, _, _ in expert_jobs] == list(_COVERED)
-    return model
 
 
 def _checkpoint(
@@ -463,10 +543,11 @@ class _Variant(NamedTuple):
     """``TRTLLM_DWDP_DENSE_SEGMENTS``."""
 
     rank: int
-    """This rank in the 16-rank group."""
+    """This rank in the group."""
 
     transfer: CopyMode = CopyMode.GATHER
-    """The expert DWDP transfer mode, which dense DWDP follows."""
+    """With expert DWDP, its transfer mode, which dense DWDP follows; standalone,
+    ``TRTLLM_DWDP_DENSE_COPY``."""
 
     store_chunk_mb: int = 0
     """``TRTLLM_DWDP_DENSE_STORE_CHUNK_MB``."""
@@ -478,17 +559,39 @@ class _Variant(NamedTuple):
     """``TRTLLM_DWDP_DENSE_DEBUG``: 1 fills the slots with NaN at commit; 2 also runs the slot
     watchdog."""
 
+    mode: DenseMode = DenseMode.ATTACHED
+    """``ATTACHED``: with expert DWDP, set up as ``DwdpManager.setup`` does; ``STANDALONE``: by a
+    ``DenseDwdpManager`` of rank ``rank`` of a DEP instance, without expert DWDP."""
+
+    num_ranks: int = _NUM_RANKS
+    """The group: the DWDP group with expert DWDP, the instance's tp group standalone."""
+
     @property
     def name(self) -> str:
         chunks = f"-chunk{self.store_chunk_mb}mb" if self.store_chunk_mb else ""
         lenient = "" if self.strict else "-lenient"
         debug = "" if self.debug == 1 else f"-debug{self.debug}"
         segments = "_".join(kind.value for kind in self.segments)
-        return f"{segments}-{self.transfer.value}-rank{self.rank}{chunks}{lenient}{debug}"
+        name = f"{segments}-{self.transfer.value}-rank{self.rank}{chunks}{lenient}{debug}"
+        if self.mode is DenseMode.STANDALONE:
+            return f"standalone-dep{self.num_ranks}-{name}"
+        return name
 
 
 #: The deployment: both segments over the SM gather.
 _DEPLOYED = _Variant((ATTN, MOE), rank=5)
+
+#: The standalone decoder test's ranks: of a DEP2, a DEP4 and a DEP16 instance, the last with the
+#: slot watchdog (``TRTLLM_DWDP_DENSE_DEBUG=2``).
+_STANDALONE_DECODER = (
+    _Variant(
+        (ATTN, MOE), rank=1, transfer=CopyMode.BATCHED, mode=DenseMode.STANDALONE, num_ranks=2
+    ),
+    _Variant(
+        (ATTN, MOE), rank=3, transfer=CopyMode.BATCHED, mode=DenseMode.STANDALONE, num_ranks=4
+    ),
+    _Variant((ATTN, MOE), rank=12, transfer=CopyMode.BATCHED, debug=2, mode=DenseMode.STANDALONE),
+)
 
 #: GPU clock cycles of a spin kernel: long enough that a read or a copy that does not wait for its
 #: event runs into the other stream's work.
@@ -500,13 +603,20 @@ class _SpinningLauncher:
 
     With ``spin_cycles`` set every copy lands long after compute has reached the H1 that waits
     for it, so a read that did not wait would see the slot's previous holder or the NaN fill.
+    ``launches`` lists the layers launched, in order.
     """
 
     def __init__(self, launcher: DenseCopyLauncher) -> None:
         self._launcher = launcher
         self.spin_cycles = 0
+        self.launches: list[int] = []
+
+    @property
+    def mode(self) -> CopyMode:
+        return self._launcher.mode
 
     def __call__(self, layer_idx: int) -> None:
+        self.launches.append(layer_idx)
         _spin(self.spin_cycles)
         self._launcher(layer_idx)
 
@@ -524,6 +634,9 @@ class _DenseRun(NamedTuple):
     seconds: float
     allocated_before: int
     allocated_after: int
+    manager: DenseDwdpManager | None = None
+    """The standalone manager that set dense DWDP up and owns the runtime; None with expert
+    DWDP, where setup leaves the runtime to its caller."""
 
 
 def _set_up_dense(
@@ -531,11 +644,16 @@ def _set_up_dense(
     variant: _Variant,
     device: torch.device,
     monkeypatch: pytest.MonkeyPatch,
+    manager: DenseDwdpManager | None = None,
 ) -> _DenseRun:
-    """``setup_dense_dwdp`` as ``DwdpManager.setup`` calls it, for one rank of a loopback group.
+    """Dense DWDP setup on one rank of a loopback group, as the variant's owner runs it.
 
-    The weight manager stand-in supplies the copy stream and the variant's transfer mode; the
-    launcher is the production one for that mode, behind a ``_SpinningLauncher``.
+    With expert DWDP, ``setup_dense_dwdp`` as ``DwdpManager.setup`` calls it: a weight manager
+    stand-in supplies the copy stream and the variant's transfer mode.  Standalone,
+    ``DenseDwdpManager.setup`` of ``manager`` (a new standalone manager of the variant's rank if
+    None) over the loopback group, with a ``StandaloneTransfer`` of the variant's mode whose copy
+    stream setup must create once, in P2.  Either way the launcher is the production one for the
+    mode, behind a ``_SpinningLauncher``.
     """
     layouts = []
     collect = dense_setup.collect_dense_layout
@@ -547,22 +665,34 @@ def _set_up_dense(
 
     launchers = []
 
-    def spinning_launcher(plans, weight_manager, device) -> _SpinningLauncher:
+    def spinning_launcher(plans, transfer, device) -> _SpinningLauncher:
         mode = select_copy_mode(
-            use_gather=weight_manager.use_gather, use_batched=weight_manager.use_batched_prefetch
+            use_gather=transfer.use_gather, use_batched=transfer.use_batched_prefetch
         )
         launchers.append(_SpinningLauncher(DenseCopyLauncher(plans, mode, device=device)))
         return launchers[-1]
 
     monkeypatch.setattr(dense_setup, "collect_dense_layout", recording_collect)
-    # What makes DwdpManager.setup run dense setup for this model at all.
+    # What makes the manager run dense setup for this model at all.
     assert dense_setup.dense_roots_available(model)
-    group = _LoopbackGroup(variant.rank, _NUM_RANKS)
-    weight_manager = SimpleNamespace(
-        copy_stream=torch.cuda.Stream(device),
-        use_gather=variant.transfer is CopyMode.GATHER,
-        use_batched_prefetch=variant.transfer is CopyMode.BATCHED,
-    )
+    group = _LoopbackGroup(variant.rank, variant.num_ranks)
+    streams = []
+    if variant.mode is DenseMode.ATTACHED:
+        transfer = SimpleNamespace(
+            copy_stream=torch.cuda.Stream(device),
+            use_gather=variant.transfer is CopyMode.GATHER,
+            use_batched_prefetch=variant.transfer is CopyMode.BATCHED,
+        )
+    else:
+        if manager is None:
+            mapping = _dep_mapping(variant.num_ranks, variant.rank)
+            manager = DenseDwdpManager(DenseMode.STANDALONE, mapping=mapping)
+
+        def copy_stream() -> torch.cuda.Stream:
+            streams.append((group.allgathers, torch.cuda.Stream(device)))
+            return streams[-1][1]
+
+        transfer = StandaloneTransfer(variant.transfer, copy_stream)
     config = DenseConfig(
         enabled=True,
         segments=variant.segments,
@@ -573,22 +703,38 @@ def _set_up_dense(
     torch.cuda.synchronize(device)
     allocated_before = torch.cuda.memory_allocated(device)
     started = time.monotonic()
-    runtime = dense_setup.setup_dense_dwdp(
-        model,
-        weight_manager,
-        group,
-        dwdp_rank=variant.rank,
-        dwdp_size=_NUM_RANKS,
-        device_id=device.index,
-        moe_layers=list(_COVERED),
-        config=config,
-        store_factory=LoopbackShardStore,
-        launcher_factory=spinning_launcher,
-    )
+    if variant.mode is DenseMode.ATTACHED:
+        runtime = dense_setup.setup_dense_dwdp(
+            model,
+            transfer,
+            group,
+            dwdp_rank=variant.rank,
+            dwdp_size=variant.num_ranks,
+            device_id=device.index,
+            moe_layers=list(_COVERED),
+            config=config,
+            store_factory=LoopbackShardStore,
+            launcher_factory=spinning_launcher,
+        )
+    else:
+        runtime = manager.setup(
+            model,
+            comm=group,
+            transfer=transfer,
+            config=config,
+            device_id=device.index,
+            store_factory=LoopbackShardStore,
+            launcher_factory=spinning_launcher,
+        )
+        assert runtime is not None and manager.dense is runtime
+        # Created when P2 builds the runtime, after collective #1, and only then.
+        assert [gathered for gathered, _ in streams] == [1]
+        assert transfer.copy_stream is streams[0][1]
     seconds = time.monotonic() - started
     assert runtime is not None, "dense DWDP setup returned no runtime"
     (layout,) = layouts
     (launcher,) = launchers
+    assert launcher.mode is variant.transfer
     return _DenseRun(
         runtime,
         launcher,
@@ -597,6 +743,7 @@ def _set_up_dense(
         seconds,
         allocated_before,
         torch.cuda.memory_allocated(device),
+        manager if variant.mode is DenseMode.STANDALONE else None,
     )
 
 
@@ -681,6 +828,20 @@ def tactics(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> _TacticLog:
 
     monkeypatch.setattr(tuner, "choose_one", recording_choose_one)
     return log
+
+
+@pytest.fixture(autouse=True)
+def _no_registered_managers() -> Iterator[None]:
+    """No DWDP or dense DWDP manager is registered around a test.
+
+    The model's layers capture the registered dense manager when they are built, and a leaked
+    registration would make the next ``__enter__`` (or ``DwdpManager``) fail.
+    """
+    set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
+    yield
+    set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
 
 
 def _check_tactics(log: _TacticLog, reference_calls: list) -> int:
@@ -826,9 +987,11 @@ def _report(name: str, run: _DenseRun, details: str) -> None:
 
 
 class _ExpertPrefetchRecorder:
-    """The expert DWDP calls of ``DwdpManager`` priming and recovery, recorded instead of run.
+    """The expert DWDP calls of attached priming and recovery, recorded instead of run.
 
-    The routed experts are stand-ins, so there is nothing to copy for them.
+    An attached ``DenseDwdpManager`` makes them on the expert weight manager that
+    ``DwdpManager.setup`` attaches with the runtime.  The routed experts are stand-ins, so there
+    is nothing to copy for them.
     """
 
     def __init__(self, layers: Sequence[int]) -> None:
@@ -849,23 +1012,10 @@ class _ExpertPrefetchRecorder:
         self.calls.append(("record_compute", layer_idx))
 
 
-def _dwdp_manager(runtime: DenseDWDP, experts: _ExpertPrefetchRecorder) -> DwdpManager:
-    """A ``DwdpManager`` holding ``runtime`` and the expert recorder, without its DWDP group.
-
-    Its constructor needs the expert DWDP group; ``dense`` and ``ensure_primed`` read only the
-    dense runtime and the weight manager, which are attached directly.
-    """
-    manager = DwdpManager.__new__(DwdpManager)
-    manager._dense = runtime
-    manager._weight_manager = experts
-    return manager
-
-
-def _attach_dwdp(model: mkl.KimiLinearForCausalLM, manager: DwdpManager | None) -> None:
-    """Hand the model the manager it captures at construction when DWDP is on (MKL M0)."""
-    model.model._dwdp = manager
-    for layer in model.model.layers:
-        layer._dwdp = manager
+def _check_captured(model: mkl.KimiLinearForCausalLM, manager: DenseDwdpManager) -> None:
+    """The model and every decoder layer captured the registered dense manager when built."""
+    assert model.model._dense_dwdp is manager
+    assert all(layer._dense_dwdp is manager for layer in model.model.layers)
 
 
 #: The executor's token budget per forward in the decoder test, the same for every forward as in
@@ -1032,34 +1182,72 @@ def test_k3_decoder_forward_is_bit_exact_through_the_dense_hooks(
 
     ``KimiLinearModel.forward`` runs one context request per forward: real KDA prefill and MLA
     context attention, the MoE blocks with the routed-expert stand-in, layer 0 uncovered.  Dense
-    DWDP reaches the hooks through a ``DwdpManager``, whose ``ensure_primed`` is H0.  Every
-    layer's output and the final hidden state must equal the outputs without dense DWDP bit for
-    bit, the first forward with delayed copies and the second with delayed read windows.  A
-    forward that then fails inside layer 3's MoE block leaves the forward open; the next forward
-    recovers through the WAR barrier and must still be bit-exact.  The last forward runs on its
-    own execution stream after ``DwdpManager.prefetch_first_layers`` primed from the default
-    stream, as the executor loop does.  With ``TRTLLM_DWDP_DENSE_DEBUG=2`` (the T20b validation
-    run) the slot watchdog also checks every slot each H1 waits for against the layer's P1
-    checksum, at Kimi-K3 blob sizes, and must find nothing.
+    DWDP reaches the hooks through an attached ``DenseDwdpManager``, registered before the model
+    is built as ``DwdpManager`` registers it, whose ``ensure_primed`` is H0; it holds a recorder
+    of the expert calls as the expert weight manager.  Every layer's output and the final hidden
+    state must equal the outputs without dense DWDP bit for bit, the first forward with delayed
+    copies and the second with delayed read windows.  A forward that then fails inside layer 3's
+    MoE block leaves the forward open; the next forward recovers through the WAR barrier and
+    must still be bit-exact.  The last forward runs on its own execution stream after
+    ``DenseDwdpManager.prefetch_first_layers`` primed from the default stream, as the executor
+    loop does through ``DwdpManager``.  With ``TRTLLM_DWDP_DENSE_DEBUG=2`` the slot watchdog also
+    checks every slot each H1 waits for against the layer's P1 checksum, at Kimi-K3 blob sizes,
+    and must find nothing.
     """
-    model = _build_model(monkeypatch, device)
-    slot = _RequestSlot(model, _MAX_NUM_TOKENS, device)
-    try:
-        variant = _DEPLOYED._replace(debug=debug)
-        _check_decoder_forwards(model, slot, variant, device, tactics, monkeypatch)
-    finally:
-        slot.close()
+    _run_decoder_test(_DEPLOYED._replace(debug=debug), device, tactics, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "variant", _STANDALONE_DECODER, ids=[variant.name for variant in _STANDALONE_DECODER]
+)
+def test_k3_decoder_forward_is_bit_exact_standalone(
+    variant: _Variant, device: torch.device, tactics: _TacticLog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decoder test without expert DWDP, on one rank of a DEP2, DEP4 and DEP16 instance.
+
+    A standalone ``DenseDwdpManager`` is registered before the model is built, as
+    ``py_executor_creator`` registers it, and sets dense DWDP up itself over the instance's tp
+    group with batched copies on its own copy stream.  The same forwards: primed by H0 only, the
+    recovery after an aborted forward, and the executor loop's ``prefetch_first_layers`` from
+    the default stream.  There is no expert to call: the copy stream carries ``L(1) L(2) ...``
+    of the dense gathers alone.
+    """
+    _run_decoder_test(variant, device, tactics, monkeypatch)
+
+
+def _run_decoder_test(
+    variant: _Variant, device: torch.device, tactics: _TacticLog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The decoder test of ``variant``, with its manager registered while the model is built."""
+    if variant.mode is DenseMode.ATTACHED:
+        manager = DenseDwdpManager(DenseMode.ATTACHED)
+    else:
+        mapping = _dep_mapping(variant.num_ranks, variant.rank)
+        manager = DenseDwdpManager(DenseMode.STANDALONE, mapping=mapping)
+    with manager:
+        model = _build_model(monkeypatch, device)
+        _check_captured(model, manager)
+        slot = _RequestSlot(model, _MAX_NUM_TOKENS, device)
+        try:
+            _check_decoder_forwards(model, slot, variant, manager, device, tactics, monkeypatch)
+        finally:
+            slot.close()
 
 
 def _check_decoder_forwards(
     model: mkl.KimiLinearForCausalLM,
     slot: _RequestSlot,
     variant: _Variant,
+    manager: DenseDwdpManager,
     device: torch.device,
     tactics: _TacticLog,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The body of the decoder test, with the request slot open."""
+    """The body of the decoder test, with the request slot open and the hooks on ``manager``.
+
+    Every forward launches the dense gathers ``L(1) .. L(8)`` in order: H0 or the executor loop
+    primes the first two, H2 of each covered layer enqueues the layer two ahead.
+    """
     references = {tokens: _model_forward(model, slot, tokens) for tokens in _TOKEN_COUNTS}
     reference_calls = list(tactics.calls)
     for tokens in _TOKEN_COUNTS:
@@ -1069,46 +1257,62 @@ def _check_decoder_forwards(
     del repeated
     tactics.calls.clear()
 
-    run = _set_up_dense(model, variant, device, monkeypatch)
+    run = _set_up_dense(model, variant, device, monkeypatch, manager)
     runtime = run.runtime
-    experts = _ExpertPrefetchRecorder(_COVERED)
-    _attach_dwdp(model, _dwdp_manager(runtime, experts))
+    experts = None
+    if variant.mode is DenseMode.ATTACHED:
+        # What DwdpManager.setup does with the runtime setup_dense_dwdp committed.
+        experts = _ExpertPrefetchRecorder(_COVERED)
+        manager.attach(runtime, expert=experts)
+    assert manager.dense is runtime
+    launches = run.launcher.launches
     try:
         _check_setup(model, run, variant)
         # As in the module test: delayed copies, then delayed read windows, then neither.
         for forward, tokens in enumerate(_TOKEN_COUNTS):
             run.launcher.spin_cycles = _SPIN_CYCLES if forward == 0 else 0
+            launches.clear()
             with _slow_windows(model, _SPIN_CYCLES if forward == 1 else 0):
                 outputs = _model_forward(model, slot, tokens)
             differences = _differences(references[tokens], outputs)
             assert not differences, f"T={tokens}: " + "; ".join(differences)
+            assert launches == list(_COVERED)
         run.launcher.spin_cycles = 0
-        assert experts.calls == [("prefetch", 1), ("prefetch", 2)] * len(_TOKEN_COUNTS)
+        if experts is not None:
+            assert experts.calls == [("prefetch", 1), ("prefetch", 2)] * len(_TOKEN_COUNTS)
         gemms = _check_tactics(tactics, reference_calls)
 
         routed_experts = model.model.layers[3].block_sparse_moe.routed_experts
         routed_experts.fail = True
+        launches.clear()
         with pytest.raises(RuntimeError, match="injected"):
             _model_forward(model, slot, _TOKEN_COUNTS[0])
         routed_experts.fail = False
         assert runtime.forward_open
-        experts.calls.clear()
+        # Layer 3's H2 enqueued L(5) before its MoE block failed.
+        assert launches == [1, 2, 3, 4, 5]
+        if experts is not None:
+            experts.calls.clear()
+        launches.clear()
         tokens = _LONG
         differences = _differences(references[tokens], _model_forward(model, slot, tokens))
         assert not differences, f"T={tokens} after an aborted forward: " + "; ".join(differences)
-        assert experts.calls == [
-            ("record_compute", 1),
-            ("record_compute", 2),
-            ("prefetch", 1),
-            ("prefetch", 2),
-        ]
+        assert launches == list(_COVERED)
+        if experts is not None:
+            assert experts.calls == [
+                ("record_compute", 1),
+                ("record_compute", 2),
+                ("prefetch", 1),
+                ("prefetch", 2),
+            ]
 
         # The executor loop primes from its own stream before the forward runs on the execution
         # stream; H0 then finds the slots primed and enqueues nothing.
-        experts.calls.clear()
-        manager = model.model._dwdp
+        if experts is not None:
+            experts.calls.clear()
+        launches.clear()
         manager.prefetch_first_layers()
-        assert runtime.primed
+        assert runtime.primed and launches == [1, 2]
         execution_stream = torch.cuda.Stream(device)
         execution_stream.wait_stream(torch.cuda.current_stream(device))
         run.launcher.spin_cycles = _SPIN_CYCLES
@@ -1119,7 +1323,9 @@ def _check_decoder_forwards(
         run.launcher.spin_cycles = 0
         differences = _differences(references[tokens], outputs)
         assert not differences, f"T={tokens} on the execution stream: " + "; ".join(differences)
-        assert experts.calls == [("prefetch", 1), ("prefetch", 2)]
+        assert launches == list(_COVERED)
+        if experts is not None:
+            assert experts.calls == [("prefetch", 1), ("prefetch", 2)]
         assert (runtime.demand_fetches, runtime.war_fences) == (0, 0)
         assert not runtime.forward_open
         # Five forwards ran every covered layer's H1; the aborted one ran H1 of layers 1-3.
@@ -1127,8 +1333,9 @@ def _check_decoder_forwards(
         if variant.debug < 2:
             checks = 0
         assert (runtime.watchdog_checks, runtime.watchdog_mismatches) == (checks, 0)
+        label = variant.name if variant.mode is DenseMode.STANDALONE else f"debug={variant.debug}"
         _report(
-            f"dense k3 decoder forward debug={variant.debug}",
+            f"dense k3 decoder forward {label}",
             run,
             f"{len(references[tokens])} layer and final outputs per forward bit-exact over "
             f"T={list(_TOKEN_COUNTS)}, after an aborted forward and on an execution stream the "
@@ -1137,7 +1344,7 @@ def _check_decoder_forwards(
             f"{runtime.watchdog_checks} checks, {runtime.watchdog_mismatches} mismatches",
         )
     finally:
-        _attach_dwdp(model, None)
-        runtime.release()
+        manager.cleanup()
+    assert manager.dense is None
     assert runtime.watchdog_mismatches == 0
     _check_detached(model.model.layers, variant.segments)

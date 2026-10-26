@@ -28,6 +28,9 @@ backends' RoPE tables and scale tensors on CUDA, so the MLA cases run twice: wit
 which needs a GPU and skips without one (the parameters still stay on CPU), and on CPU with only
 that mixer replaced by a stand-in.  The stand-in keeps the layer's real MLA branch and its
 ``KimiMLARuntime`` wrapper, which are what the roots and the hooks depend on.
+
+The model reaches dense DWDP through the dense DWDP manager it captures when built
+(``get_global_dense_dwdp_manager``), in both modes: attached to expert DWDP and standalone.
 """
 
 from types import SimpleNamespace
@@ -37,13 +40,13 @@ import torch
 from torch import nn
 
 pytest.importorskip("fla")
-
 from tensorrt_llm._torch.configs.kimi_linear import KimiLinearConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models import modeling_kimi_linear as mkl
 from tensorrt_llm._torch.modules import kimi_k3_mla
+from tensorrt_llm._torch.modules.dwdp.dense.manager import set_global_dense_dwdp_manager
 from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE, CutlassFusedMoE
-from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager, set_global_dwdp_manager
+from tensorrt_llm._torch.pyexecutor.dwdp import set_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -81,17 +84,20 @@ def _kimi_config(
     mla_layers: tuple[int, ...] = (3,),
     first_k_dense_replace: int = 1,
     full_rank_gate: bool = True,
+    num_heads: int = 2,
+    num_experts: int = 8,
 ) -> KimiLinearConfig:
     """A tiny Kimi-K3: by default a dense-MLP KDA layer 0, then KDA, MLA and KDA MoE layers.
 
-    ``kda_layers`` and ``mla_layers`` are 1-indexed, as in the checkpoint config.
+    ``kda_layers`` and ``mla_layers`` are 1-indexed, as in the checkpoint config.  ``num_heads``
+    is the head count of the KDA and the MLA attention.
     """
     return KimiLinearConfig(
         vocab_size=128,
         hidden_size=_HIDDEN,
         intermediate_size=256,
         num_hidden_layers=len(kda_layers) + len(mla_layers),
-        num_attention_heads=2,
+        num_attention_heads=num_heads,
         q_lora_rank=256,
         kv_lora_rank=128,
         qk_nope_head_dim=128,
@@ -104,12 +110,12 @@ def _kimi_config(
         linear_attn_config={
             "kda_layers": list(kda_layers),
             "full_attn_layers": list(mla_layers),
-            "num_heads": 2,
+            "num_heads": num_heads,
             "head_dim": 128,
             "short_conv_kernel_size": 4,
             "use_full_rank_gate": full_rank_gate,
         },
-        num_experts=8,
+        num_experts=num_experts,
         num_experts_per_token=2,
         moe_intermediate_size=128,
         num_shared_experts=1,
@@ -130,12 +136,24 @@ def _kda_config(num_layers: int, *, first_k_dense_replace: int = 1) -> KimiLinea
     )
 
 
-def _model_config(cfg: KimiLinearConfig) -> ModelConfig:
-    """The deployed context-worker shape: tp1 with attention DP (fp32 router, replicated MLPs)."""
+def _model_config(
+    cfg: KimiLinearConfig,
+    mapping: Mapping | None = None,
+    quant_config_dict: dict[str, QuantConfig] | None = None,
+) -> ModelConfig:
+    """The deployed context-worker shape: tp1 with attention DP (fp32 router, replicated MLPs).
+
+    Args:
+        mapping: Another rank mapping, such as a DEP16 rank's.
+        quant_config_dict: Per-module quantization, by checkpoint module name.
+    """
+    if mapping is None:
+        mapping = Mapping(world_size=1, tp_size=1, rank=0, enable_attention_dp=True)
     return ModelConfig(
         pretrained_config=cfg,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0, enable_attention_dp=True),
+        mapping=mapping,
         quant_config=QuantConfig(),
+        quant_config_dict=quant_config_dict,
         moe_backend="CUTLASS",
     )
 
@@ -180,9 +198,9 @@ class _CpuRoutedBackend(CutlassFusedMoE):
     implements are never called on this stand-in.
     """
 
-    def __init__(self, num_experts: int) -> None:
+    def __init__(self, expert_ids: list[int]) -> None:
         nn.Module.__init__(self)
-        self.initial_local_expert_ids = list(range(num_experts))
+        self.initial_local_expert_ids = expert_ids
 
     @classmethod
     def can_implement(cls, p, d):
@@ -195,13 +213,17 @@ class _CpuRoutedBackend(CutlassFusedMoE):
 class _CpuRoutedExperts(ConfigurableMoE):
     """Stands in for the routed experts ``create_moe`` builds.
 
-    Holds what ``KimiK3MoERuntime`` reads at construction: a backend with this rank's experts
-    (all of them at tp1), no load balancer and no all-reduce.
+    Holds what ``KimiK3MoERuntime`` reads at construction: a backend with this rank's contiguous
+    slice of the experts under expert parallelism (all of them at tp1), no load balancer and no
+    all-reduce.
     """
 
-    def __init__(self, *, num_experts: int, **kwargs) -> None:
+    def __init__(self, *, num_experts: int, model_config: ModelConfig, **kwargs) -> None:
         nn.Module.__init__(self)
-        self.backend = _CpuRoutedBackend(num_experts)
+        mapping = model_config.mapping
+        per_rank = num_experts // mapping.moe_ep_size
+        first = mapping.moe_ep_rank * per_rank
+        self.backend = _CpuRoutedBackend(list(range(first, first + per_rank)))
         self.comm = None
         self.layer_load_balancer = None
         self.all_reduce = None
@@ -231,12 +253,17 @@ def moe_layer(
 
 
 @pytest.fixture(autouse=True)
-def _no_global_dwdp_manager():
-    """Layers capture the global manager when built; every test starts and ends without one."""
-    previous = get_global_dwdp_manager()
+def _no_global_managers():
+    """Layers capture the global dense manager when built; every test starts and ends without one.
+
+    The DWDP manager's accessor is reset too: a leftover registration of either fails the next
+    ``DwdpManager`` of this process.
+    """
     set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
     yield
-    set_global_dwdp_manager(previous)
+    set_global_dwdp_manager(None)
+    set_global_dense_dwdp_manager(None)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +325,7 @@ class _RecordingDense:
 
 
 class _RecordingManager:
-    """``DwdpManager.dense`` and ``DwdpManager.ensure_primed``, recorded."""
+    """``DenseDwdpManager.dense`` and ``DenseDwdpManager.ensure_primed``, recorded."""
 
     def __init__(self, log: list, dense: object | None) -> None:
         self._log = log
@@ -370,7 +397,7 @@ def _hooked_layer_reads(layer_idx: int, ffn: str) -> list[tuple]:
 def test_hooks_bracket_the_attention_and_moe_reads(moe_layer):
     log = []
     _install_recorders(moe_layer, log)
-    moe_layer._dwdp = _RecordingManager(log, _RecordingDense(log, covered=_MOE_LAYERS))
+    moe_layer._dense_dwdp = _RecordingManager(log, _RecordingDense(log, covered=_MOE_LAYERS))
     _run_layer(moe_layer)
     assert log == _hooked_layer_reads(moe_layer.layer_idx, "moe")
 
@@ -392,8 +419,8 @@ def test_model_primes_before_the_embedding_only_with_dense(monkeypatch, state):
         "no_dense": _RecordingManager(log, None),
         "no_manager": None,
     }[state]
-    model._dwdp = manager
-    model.layers[0]._dwdp = manager
+    model._dense_dwdp = manager
+    model.layers[0]._dense_dwdp = manager
 
     output = model(_attn_metadata(), input_ids=torch.zeros(_TOKENS, dtype=torch.int32))
 

@@ -99,15 +99,25 @@ happen once per layer rather than once per scheduler chunk. Schedulers must not
 perform DWDP lifecycle calls.
 
 Dense DWDP (`TRTLLM_DWDP_DENSE`, which row-shards the replicated dense weights
-of the MoE decoder layers the same way) is owned by `DwdpManager` and the
-model's decoder-layer hooks, which enqueue each layer's dense weights on the
-same copy stream ahead of its experts; with it on, the model's forward entry
-(`DwdpManager.ensure_primed`) also primes the first two MoE layers, each
-layer's experts right after its dense weights, for every forward the executor
-loop did not prime (warmup, KV-cache estimation, the forward after an aborted
-one), `prefetch_first_layers` skips when they are already primed or the
-previous forward aborted, and `ConfigurableMoE` is unaware of dense DWDP and
-keeps the expert wait/bind/record protocol above unchanged.
+of the MoE decoder layers the same way) is owned by `DenseDwdpManager`
+(`modules/dwdp/dense/manager.py`), which the model's decoder-layer hooks reach
+through `get_global_dense_dwdp_manager()`. With expert DWDP, `DwdpManager`
+builds the dense manager and drives it: dense DWDP shards over the DWDP group,
+and the hooks enqueue each layer's dense weights on the same copy stream ahead
+of its experts; the model's forward entry (`DenseDwdpManager.ensure_primed`)
+also primes the first two MoE layers, each layer's experts right after its
+dense weights, for every forward the executor loop did not prime (warmup,
+KV-cache estimation, the forward after an aborted one), and
+`prefetch_first_layers` skips when they are already primed or the previous
+forward aborted. Without `dwdp_config`, dense DWDP runs standalone on an
+attention-DP instance (`tp_size > 1`): the executor creator builds the dense
+manager, which shards over the attention-DP group on its own copy stream. The
+non-overlap executor loop primes it before each forward, and the model's
+forward entry primes any forward the loop did not, so the overlap scheduler,
+whose loop does not prime, is allowed there. In both modes `ConfigurableMoE`
+is unaware of dense DWDP: with expert DWDP it keeps the wait/bind/record
+protocol above unchanged; standalone it runs without DWDP (expert-parallel
+experts, no wait/bind/record).
 
 The composite mapping exposes the full expert table through the backend's
 ordinary weight attributes, so DWDP returns `None` from
